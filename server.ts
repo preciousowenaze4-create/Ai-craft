@@ -53,61 +53,23 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const IS_PROD = process.env.NODE_ENV === 'production';
 
-const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+import {
+  OPENROUTER_BASE_URL,
+  cleanEnvKey,
+  fetchFreeOpenRouterCatalog,
+  fetchOpenRouterKeyStatus,
+  getGeminiApiKey,
+  getOpenRouterApiKey,
+  isCandidateFreeOpenRouterModel,
+  resolveFreeModelInfo,
+  type NormalizedOpenRouterModel,
+} from './api/_openrouterModels.js';
+
 const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
-
-interface NormalizedOpenRouterModel {
-  id: string;
-  name: string;
-  provider: string;
-  contextLength: number;
-  isFree: boolean;
-}
-
-interface OpenRouterApiModel {
-  id?: string;
-  name?: string;
-  context_length?: number;
-  endpoints?: string[];
-  pricing?: {
-    prompt?: string | number;
-    completion?: string | number;
-  };
-}
 
 let cachedModels: NormalizedOpenRouterModel[] = [];
 let modelsCachedAt = 0;
 let modelsCachedKey = '';
-
-function cleanEnvKey(raw: string | undefined, placeholders: string[]): string {
-  if (typeof raw !== 'string') return '';
-  let cleaned = raw.trim();
-  if (
-    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
-    (cleaned.startsWith("'") && cleaned.endsWith("'"))
-  ) {
-    cleaned = cleaned.slice(1, -1).trim();
-  }
-  if (/^bearer\s+/i.test(cleaned)) {
-    cleaned = cleaned.replace(/^bearer\s+/i, '').trim();
-  }
-  if (!cleaned || placeholders.includes(cleaned)) return '';
-  return cleaned;
-}
-
-function getGeminiApiKey(): string {
-  const candidates = [
-    process.env.GEMINI_API_KEY,
-    process.env.GOOGLE_API_KEY,
-    process.env.GOOGLE_GENERATIVE_AI_API_KEY,
-    process.env.VITE_GEMINI_API_KEY,
-  ];
-  for (const raw of candidates) {
-    const cleaned = cleanEnvKey(raw, ['MY_GEMINI_API_KEY']);
-    if (cleaned) return cleaned;
-  }
-  return '';
-}
 
 function createGeminiClient() {
   const apiKey = getGeminiApiKey();
@@ -122,26 +84,6 @@ function createGeminiClient() {
       },
     },
   });
-}
-
-function getOpenRouterApiKey(): string {
-  const candidates = [
-    process.env.OPENROUTER_API_KEY,
-    process.env.OPEN_ROUTER_API_KEY,
-    process.env.OPENROUTER_KEY,
-    process.env.OPENROUTER_API,
-    process.env.OPENROUTER_TOKEN,
-    process.env.NEXT_PUBLIC_OPENROUTER_API_KEY,
-    process.env.VITE_OPENROUTER_API_KEY,
-  ];
-  for (const raw of candidates) {
-    const cleaned = cleanEnvKey(raw, ['MY_OPENROUTER_API_KEY']);
-    if (!cleaned || cleaned.startsWith('AIza')) continue;
-    return cleaned;
-  }
-  const apiKey = cleanEnvKey(process.env.API_KEY, ['MY_OPENROUTER_API_KEY']);
-  if (apiKey.startsWith('sk-or-')) return apiKey;
-  return '';
 }
 
 function getSupabaseConfig(): { url: string; anonKey: string; serviceRoleKey: string } {
@@ -316,87 +258,12 @@ function serializeSupabaseUser(user: SupabaseUser | null | undefined) {
   };
 }
 
-function isRestrictedHarnessModel(id: string): boolean {
-  return id.endsWith(':batch') || id.startsWith('thinkingmachines/');
-}
-
 function resolveModelInfo(modelId: string): {
   id: string;
   name: string;
   provider: string;
 } {
-  const found = cachedModels.find((m) => m.id === modelId);
-  if (found) {
-    return {
-      id: found.id,
-      name: found.name,
-      provider: found.provider,
-    };
-  }
-  const slashIdx = modelId.indexOf('/');
-  const provider = slashIdx > 0 ? modelId.slice(0, slashIdx) : 'openrouter';
-  const shortName = slashIdx > 0 ? modelId.slice(slashIdx + 1) : modelId;
-  return {
-    id: modelId,
-    name: shortName,
-    provider,
-  };
-}
-
-function normalizeOpenRouterModels(rawList: OpenRouterApiModel[]): NormalizedOpenRouterModel[] {
-  const normalized: NormalizedOpenRouterModel[] = [];
-  const seen = new Set<string>();
-
-  for (const item of rawList) {
-    const id = typeof item?.id === 'string' ? item.id.trim() : '';
-    if (!id || seen.has(id) || isRestrictedHarnessModel(id)) continue;
-
-    // Exclude batch-only endpoints that cannot serve live chat completions
-    if (
-      Array.isArray(item?.endpoints) &&
-      item.endpoints.length > 0 &&
-      !item.endpoints.includes('/api/v1/chat/completions')
-    ) {
-      continue;
-    }
-
-    seen.add(id);
-
-    const slashIndex = id.indexOf('/');
-    const provider = slashIndex > 0 ? id.slice(0, slashIndex) : 'openrouter';
-    const rawName = typeof item?.name === 'string' && item.name.trim() ? item.name.trim() : id;
-    const contextLength =
-      typeof item?.context_length === 'number' && Number.isFinite(item.context_length)
-        ? item.context_length
-        : 0;
-
-    const promptPrice = Number(item?.pricing?.prompt ?? 1);
-    const completionPrice = Number(item?.pricing?.completion ?? 1);
-    const isFree =
-      id.endsWith(':free') ||
-      (Number.isFinite(promptPrice) &&
-        Number.isFinite(completionPrice) &&
-        promptPrice === 0 &&
-        completionPrice === 0);
-
-    normalized.push({
-      id,
-      name: rawName,
-      provider,
-      contextLength,
-      isFree,
-    });
-  }
-
-  // Keep openrouter/auto first if available, then free models, then alphabetical
-  normalized.sort((a, b) => {
-    if (a.id === 'openrouter/auto') return -1;
-    if (b.id === 'openrouter/auto') return 1;
-    if (a.isFree !== b.isFree) return a.isFree ? -1 : 1;
-    return a.name.localeCompare(b.name);
-  });
-
-  return normalized;
+  return resolveFreeModelInfo(modelId, cachedModels);
 }
 
 async function fetchOpenRouterModels(forceRefresh = false): Promise<NormalizedOpenRouterModel[]> {
@@ -412,29 +279,8 @@ async function fetchOpenRouterModels(forceRefresh = false): Promise<NormalizedOp
     return cachedModels;
   }
 
-  const headers: Record<string, string> = {
-    'HTTP-Referer': process.env.APP_URL || `http://localhost:${PORT}`,
-    'X-Title': 'AI Craft',
-  };
-  if (openRouterKey) {
-    headers.Authorization = `Bearer ${openRouterKey}`;
-  }
-
-  const response = await fetch(`${OPENROUTER_BASE_URL}/models`, {
-    method: 'GET',
-    headers,
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    throw new Error(
-      `Failed to fetch OpenRouter models (${response.status})${errText ? `: ${errText.slice(0, 140)}` : ''}`
-    );
-  }
-
-  const json = (await response.json()) as { data?: OpenRouterApiModel[] };
-  const rawList = Array.isArray(json?.data) ? json.data : [];
-  const openRouterModels = normalizeOpenRouterModels(rawList);
+  const referer = process.env.APP_URL || `http://localhost:${PORT}`;
+  const openRouterModels = await fetchFreeOpenRouterCatalog(openRouterKey, referer);
 
   if (openRouterModels.length > 0) {
     cachedModels = openRouterModels;
@@ -2933,17 +2779,24 @@ async function startServer() {
 
   app.get('/api/models', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
+    const openRouterKey = getOpenRouterApiKey();
+    const referer = getAppBaseUrl(req);
     try {
       const forceRefresh = req.query.refresh === '1';
-      const models = await fetchOpenRouterModels(forceRefresh);
+      const [models, keyStatus] = await Promise.all([
+        fetchOpenRouterModels(forceRefresh),
+        fetchOpenRouterKeyStatus(openRouterKey, referer, forceRefresh),
+      ]);
       res.json({
         models,
-        openRouterConfigured: Boolean(getOpenRouterApiKey()),
+        openRouterConfigured: Boolean(openRouterKey),
         geminiConfigured: Boolean(getGeminiApiKey()),
+        freeOnly: true,
+        keyStatus,
       });
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : 'Unable to load OpenRouter models.';
+        err instanceof Error ? err.message : 'Unable to load free OpenRouter models.';
       const fallbackModels = getGeminiApiKey()
         ? [
             {
@@ -2951,14 +2804,17 @@ async function startServer() {
               name: 'Google: Gemini 4 Hydrogen',
               provider: 'google',
               contextLength: 1048576,
-              isFree: false,
+              isFree: true,
+              capabilities: ['Code', 'Build', 'Vision'],
+              category: 'code',
             },
           ]
         : [];
       res.status(fallbackModels.length > 0 ? 200 : 502).json({
         models: fallbackModels.length > 0 ? fallbackModels : cachedModels,
-        openRouterConfigured: Boolean(getOpenRouterApiKey()),
+        openRouterConfigured: Boolean(openRouterKey),
         geminiConfigured: Boolean(getGeminiApiKey()),
+        freeOnly: true,
         error: fallbackModels.length > 0 ? undefined : message,
       });
     }
@@ -3738,7 +3594,7 @@ async function startServer() {
           const trimmed = id?.trim();
           if (
             trimmed &&
-            !isRestrictedHarnessModel(trimmed) &&
+            isCandidateFreeOpenRouterModel(trimmed, cachedModels) &&
             !candidates.includes(trimmed)
           ) {
             candidates.push(trimmed);
@@ -3747,10 +3603,10 @@ async function startServer() {
 
         addCandidate(requestedModel);
         addCandidate(process.env.OPENROUTER_FALLBACK_MODEL);
-        addCandidate('openrouter/auto');
+        addCandidate('openrouter/free');
 
         for (const m of cachedModels) {
-          if (m.isFree && candidates.length < 6) {
+          if (m.isFree && candidates.length < 8) {
             addCandidate(m.id);
           }
         }
@@ -4057,7 +3913,7 @@ async function startServer() {
         }
 
         const finalLogo = extractLogoDirectiveFromRaw(fullRaw) ?? undefined;
-        const finalInfo = resolveModelInfo(modelUsed || requestedModel || 'openrouter/auto');
+        const finalInfo = resolveModelInfo(modelUsed || 'openrouter/free');
         sendEvent({
           type: 'paused',
           reason: exhaustInfo.code,

@@ -62,6 +62,8 @@ export interface OpenRouterModel {
   provider: string;
   contextLength: number;
   isFree: boolean;
+  capabilities?: string[];
+  category?: 'router' | 'code' | 'image' | 'music' | 'chat';
 }
 
 export interface ProjectSecret {

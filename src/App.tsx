@@ -889,15 +889,16 @@ export default function App() {
       const fetched = Array.isArray(data?.models) ? data.models : [];
       if (fetched.length > 0) {
         setModels(fetched);
-        setSelectedModel((prev) =>
-          prev && fetched.some((m) => m.id === prev) ? prev : fetched[0].id
-        );
+        setSelectedModel((prev) => {
+          const matched = prev ? fetched.find((m) => m.id === prev && m.isFree) : undefined;
+          return matched ? matched.id : fetched[0].id;
+        });
       } else if (!response.ok || data?.error) {
-        setModelsError(data?.error || 'Unable to load OpenRouter models.');
+        setModelsError(data?.error || 'Unable to load free OpenRouter models.');
       }
     } catch (err) {
       setModelsError(
-        err instanceof Error ? err.message : 'Unable to load OpenRouter models.'
+        err instanceof Error ? err.message : 'Unable to load free OpenRouter models.'
       );
     } finally {
       setModelsLoading(false);

@@ -10,27 +10,15 @@ import {
   getCreditExhaustionInfo,
   verifyUserCanGenerate,
 } from '../_billing.js';
-
-const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
-
-interface NormalizedOpenRouterModel {
-  id: string;
-  name: string;
-  provider: string;
-  contextLength: number;
-  isFree: boolean;
-}
-
-interface OpenRouterApiModel {
-  id?: string;
-  name?: string;
-  context_length?: number;
-  endpoints?: string[];
-  pricing?: {
-    prompt?: string | number;
-    completion?: string | number;
-  };
-}
+import {
+  OPENROUTER_BASE_URL,
+  fetchFreeOpenRouterCatalog,
+  getGeminiApiKey,
+  getOpenRouterApiKey,
+  isCandidateFreeOpenRouterModel,
+  resolveFreeModelInfo as resolveModelInfo,
+  type NormalizedOpenRouterModel,
+} from '../_openrouterModels.js';
 
 class OpenRouterApiError extends Error {
   status: number;
@@ -41,57 +29,8 @@ class OpenRouterApiError extends Error {
   }
 }
 
-function cleanEnvKey(raw: string | undefined, placeholders: string[]): string {
-  if (typeof raw !== 'string') return '';
-  let cleaned = raw.trim();
-  if (
-    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
-    (cleaned.startsWith("'") && cleaned.endsWith("'"))
-  ) {
-    cleaned = cleaned.slice(1, -1).trim();
-  }
-  if (/^bearer\s+/i.test(cleaned)) {
-    cleaned = cleaned.replace(/^bearer\s+/i, '').trim();
-  }
-  if (!cleaned || placeholders.includes(cleaned)) return '';
-  return cleaned;
-}
-
-function getOpenRouterApiKey(): string {
-  const candidates = [
-    process.env.OPENROUTER_API_KEY,
-    process.env.OPEN_ROUTER_API_KEY,
-    process.env.OPENROUTER_KEY,
-    process.env.OPENROUTER_API,
-    process.env.OPENROUTER_TOKEN,
-    process.env.NEXT_PUBLIC_OPENROUTER_API_KEY,
-    process.env.VITE_OPENROUTER_API_KEY,
-  ];
-  for (const raw of candidates) {
-    const cleaned = cleanEnvKey(raw, ['MY_OPENROUTER_API_KEY']);
-    if (!cleaned || cleaned.startsWith('AIza')) continue;
-    return cleaned;
-  }
-  const apiKey = cleanEnvKey(process.env.API_KEY, ['MY_OPENROUTER_API_KEY']);
-  if (apiKey.startsWith('sk-or-')) return apiKey;
-  return '';
-}
-
 function createGeminiClient() {
-  const candidates = [
-    process.env.GEMINI_API_KEY,
-    process.env.GOOGLE_API_KEY,
-    process.env.GOOGLE_GENERATIVE_AI_API_KEY,
-    process.env.VITE_GEMINI_API_KEY,
-  ];
-  let apiKey = '';
-  for (const raw of candidates) {
-    const cleaned = cleanEnvKey(raw, ['MY_GEMINI_API_KEY']);
-    if (cleaned) {
-      apiKey = cleaned;
-      break;
-    }
-  }
+  const apiKey = getGeminiApiKey();
   if (!apiKey) {
     return null;
   }
@@ -105,71 +44,12 @@ function createGeminiClient() {
   });
 }
 
-function isRestrictedHarnessModel(id: string): boolean {
-  return id.endsWith(':batch') || id.startsWith('thinkingmachines/');
-}
-
-function resolveModelInfo(
-  modelId: string,
-  catalog: NormalizedOpenRouterModel[]
-): { id: string; name: string; provider: string } {
-  const found = catalog.find((m) => m.id === modelId);
-  if (found) {
-    return { id: found.id, name: found.name, provider: found.provider };
-  }
-  const slashIdx = modelId.indexOf('/');
-  const provider = slashIdx > 0 ? modelId.slice(0, slashIdx) : 'openrouter';
-  const shortName = slashIdx > 0 ? modelId.slice(slashIdx + 1) : modelId;
-  return { id: modelId, name: shortName, provider };
-}
-
 async function fetchFreeOpenRouterFallbacks(
   apiKey: string,
   referer: string
 ): Promise<NormalizedOpenRouterModel[]> {
   try {
-    const res = await fetch(`${OPENROUTER_BASE_URL}/models`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'HTTP-Referer': referer,
-        'X-Title': 'AI Craft',
-      },
-    });
-    if (!res.ok) return [];
-    const json = (await res.json()) as { data?: OpenRouterApiModel[] };
-    const list = Array.isArray(json?.data) ? json.data : [];
-    const out: NormalizedOpenRouterModel[] = [];
-
-    for (const item of list) {
-      const id = typeof item?.id === 'string' ? item.id.trim() : '';
-      if (!id || isRestrictedHarnessModel(id)) continue;
-      if (
-        Array.isArray(item?.endpoints) &&
-        item.endpoints.length > 0 &&
-        !item.endpoints.includes('/api/v1/chat/completions')
-      ) {
-        continue;
-      }
-      const promptPrice = Number(item?.pricing?.prompt ?? 1);
-      const completionPrice = Number(item?.pricing?.completion ?? 1);
-      const isFree =
-        id.endsWith(':free') ||
-        (Number.isFinite(promptPrice) &&
-          Number.isFinite(completionPrice) &&
-          promptPrice === 0 &&
-          completionPrice === 0);
-      if (!isFree) continue;
-      const slashIndex = id.indexOf('/');
-      out.push({
-        id,
-        name: typeof item?.name === 'string' && item.name.trim() ? item.name.trim() : id,
-        provider: slashIndex > 0 ? id.slice(0, slashIndex) : 'openrouter',
-        contextLength: typeof item?.context_length === 'number' ? item.context_length : 0,
-        isFree: true,
-      });
-    }
-    return out;
+    return await fetchFreeOpenRouterCatalog(apiKey, referer);
   } catch {
     return [];
   }
@@ -1925,7 +1805,7 @@ export async function POST(request: Request): Promise<Response> {
             const trimmed = id?.trim();
             if (
               trimmed &&
-              !isRestrictedHarnessModel(trimmed) &&
+              isCandidateFreeOpenRouterModel(trimmed, catalog) &&
               !candidates.includes(trimmed)
             ) {
               candidates.push(trimmed);
@@ -1934,10 +1814,10 @@ export async function POST(request: Request): Promise<Response> {
 
           addCandidate(requestedModel);
           addCandidate(process.env.OPENROUTER_FALLBACK_MODEL);
-          addCandidate('openrouter/auto');
+          addCandidate('openrouter/free');
 
           for (const m of catalog) {
-            if (candidates.length < 6) {
+            if (m.isFree && candidates.length < 8) {
               addCandidate(m.id);
             }
           }
@@ -2240,7 +2120,7 @@ export async function POST(request: Request): Promise<Response> {
           }
 
           const finalLogo = extractLogoDirectiveFromRaw(fullRaw) ?? undefined;
-          const finalInfo = resolveModelInfo(modelUsed || requestedModel || 'openrouter/auto', catalog);
+          const finalInfo = resolveModelInfo(modelUsed || 'openrouter/free', catalog);
           sendEvent({
             type: 'paused',
             reason: exhaustInfo.code,

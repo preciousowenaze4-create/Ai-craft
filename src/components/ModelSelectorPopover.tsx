@@ -38,6 +38,9 @@ export function ModelSelectorPopover({
 }: ModelSelectorPopoverProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState<
+    'all' | 'code' | 'image' | 'music'
+  >('all');
   const containerRef = useRef<HTMLDivElement | null>(null);
   const theme = MODE_THEMES[mode];
 
@@ -46,16 +49,39 @@ export function ModelSelectorPopover({
     [models, selectedModel]
   );
 
+  const hasFreeImageModels = useMemo(
+    () => models.some((m) => m.category === 'image' || m.capabilities?.includes('Image')),
+    [models]
+  );
+  const hasFreeMusicModels = useMemo(
+    () => models.some((m) => m.category === 'music' || m.capabilities?.includes('Music')),
+    [models]
+  );
+
   const filteredModels = useMemo(() => {
     const trimmed = query.trim().toLowerCase();
-    if (!trimmed) return models;
-    return models.filter(
-      (m) =>
+    return models.filter((m) => {
+      if (categoryFilter === 'code') {
+        const isCodeOrRouter =
+          m.category === 'code' ||
+          m.category === 'router' ||
+          Boolean(m.capabilities?.some((c) => c === 'Code' || c === 'Build'));
+        if (!isCodeOrRouter) return false;
+      } else if (categoryFilter === 'image') {
+        if (m.category !== 'image' && !m.capabilities?.includes('Image')) return false;
+      } else if (categoryFilter === 'music') {
+        if (m.category !== 'music' && !m.capabilities?.includes('Music')) return false;
+      }
+
+      if (!trimmed) return true;
+      return (
         m.name.toLowerCase().includes(trimmed) ||
         m.id.toLowerCase().includes(trimmed) ||
-        m.provider.toLowerCase().includes(trimmed)
-    );
-  }, [models, query]);
+        m.provider.toLowerCase().includes(trimmed) ||
+        Boolean(m.capabilities?.some((c) => c.toLowerCase().includes(trimmed)))
+      );
+    });
+  }, [models, query, categoryFilter]);
 
   useEffect(() => {
     if (!open) return;
@@ -168,17 +194,17 @@ export function ModelSelectorPopover({
             <div className="px-2.5 pt-2.5 pb-2 border-b border-black/[0.08] flex flex-col gap-1.5">
               <div className="flex items-center justify-between gap-2 px-0.5">
                 <span className="font-display font-semibold text-[12.5px] text-[#0B0B0F] tracking-[-0.01em]">
-                  Select AI
+                  Free AI Models
                 </span>
                 <div className="flex items-center gap-1.5">
                   <span className="text-[11px] text-[#52525B] tabular-nums">
-                    {modelsLoading ? 'Loading...' : `${filteredModels.length}`}
+                    {modelsLoading ? 'Loading...' : `${filteredModels.length} free`}
                   </span>
                   <button
                     type="button"
                     onClick={onRetryModels}
                     disabled={modelsLoading}
-                    aria-label="Refresh models"
+                    aria-label="Refresh free models"
                     className="p-1 rounded-full text-[#52525B] hover:text-[#0B0B0F] hover:bg-black/[0.05] disabled:opacity-40 transition-colors"
                   >
                     <RefreshCw
@@ -188,14 +214,43 @@ export function ModelSelectorPopover({
                 </div>
               </div>
 
+              {(hasFreeImageModels || hasFreeMusicModels) && (
+                <div className="flex items-center gap-1 overflow-x-auto pb-0.5 text-[11px]">
+                  {(
+                    [
+                      { id: 'all', label: 'All' },
+                      { id: 'code', label: 'Code & Build' },
+                      ...(hasFreeImageModels ? [{ id: 'image', label: 'Image' }] : []),
+                      ...(hasFreeMusicModels ? [{ id: 'music', label: 'Music' }] : []),
+                    ] as Array<{ id: 'all' | 'code' | 'image' | 'music'; label: string }>
+                  ).map((tab) => {
+                    const active = categoryFilter === tab.id;
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        onClick={() => setCategoryFilter(tab.id)}
+                        className={`px-2 py-0.5 rounded-md font-medium shrink-0 transition-colors ${
+                          active
+                            ? 'bg-[#0B0B0F] text-white'
+                            : 'bg-white/70 text-[#52525B] hover:text-[#0B0B0F]'
+                        }`}
+                      >
+                        {tab.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
               <div className="relative flex items-center">
                 <Search className="w-3.5 h-3.5 text-[#52525B] absolute left-2.5 pointer-events-none" />
                 <input
                   type="text"
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Search models..."
-                  aria-label="Search OpenRouter models"
+                  placeholder="Search free AI..."
+                  aria-label="Search free OpenRouter models"
                   className="w-full h-8 pl-7 pr-6 rounded-lg bg-white/80 border border-black/[0.07] text-[12.5px] text-[#0B0B0F] placeholder:text-[#71717A] focus:outline-none focus:bg-white"
                 />
                 {query && (
@@ -283,7 +338,13 @@ export function ModelSelectorPopover({
                           {model.name}
                         </p>
                         <div className="flex items-center gap-1 mt-0.5 text-[10.5px] text-[#52525B] truncate">
-                          <span className="font-mono truncate">{model.id}</span>
+                          {model.capabilities && model.capabilities.length > 0 ? (
+                            <span className="truncate font-medium text-[#3F3F46]">
+                              {model.capabilities.slice(0, 2).join(' · ')}
+                            </span>
+                          ) : (
+                            <span className="font-mono truncate">{model.id}</span>
+                          )}
                           {ctxLabel && (
                             <>
                               <span aria-hidden="true">·</span>
