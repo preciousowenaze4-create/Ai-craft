@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ArrowRight, ChevronRight, Loader2, Plus } from 'lucide-react';
+import { ArrowRight, Plus } from 'lucide-react';
 import {
   AuthScreen,
   AuthViewMode,
@@ -21,6 +21,7 @@ import {
   ProUpgradeModal,
 } from './components/ProUpgradeModal';
 import { PromptComposer } from './components/PromptComposer';
+import { SwipeableProjectRow } from './components/SwipeableProjectRow';
 import { TopBar } from './components/TopBar';
 import { unlockSpeechSynthesis } from './hooks/useSpeechNarration';
 import { buildProjectSecretHints } from './utils/secretHints';
@@ -35,6 +36,7 @@ import {
   BuildMode,
   BuilderTurn,
   ComposerOptions,
+  CraftProject,
   GeneratedMediaPayload,
   MODE_THEMES,
   NavTab,
@@ -49,17 +51,6 @@ import {
   UserProfile,
   WorkspaceView,
 } from './types/craft';
-
-interface CraftProject {
-  id: string;
-  title: string;
-  mode: BuildMode;
-  createdAt: string;
-  turns: BuilderTurn[];
-  secrets?: ProjectSecret[];
-  databaseConfig?: ProjectDatabaseConfig;
-  deployment?: ProjectDeploymentConfig;
-}
 
 interface CloudWorkspacePayload {
   projects?: CraftProject[];
@@ -350,15 +341,20 @@ function mergeProjectsFromCloud(
   return Array.from(mergedMap.values()).map(normalizeProjectTitle);
 }
 
-const CLIENT_BYTES_PER_BUILD_CREDIT = 1350;
-const CLIENT_MAX_CREDITS_PER_BUILD = 35;
+const CLIENT_MIN_CHAT_CREDITS = 30;
+const CLIENT_BYTES_PER_BUILD_CREDIT = 250;
+const CLIENT_MAX_CREDITS_PER_BUILD = 300;
 
-function calculateClientBuildCredits(bytesBuilt: number): number {
+function calculateClientBuildCredits(
+  bytesBuilt: number,
+  filesCount = 0,
+  dbTablesCount = 0
+): number {
   if (!Number.isFinite(bytesBuilt) || bytesBuilt <= 0) return 0;
-  return Math.min(
-    CLIENT_MAX_CREDITS_PER_BUILD,
-    Math.max(1, Math.floor(bytesBuilt / CLIENT_BYTES_PER_BUILD_CREDIT) + 1)
-  );
+  const baseFromCode = Math.max(1, Math.round(bytesBuilt / CLIENT_BYTES_PER_BUILD_CREDIT));
+  const filesBonus = Math.max(0, Math.min(12, Math.floor(filesCount))) * 2;
+  const dbBonus = Math.max(0, Math.min(10, Math.floor(dbTablesCount))) * 4;
+  return Math.min(CLIENT_MAX_CREDITS_PER_BUILD, Math.max(1, baseFromCode + filesBonus + dbBonus));
 }
 
 export default function App() {
@@ -412,6 +408,7 @@ export default function App() {
     loadSavedRecord<boolean>(STORAGE_PUBLISHED_KEY)
   );
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [swipedProjectId, setSwipedProjectId] = useState<string | null>(null);
   const [inlineNotice, setInlineNotice] = useState<string | null>(null);
   const [models, setModels] = useState<OpenRouterModel[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>(() =>
@@ -959,6 +956,34 @@ export default function App() {
     );
   }, []);
 
+  const handleDeleteProject = useCallback(
+    (projectId: string) => {
+      const target = projectsRef.current.find((p) => p.id === projectId);
+      if (target) {
+        for (const t of target.turns) {
+          activeConnectionsRef.current.get(t.id)?.abort();
+          activeConnectionsRef.current.delete(t.id);
+        }
+      }
+      setProjects((prev) => prev.filter((p) => p.id !== projectId));
+      setProjectViews((prev) => {
+        if (!(projectId in prev)) return prev;
+        const next = { ...prev };
+        delete next[projectId];
+        return next;
+      });
+      setPublishedProjects((prev) => {
+        if (!(projectId in prev)) return prev;
+        const next = { ...prev };
+        delete next[projectId];
+        return next;
+      });
+      setSwipedProjectId((prev) => (prev === projectId ? null : prev));
+      setActiveProjectId((prev) => (prev === projectId ? null : prev));
+    },
+    []
+  );
+
   const publishProjectLive = useCallback(
     async (
       projectId: string,
@@ -1163,37 +1188,18 @@ export default function App() {
       let pendingBytes: number | null = null;
       let flushTimer: number | null = null;
 
-      // Smooth, realistic token metering: 0 credits for chat/thinking, ~1 credit / ~950ms during active builds
-      let turnChargedSoFar = 0;
-      let targetCreditsForTurn = 0;
+      // Tokens stay untouched during building and deduct all together once the build finishes
       let currentTurnPhase: 'understanding' | 'building' | 'complete' | 'paused' | 'error' =
         'understanding';
       let currentTurnKind: TurnKind = 'chat';
       let latestBytesBuilt = 0;
-      let creditTickTimer: number | null = null;
+      let latestFilesCount = 0;
+      let latestDbTablesCount = 0;
 
-      const stopCreditTicker = () => {
-        if (creditTickTimer !== null) {
-          window.clearTimeout(creditTickTimer);
-          creditTickTimer = null;
-        }
-      };
-
-      const scheduleCreditTicker = () => {
-        if (creditTickTimer !== null) return;
-        if (turnChargedSoFar >= targetCreditsForTurn) return;
-        const delayMs = turnChargedSoFar === 0 ? 320 : 950;
-        creditTickTimer = window.setTimeout(() => {
-          creditTickTimer = null;
-          if (turnChargedSoFar < targetCreditsForTurn) {
-            turnChargedSoFar += 1;
-            adjustLocalCredits(-1);
-          }
-          if (turnChargedSoFar < targetCreditsForTurn) {
-            scheduleCreditTicker();
-          }
-        }, delayMs);
-      };
+      const stopCreditTicker = () => {};
+      const scheduleCreditTicker = () => {};
+      const turnChargedSoFar = 0;
+      let targetCreditsForTurn = 0;
 
       const flushBuffered = () => {
         if (flushTimer !== null) {
@@ -1378,6 +1384,7 @@ export default function App() {
                 }));
               } else if (evt.type === 'schema' && Array.isArray(evt.tables)) {
                 const incomingTables = evt.tables;
+                latestDbTablesCount = Math.max(latestDbTablesCount, incomingTables.length);
                 setProjects((prev) =>
                   prev.map((p) =>
                     p.id === projectId
@@ -1411,13 +1418,11 @@ export default function App() {
                 if (currentTurnPhase === 'understanding') {
                   currentTurnPhase = 'building';
                 }
+                if (Array.isArray(evt.allFiles)) {
+                  latestFilesCount = Math.max(latestFilesCount, evt.allFiles.length);
+                }
                 if (typeof evt.bytesBuilt === 'number') {
                   latestBytesBuilt = evt.bytesBuilt;
-                  const estCredits = calculateClientBuildCredits(evt.bytesBuilt);
-                  if (estCredits > targetCreditsForTurn) {
-                    targetCreditsForTurn = estCredits;
-                    scheduleCreditTicker();
-                  }
                 }
                 updateTurn(projectId, turnId, (t) => ({
                   ...t,
@@ -1436,24 +1441,15 @@ export default function App() {
                   latestBytesBuilt = evt.bytesBuilt;
                   pendingBytes = evt.bytesBuilt;
                   scheduleBufferedFlush();
-                  if (currentTurnPhase === 'building' || currentTurnKind === 'build') {
-                    const estCredits = calculateClientBuildCredits(evt.bytesBuilt);
-                    if (estCredits > targetCreditsForTurn) {
-                      targetCreditsForTurn = estCredits;
-                      scheduleCreditTicker();
-                    }
-                  }
                 }
               } else if (evt.type === 'reset') {
                 stopCreditTicker();
-                if (turnChargedSoFar > 0) {
-                  adjustLocalCredits(turnChargedSoFar);
-                  turnChargedSoFar = 0;
-                }
                 targetCreditsForTurn = 0;
                 currentTurnKind = 'chat';
                 currentTurnPhase = 'understanding';
                 latestBytesBuilt = 0;
+                latestFilesCount = 0;
+                latestDbTablesCount = 0;
                 pendingDelta = '';
                 pendingBytes = null;
                 if (flushTimer !== null) {
@@ -1598,7 +1594,13 @@ export default function App() {
                               : calculateClientBuildCredits(
                                   typeof evt.bytesBuilt === 'number'
                                     ? evt.bytesBuilt
-                                    : latestBytesBuilt
+                                    : latestBytesBuilt,
+                                  Array.isArray(evt.allFiles)
+                                    ? evt.allFiles.length
+                                    : latestFilesCount,
+                                  Array.isArray(evt.dbTables)
+                                    ? evt.dbTables.length
+                                    : latestDbTablesCount
                                 )
                           )
                         );
@@ -1755,11 +1757,6 @@ export default function App() {
                 sawTerminalEvent = true;
                 stopCreditTicker();
                 flushBuffered();
-                if (turnChargedSoFar > 0) {
-                  adjustLocalCredits(turnChargedSoFar);
-                  turnChargedSoFar = 0;
-                  void syncBillingFromServer();
-                }
                 updateTurn(projectId, turnId, (t) => ({
                   ...t,
                   phase: 'error',
@@ -2224,14 +2221,18 @@ export default function App() {
     const monthlyResetPassed = Number.isFinite(monthlyResetMs) && nowMs >= monthlyResetMs;
     const dailyResetPassed = Number.isFinite(dailyResetMs) && nowMs >= dailyResetMs;
 
-    if (
-      (credits <= 0 || (billing !== null && billing.monthlyCreditsRemaining <= 0)) &&
-      !monthlyResetPassed
-    ) {
+    const effectiveRemaining =
+      billing !== null
+        ? Math.min(credits, billing.monthlyCreditsRemaining)
+        : credits;
+
+    if (effectiveRemaining <= CLIENT_MIN_CHAT_CREDITS && !monthlyResetPassed) {
       setInlineNotice(
-        proPlanId
-          ? 'No credits remaining for this 30-day cycle. Wait for refresh or upgrade your plan.'
-          : 'Your 300 free credits are used up. Upgrade to keep chatting or wait for your 30-day refresh.'
+        effectiveRemaining <= 0
+          ? proPlanId
+            ? 'No credits remaining for this 30-day cycle. Pay to upgrade or wait for refresh.'
+            : 'Your free credits are used up. Pay to top up or wait for your 30-day refresh.'
+          : `You have ${effectiveRemaining.toLocaleString()} tokens left (minimum ${CLIENT_MIN_CHAT_CREDITS + 1} tokens required). Please pay to continue chatting.`
       );
       setShowProUpgrade(true);
       return false;
@@ -3103,69 +3104,31 @@ export default function App() {
                   </div>
                 ) : (
                   <ul className="flex flex-col gap-3">
-                    {projects.map((item) => {
-                      const firstTurn = item.turns[0];
-                      const latestTurn = item.turns[item.turns.length - 1];
-                      const itemWorking = isProjectWorking(item);
-                      const hasAppBuilt = item.turns.some((t) => Boolean(t.previewHtml));
-                      return (
-                        <li key={item.id}>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setActiveProjectId(item.id);
-                              setMode(item.mode);
-                              setViewMode('builder');
-                            }}
-                            className="w-full text-left rounded-2xl border border-black/[0.08] bg-white p-4 shadow-[0_4px_16px_rgba(15,15,30,0.03)] hover:border-black/20 active:scale-[0.99] transition-all flex items-center justify-between gap-3"
-                          >
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2 text-xs text-[#71717A] flex-wrap">
-                                <span className="font-semibold text-[#0B0B0F]">
-                                  {item.title}
-                                </span>
-                                <span aria-hidden="true">·</span>
-                                <span>{MODE_THEMES[item.mode].label}</span>
-                                <span aria-hidden="true">·</span>
-                                <span className="tabular-nums">
-                                  {item.createdAt}
-                                </span>
-                                {itemWorking ? (
-                                  <span
-                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium"
-                                    style={{
-                                      backgroundColor: MODE_THEMES[item.mode].accentSoft,
-                                      color: MODE_THEMES[item.mode].accentColor,
-                                    }}
-                                  >
-                                    <Loader2 className="w-3 h-3 animate-spin" />
-                                    <span>
-                                      {latestTurn?.phase === 'building'
-                                        ? 'Building'
-                                        : 'Thinking'}
-                                    </span>
-                                  </span>
-                                ) : latestTurn?.phase === 'paused' ? (
-                                  <span className="px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[11px] font-medium">
-                                    Paused
-                                  </span>
-                                ) : hasAppBuilt ? (
-                                  <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-medium">
-                                    Ready
-                                  </span>
-                                ) : null}
-                              </div>
-                              {firstTurn && (
-                                <p className="mt-1.5 text-sm text-[#27272F] truncate">
-                                  {firstTurn.userMessage}
-                                </p>
-                              )}
-                            </div>
-                            <ChevronRight className="w-4 h-4 text-[#71717A] shrink-0" />
-                          </button>
-                        </li>
-                      );
-                    })}
+                    {projects.map((item) => (
+                      <SwipeableProjectRow
+                        key={item.id}
+                        project={item}
+                        isWorking={isProjectWorking(item)}
+                        isSwipedOpen={swipedProjectId === item.id}
+                        onSwipeOpenChange={(id, open) => {
+                          setSwipedProjectId((prev) =>
+                            open ? id : prev === id ? null : prev
+                          );
+                        }}
+                        onOpen={(proj) => {
+                          setSwipedProjectId(null);
+                          setActiveProjectId(proj.id);
+                          setMode(proj.mode);
+                          setViewMode('builder');
+                        }}
+                        onRename={(id, nextTitle) => {
+                          updateProjectTitle(id, nextTitle);
+                        }}
+                        onDelete={(id) => {
+                          handleDeleteProject(id);
+                        }}
+                      />
+                    ))}
                   </ul>
                 )}
               </div>

@@ -574,15 +574,25 @@ export async function upgradeUserAccountFromTransaction(params: {
   return upgraded.state;
 }
 
-export const BYTES_PER_BUILD_CREDIT = 1350;
-export const MAX_CREDITS_PER_BUILD = 35;
+export const MIN_CHAT_CREDITS_THRESHOLD = 30;
+export const BYTES_PER_BUILD_CREDIT = 250;
+export const MAX_CREDITS_PER_BUILD = 300;
 
-export function calculateBuildCreditsForBytes(bytesBuilt: number): number {
+export function calculateBuildCreditsForBytes(
+  bytesBuilt: number,
+  details?: { filesCount?: number; dbTablesCount?: number }
+): number {
   if (!Number.isFinite(bytesBuilt) || bytesBuilt <= 0) return 0;
-  return Math.min(
-    MAX_CREDITS_PER_BUILD,
-    Math.max(1, Math.floor(bytesBuilt / BYTES_PER_BUILD_CREDIT) + 1)
-  );
+  const baseFromCode = Math.max(1, Math.round(bytesBuilt / BYTES_PER_BUILD_CREDIT));
+  const filesBonus =
+    details?.filesCount && Number.isFinite(details.filesCount)
+      ? Math.max(0, Math.min(12, Math.floor(details.filesCount))) * 2
+      : 0;
+  const dbBonus =
+    details?.dbTablesCount && Number.isFinite(details.dbTablesCount)
+      ? Math.max(0, Math.min(10, Math.floor(details.dbTablesCount))) * 4
+      : 0;
+  return Math.min(MAX_CREDITS_PER_BUILD, Math.max(1, baseFromCode + filesBonus + dbBonus));
 }
 
 export function getAvailableCreditsBudget(
@@ -663,14 +673,19 @@ export async function verifyUserCanGenerate(
     checkPaystack: false,
   });
 
-  const check = consumeBillingCredit(current, 1, Date.now());
-  if (!check.allowed) {
+  const availableBudget = getAvailableCreditsBudget(current, Date.now());
+  if (availableBudget <= MIN_CHAT_CREDITS_THRESHOLD) {
+    const plan = getPlanConfig(current.tier);
+    const hitDaily =
+      plan.dailyLimit !== null && current.dailyCreditsUsed >= plan.dailyLimit;
     return {
       allowed: false,
       status: 402,
-      code: check.code || 'LIMIT_REACHED',
-      error: check.error || 'Credit limit reached.',
-      billing: serializeBillingSummary(check.state),
+      code: hitDaily ? 'DAILY_LIMIT_REACHED' : 'LOW_CREDITS_THRESHOLD',
+      error: hitDaily
+        ? `Daily limit reached (${(plan.dailyLimit ?? 0).toLocaleString()} credits/day on ${plan.name}). Resets in 24 hours or upgrade your plan.`
+        : `You have ${availableBudget.toLocaleString()} tokens remaining (minimum ${MIN_CHAT_CREDITS_THRESHOLD + 1} tokens required to chat or build). Top up or upgrade a plan to continue.`,
+      billing: serializeBillingSummary(current),
     };
   }
 
@@ -683,7 +698,7 @@ export async function verifyUserCanGenerate(
       state: current,
     },
     billing: serializeBillingSummary(current),
-    creditBudget: getAvailableCreditsBudget(current, Date.now()),
+    creditBudget: availableBudget,
   };
 }
 

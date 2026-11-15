@@ -509,16 +509,18 @@ export function ProUpgradeModal({
                 </span>
               </div>
 
-              {statusNotice && (
+              {(statusNotice || credits <= 30) && (
                 <div
-                  role={statusNotice.type === 'error' ? 'alert' : 'status'}
+                  role={statusNotice?.type === 'error' || credits <= 30 ? 'alert' : 'status'}
                   className={`mb-1.5 rounded-xl px-3 py-1.5 text-[11px] font-medium ${
-                    statusNotice.type === 'error'
+                    statusNotice?.type === 'error' || (!statusNotice && credits <= 30)
                       ? 'bg-red-50 border border-red-200 text-red-700'
                       : 'bg-[#EEF4FF] border border-[#0D5BFF]/20 text-[#0B3AC7]'
                   }`}
                 >
-                  {statusNotice.text}
+                  {statusNotice
+                    ? statusNotice.text
+                    : `Minimum 31 tokens required to chat or build (${credits.toLocaleString()} remaining). Pay to top up or choose a plan below.`}
                 </div>
               )}
 

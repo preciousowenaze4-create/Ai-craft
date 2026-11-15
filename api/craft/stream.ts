@@ -5,6 +5,7 @@ import {
   sanitizeSessionTitle,
 } from '../_appsStore.js';
 import {
+  MIN_CHAT_CREDITS_THRESHOLD,
   calculateBuildCreditsForBytes,
   commitGenerationCredits,
   getCreditExhaustionInfo,
@@ -1021,8 +1022,8 @@ async function streamOpenRouterCompletion(
     }, ms);
   };
 
-  // Initial connect / first-byte timeout: 12s so hung free models fail over immediately
-  resetWatchdog(12_000, `${candidate.modelName} timed out before responding`);
+  // Initial connect / first-byte timeout: 15s so reasoning/free models respond or fail over cleanly
+  resetWatchdog(15_000, `${candidate.modelName} timed out before responding`);
 
   try {
     const sendRequest = async (payloadMessages: OpenRouterChatMessage[]) =>
@@ -1292,6 +1293,19 @@ export async function POST(request: Request): Promise<Response> {
   }
   const effectiveCreditBudget =
     creditCheck.creditBudget !== null ? creditCheck.creditBudget : clientCreditsHint;
+  if (
+    creditCheck.creditBudget === null &&
+    clientCreditsHint !== null &&
+    clientCreditsHint <= MIN_CHAT_CREDITS_THRESHOLD
+  ) {
+    return Response.json(
+      {
+        error: `You have ${clientCreditsHint.toLocaleString()} tokens remaining (minimum ${MIN_CHAT_CREDITS_THRESHOLD + 1} tokens required to chat or build). Top up or upgrade a plan to continue.`,
+        code: 'LOW_CREDITS_THRESHOLD',
+      },
+      { status: 402 }
+    );
+  }
 
   const encoder = new TextEncoder();
 
@@ -1771,39 +1785,15 @@ export async function POST(request: Request): Promise<Response> {
             });
           }
 
-          const targetCredits = calculateBuildCreditsForBytes(cleanHtml.length);
+          const targetCredits = calculateBuildCreditsForBytes(cleanHtml.length, {
+            filesCount: emittedFiles.length,
+            dbTablesCount: emittedDbTables.length,
+          });
           const cappedTargetCredits =
             effectiveCreditBudget !== null
               ? Math.min(targetCredits, effectiveCreditBudget)
               : targetCredits;
-
-          if (
-            cappedTargetCredits > buildCreditsEmitted &&
-            (buildCreditsEmitted === 0 || nowMs - lastCreditEmitAt >= 900)
-          ) {
-            buildCreditsEmitted += 1;
-            lastCreditEmitAt = nowMs;
-            sendEvent({
-              type: 'credits',
-              used: buildCreditsEmitted,
-              targetUsed: cappedTargetCredits,
-            });
-          }
-
-          // Strict hard stop: if build consumption exceeds remaining credit budget, pause right here
-          if (
-            effectiveCreditBudget !== null &&
-            (targetCredits > effectiveCreditBudget ||
-              (effectiveCreditBudget > 0 && buildCreditsEmitted >= effectiveCreditBudget && cleanHtml.length > effectiveCreditBudget * 1350))
-          ) {
-            buildCreditsEmitted = effectiveCreditBudget;
-            sendEvent({
-              type: 'credits',
-              used: effectiveCreditBudget,
-              targetUsed: effectiveCreditBudget,
-            });
-            triggerCreditPause();
-          }
+          buildCreditsEmitted = Math.max(buildCreditsEmitted, cappedTargetCredits);
         };
 
         const emitCleanProseRange = (upToIndex: number) => {
@@ -2521,7 +2511,13 @@ export async function POST(request: Request): Promise<Response> {
 
         const rawCreditsUsed =
           resolvedKind === 'build' && (previewHtml.length > 0 || finalFiles.length > 0)
-            ? Math.max(1, calculateBuildCreditsForBytes(previewHtml.length))
+            ? Math.max(
+                1,
+                calculateBuildCreditsForBytes(previewHtml.length, {
+                  filesCount: finalFiles.length,
+                  dbTablesCount: finalDbTables.length,
+                })
+              )
             : 0;
         const finalCreditsUsed =
           effectiveCreditBudget !== null

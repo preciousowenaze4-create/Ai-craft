@@ -174,6 +174,17 @@ export interface BuilderTurn {
   errorMessage?: string;
 }
 
+export interface CraftProject {
+  id: string;
+  title: string;
+  mode: BuildMode;
+  createdAt: string;
+  turns: BuilderTurn[];
+  secrets?: ProjectSecret[];
+  databaseConfig?: ProjectDatabaseConfig;
+  deployment?: ProjectDeploymentConfig;
+}
+
 export interface ModeThemeConfig {
   id: BuildMode;
   label: string;

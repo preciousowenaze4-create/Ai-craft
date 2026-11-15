@@ -9,6 +9,7 @@ import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import {
   buildPaymentCallbackHtml,
   getPaymentSecretKey,
+  getPlanConfig,
   initializeCheckoutSession,
   listCustomerTransactions,
   resolvePlanFromMetadataOrAmount,
@@ -16,6 +17,7 @@ import {
   verifyWebhookSignature,
 } from './api/_paystack.js';
 import {
+  MIN_CHAT_CREDITS_THRESHOLD,
   VerifiedGenerationContext,
   calculateBuildCreditsForBytes,
   commitGenerationCredits,
@@ -777,8 +779,8 @@ async function streamOpenRouterCompletion(
     }, ms);
   };
 
-  // Initial connect / first-byte timeout: 12s so hung free models fail over immediately
-  resetWatchdog(12_000, `${candidate.modelName} timed out before responding`);
+  // Initial connect / first-byte timeout: 15s so reasoning/free models respond or fail over cleanly
+  resetWatchdog(15_000, `${candidate.modelName} timed out before responding`);
 
   try {
     const sendRequest = async (payloadMessages: OpenRouterChatMessage[]) =>
@@ -3118,12 +3120,17 @@ async function startServer() {
             refreshToken: auth.refreshToken,
             checkPaystack: false,
           });
-          const check = consumeBillingCredit(currentBilling, 1, Date.now());
-          if (!check.allowed) {
+          const availableBudget = getAvailableCreditsBudget(currentBilling, Date.now());
+          if (availableBudget <= MIN_CHAT_CREDITS_THRESHOLD) {
+            const plan = getPlanConfig(currentBilling.tier);
+            const hitDaily =
+              plan.dailyLimit !== null && currentBilling.dailyCreditsUsed >= plan.dailyLimit;
             res.status(402).json({
-              error: check.error,
-              code: check.code,
-              billing: serializeBillingSummary(check.state),
+              error: hitDaily
+                ? `Daily limit reached (${(plan.dailyLimit ?? 0).toLocaleString()} credits/day on ${plan.name}). Resets in 24 hours or upgrade your plan.`
+                : `You have ${availableBudget.toLocaleString()} tokens remaining (minimum ${MIN_CHAT_CREDITS_THRESHOLD + 1} tokens required to chat or build). Top up or upgrade a plan to continue.`,
+              code: hitDaily ? 'DAILY_LIMIT_REACHED' : 'LOW_CREDITS_THRESHOLD',
+              billing: serializeBillingSummary(currentBilling),
             });
             return;
           }
@@ -3134,12 +3141,23 @@ async function startServer() {
             state: currentBilling,
           };
           initialBillingSummary = serializeBillingSummary(currentBilling);
-          serverCreditBudget = getAvailableCreditsBudget(currentBilling, Date.now());
+          serverCreditBudget = availableBudget;
         }
       }
     }
     const effectiveCreditBudget =
       serverCreditBudget !== null ? serverCreditBudget : clientCreditsHint;
+    if (
+      serverCreditBudget === null &&
+      clientCreditsHint !== null &&
+      clientCreditsHint <= MIN_CHAT_CREDITS_THRESHOLD
+    ) {
+      res.status(402).json({
+        error: `You have ${clientCreditsHint.toLocaleString()} tokens remaining (minimum ${MIN_CHAT_CREDITS_THRESHOLD + 1} tokens required to chat or build). Top up or upgrade a plan to continue.`,
+        code: 'LOW_CREDITS_THRESHOLD',
+      });
+      return;
+    }
 
     pruneOldJobs();
 
@@ -3635,40 +3653,15 @@ async function startServer() {
           });
         }
 
-        const targetCredits = calculateBuildCreditsForBytes(cleanHtml.length);
+        const targetCredits = calculateBuildCreditsForBytes(cleanHtml.length, {
+          filesCount: emittedFiles.length,
+          dbTablesCount: emittedDbTables.length,
+        });
         const cappedTargetCredits =
           effectiveCreditBudget !== null
             ? Math.min(targetCredits, effectiveCreditBudget)
             : targetCredits;
-
-        if (
-          cappedTargetCredits > buildCreditsEmitted &&
-          (buildCreditsEmitted === 0 || nowMs - lastCreditEmitAt >= 900)
-        ) {
-          buildCreditsEmitted += 1;
-          lastCreditEmitAt = nowMs;
-          sendEvent({
-            type: 'credits',
-            used: buildCreditsEmitted,
-            targetUsed: cappedTargetCredits,
-          });
-        }
-
-        if (
-          effectiveCreditBudget !== null &&
-          (targetCredits > effectiveCreditBudget ||
-            (effectiveCreditBudget > 0 &&
-              buildCreditsEmitted >= effectiveCreditBudget &&
-              cleanHtml.length > effectiveCreditBudget * 1350))
-        ) {
-          buildCreditsEmitted = effectiveCreditBudget;
-          sendEvent({
-            type: 'credits',
-            used: effectiveCreditBudget,
-            targetUsed: effectiveCreditBudget,
-          });
-          triggerCreditPause();
-        }
+        buildCreditsEmitted = Math.max(buildCreditsEmitted, cappedTargetCredits);
       };
 
       const emitCleanProseRange = (upToIndex: number) => {
@@ -4373,7 +4366,13 @@ async function startServer() {
 
       const rawCreditsUsed =
         resolvedKind === 'build' && (previewHtml.length > 0 || finalFiles.length > 0)
-          ? Math.max(1, calculateBuildCreditsForBytes(previewHtml.length))
+          ? Math.max(
+              1,
+              calculateBuildCreditsForBytes(previewHtml.length, {
+                filesCount: finalFiles.length,
+                dbTablesCount: finalDbTables.length,
+              })
+            )
           : 0;
       const finalCreditsUsed =
         effectiveCreditBudget !== null
