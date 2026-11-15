@@ -29,6 +29,8 @@ function resolveProviderKey(provider?: string, modelId?: string): string {
   if (raw.includes('minimax')) return 'minimax';
   if (raw.includes('z-ai') || raw.includes('zai') || raw.includes('thudm')) return 'zai';
   if (raw.includes('groq')) return 'groq';
+  if (raw.includes('huggingface') || modelId?.startsWith('hf::')) return 'huggingface';
+  if (raw.includes('ngrok') || modelId?.startsWith('ngrok::')) return 'ngrok';
   if (raw.includes('openrouter')) return 'openrouter';
   return raw;
 }
@@ -182,6 +184,24 @@ export function ProviderLogo({
         return (
           <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" stroke="#76B900" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M3.5 12.5C6.5 7.5 12 6 17.5 8.5C19.5 9.5 20.5 11.5 20.5 13.5C20.5 16.8 17 19 12.8 19C9.5 19 7 17.2 7 14.5C7 12.2 9 10.6 11.5 10.6C13.5 10.6 15 11.8 15 13.4C15 14.8 13.9 15.8 12.5 15.8" />
+          </svg>
+        );
+
+      case 'huggingface':
+        return (
+          <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <circle cx="12" cy="12" r="9.2" fill="#FFD21E" stroke="#E0A800" strokeWidth="1.2" />
+            <circle cx="9.2" cy="10.2" r="1.25" fill="#1F2937" />
+            <circle cx="14.8" cy="10.2" r="1.25" fill="#1F2937" />
+            <path d="M8.8 14.1C9.7 15.6 14.3 15.6 15.2 14.1" stroke="#1F2937" strokeWidth="1.6" strokeLinecap="round" />
+          </svg>
+        );
+
+      case 'ngrok':
+        return (
+          <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" stroke="#1E3A8A" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <rect x="4" y="4" width="16" height="16" rx="4" fill="#EEF2FF" stroke="#4338CA" />
+            <path d="M8.5 15.5V9L15.5 15V8.5" stroke="#312E81" strokeWidth="2.1" />
           </svg>
         );
 

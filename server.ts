@@ -54,13 +54,24 @@ const PORT = Number(process.env.PORT || 3000);
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 import {
-  OPENROUTER_BASE_URL,
+  buildGatewayExecutionPlan,
+  fetchAllGatewayModels,
+  fetchHuggingFaceCatalog,
+  fetchNgrokCatalog,
+  getGatewayOrder,
+  getHuggingFaceApiKey,
+  getNgrokApiKey,
+  markGatewayCandidateCooldown,
+  type AiGatewayId,
+  type GatewayExecutionCandidate,
+  type UnifiedAiModel,
+} from './api/_aiGateways.js';
+import { generateMediaAsset } from './api/_mediaService.js';
+import {
   cleanEnvKey,
   fetchFreeOpenRouterCatalog,
-  fetchOpenRouterKeyStatus,
   getGeminiApiKey,
   getOpenRouterApiKey,
-  isCandidateFreeOpenRouterModel,
   resolveFreeModelInfo,
   type NormalizedOpenRouterModel,
 } from './api/_openrouterModels.js';
@@ -68,6 +79,8 @@ import {
 const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 
 let cachedModels: NormalizedOpenRouterModel[] = [];
+let cachedHfModels: UnifiedAiModel[] = [];
+let cachedNgrokModels: UnifiedAiModel[] = [];
 let modelsCachedAt = 0;
 let modelsCachedKey = '';
 
@@ -684,11 +697,11 @@ function classifyInitialRoute(
   return 'auto';
 }
 
-class OpenRouterApiError extends Error {
+class GatewayApiError extends Error {
   status: number;
   constructor(message: string, status: number) {
     super(message);
-    this.name = 'OpenRouterApiError';
+    this.name = 'GatewayApiError';
     this.status = status;
   }
 }
@@ -710,8 +723,7 @@ function stripImagesFromMessages(
 }
 
 async function streamOpenRouterCompletion(
-  apiKey: string,
-  modelId: string,
+  candidate: GatewayExecutionCandidate,
   systemInstruction: string,
   messages: OpenRouterChatMessage[],
   onTextChunk: (chunkText: string) => void,
@@ -719,18 +731,20 @@ async function streamOpenRouterCompletion(
   signal?: AbortSignal
 ): Promise<void> {
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${apiKey}`,
+    Authorization: `Bearer ${candidate.apiKey}`,
     'Content-Type': 'application/json',
-    'HTTP-Referer': process.env.APP_URL || `http://localhost:${PORT}`,
-    'X-Title': 'AI Craft',
   };
+  if (candidate.isOpenRouter) {
+    headers['HTTP-Referer'] = process.env.APP_URL || `http://localhost:${PORT}`;
+    headers['X-Title'] = 'AI Craft';
+  }
 
   const sendRequest = async (payloadMessages: OpenRouterChatMessage[]) =>
-    fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+    fetch(`${candidate.baseUrl}/chat/completions`, {
       method: 'POST',
       headers,
       body: JSON.stringify({
-        model: modelId,
+        model: candidate.upstreamModelId,
         stream: true,
         messages: [
           { role: 'system', content: systemInstruction },
@@ -756,7 +770,7 @@ async function streamOpenRouterCompletion(
   }
 
   if (!response.ok || !response.body) {
-    let errorDetail = `OpenRouter error (${response.status})`;
+    let errorDetail = `${candidate.gatewayLabel} error (${response.status})`;
     try {
       const errBody = (await response.json()) as {
         error?: { message?: string };
@@ -771,7 +785,7 @@ async function streamOpenRouterCompletion(
       const text = await response.text().catch(() => '');
       if (text) errorDetail = text.slice(0, 200);
     }
-    throw new OpenRouterApiError(errorDetail, response.status);
+    throw new GatewayApiError(errorDetail, response.status);
   }
 
   const reader = response.body.getReader();
@@ -1539,7 +1553,10 @@ async function startServer() {
     res.json({
       ok: true,
       openRouterConfigured: Boolean(getOpenRouterApiKey()),
+      huggingFaceConfigured: Boolean(getHuggingFaceApiKey()),
+      ngrokConfigured: Boolean(getNgrokApiKey()),
       geminiConfigured: Boolean(getGeminiApiKey()),
+      gatewayOrder: getGatewayOrder(),
       supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
     });
   });
@@ -2779,32 +2796,40 @@ async function startServer() {
 
   app.get('/api/models', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    const openRouterKey = getOpenRouterApiKey();
     const referer = getAppBaseUrl(req);
     try {
       const forceRefresh = req.query.refresh === '1';
-      const [models, keyStatus] = await Promise.all([
-        fetchOpenRouterModels(forceRefresh),
-        fetchOpenRouterKeyStatus(openRouterKey, referer, forceRefresh),
-      ]);
+      const result = await fetchAllGatewayModels(referer, forceRefresh);
+      cachedModels = result.models.filter((m) => m.gateway === 'openrouter');
+      cachedHfModels = result.models.filter((m) => m.gateway === 'huggingface');
+      cachedNgrokModels = result.models.filter((m) => m.gateway === 'ngrok');
+      modelsCachedAt = Date.now();
+      modelsCachedKey = getOpenRouterApiKey();
+
       res.json({
-        models,
-        openRouterConfigured: Boolean(openRouterKey),
-        geminiConfigured: Boolean(getGeminiApiKey()),
-        freeOnly: true,
-        keyStatus,
+        models: result.models,
+        gateways: result.gateways,
+        openRouterConfigured: result.openRouterConfigured,
+        huggingFaceConfigured: result.huggingFaceConfigured,
+        ngrokConfigured: result.ngrokConfigured,
+        geminiConfigured: result.geminiConfigured,
+        freeOnly: !result.huggingFaceConfigured && !result.ngrokConfigured,
+        keyStatus: result.keyStatus,
       });
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : 'Unable to load free OpenRouter models.';
+        err instanceof Error ? err.message : 'Unable to load AI gateway models.';
       const fallbackModels = getGeminiApiKey()
         ? [
             {
               id: 'google/gemini-4-hydrogen',
+              upstreamModelId: 'gemini-4-hydrogen',
+              gateway: 'gemini',
               name: 'Google: Gemini 4 Hydrogen',
               provider: 'google',
               contextLength: 1048576,
               isFree: true,
+              tierLabel: 'Built-in',
               capabilities: ['Code', 'Build', 'Vision'],
               category: 'code',
             },
@@ -2812,11 +2837,42 @@ async function startServer() {
         : [];
       res.status(fallbackModels.length > 0 ? 200 : 502).json({
         models: fallbackModels.length > 0 ? fallbackModels : cachedModels,
-        openRouterConfigured: Boolean(openRouterKey),
+        openRouterConfigured: Boolean(getOpenRouterApiKey()),
+        huggingFaceConfigured: Boolean(getHuggingFaceApiKey()),
+        ngrokConfigured: Boolean(getNgrokApiKey()),
         geminiConfigured: Boolean(getGeminiApiKey()),
         freeOnly: true,
         error: fallbackModels.length > 0 ? undefined : message,
       });
+    }
+  });
+
+  app.post('/api/media', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    try {
+      const body = req.body as {
+        kind?: string;
+        prompt?: string;
+        model?: string;
+      };
+      const kind = body?.kind === 'music' ? 'music' : 'image';
+      const prompt = typeof body?.prompt === 'string' ? body.prompt.trim() : '';
+      const requestedModel =
+        typeof body?.model === 'string' ? body.model.trim() : undefined;
+      if (!prompt) {
+        res.status(400).json({ error: 'Prompt is required.' });
+        return;
+      }
+      const result = await generateMediaAsset({
+        kind,
+        prompt,
+        requestedModel,
+      });
+      res.json(result);
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Unable to generate media.';
+      res.status(502).json({ error: message });
     }
   });
 
@@ -2828,6 +2884,7 @@ async function startServer() {
       message?: string;
       mode?: string;
       model?: string;
+      gateway?: string;
       clientTime?: string;
       clientTimeZone?: string;
       previousHtml?: string;
@@ -2853,6 +2910,8 @@ async function startServer() {
     const mode = body?.mode === 'web' ? 'web' : 'mobile';
     const requestedModel =
       typeof body?.model === 'string' ? body.model.trim() : '';
+    const requestedGateway =
+      typeof body?.gateway === 'string' ? body.gateway.trim() : '';
     const clientTime =
       typeof body?.clientTime === 'string' ? body.clientTime.trim() : '';
     const clientTimeZone =
@@ -3013,14 +3072,16 @@ async function startServer() {
     });
 
     const openRouterKey = getOpenRouterApiKey();
+    const huggingFaceKey = getHuggingFaceApiKey();
+    const ngrokKey = getNgrokApiKey();
     const geminiClient = createGeminiClient();
 
-    if (!openRouterKey && !geminiClient) {
+    if (!openRouterKey && !huggingFaceKey && !ngrokKey && !geminiClient) {
       clearInterval(keepAlive);
       sendEvent({
         type: 'error',
         message:
-          'No AI API key configured in Settings > Secrets. Add OPENROUTER_API_KEY or GEMINI_API_KEY.',
+          'No AI API key configured in Settings > Secrets. Add OPENROUTER_API_KEY, HUGGING_FACE_API_KEY, NGROK_API_KEY, or GEMINI_API_KEY.',
       });
       return;
     }
@@ -3098,6 +3159,7 @@ async function startServer() {
         '- REAL SUPABASE + GOOGLE LOGIN + REAL DATABASE WIRING: When Supabase secrets (`supabase-project-url` and `supabase-anon-key`/`jwt-token`/`supabase-credential`) are configured in Secrets OR requested by the user (e.g. WhatsApp/chat app with Google Login & real DB): load `@supabase/supabase-js@2` via `<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>`, initialize `window.supabase.createClient(sbUrl, sbKey)` using the exact key names found in Secrets (`getSecret` + `findSecret` fallback), wire real `supabaseClient.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } })` + `onAuthStateChange` + real `supabaseClient.from(table).select/insert/update/delete`, AND sync records into `window.AICraft.db` (`list`, `insert`, `update`, `remove`) while emitting `[[DB_SCHEMA: ...]]` lines so BOTH real cloud Postgres AND AI Craft Database explorer reflect real live data.',
         '- BUILT-IN REAL-TIME DATABASE API: For every app with data persistence, persist records via `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, `await window.AICraft.db.remove("table", id)`.',
         '- FULL STANDALONE PWA, CUSTOM BRAND LOGO & BROWSER ACCESS: Every app you build gets its own standalone hosted browser link (`/app/...`), its own Web App Manifest, its own scoped Service Worker, and its own generated PNG/SVG Home Screen icons — it NEVER inherits AI Craft\'s logo! Inside generated apps, you have FULL browser & PWA access via `window.AICraft.pwa` (`isStandalone()`, `isIOS()`, `canInstall()`, `promptInstall()`, `onInstallReady(cb)`, `logoUrl`, `themeColor`) and `window.AICraft.browser` (`setThemeColor(hex)`, `setTitle(str)`, `share(data)`, `copy(text)`, `vibrate(ms)`, `requestFullscreen()`, `getGeolocation()`, `notify(title, opts)`), plus standard Web APIs (`navigator.mediaDevices`, `localStorage`, `fetch`, Canvas, Audio, etc.).',
+        '- REAL FREE-TIER IMAGE & MUSIC GENERATION (NO TTS): When building apps that generate images or music, call `await window.AICraft.generateImage(prompt)` or `await window.AICraft.generateMusic(prompt)` (each returns `{ dataUrl, mimeType, modelId, gateway }`), routed automatically across configured free/low-cost gateways with automatic failover.',
       ].join('\n');
 
       const previewSummary = extractPreviewStructureSummary(previousHtml);
@@ -3578,44 +3640,49 @@ async function startServer() {
 
       let succeeded = false;
       let lastError: Error | null = null;
+      let usedCandidate: GatewayExecutionCandidate | null = null;
 
-      // 1. Primary + Fallback OpenRouter Routing
-      if (openRouterKey) {
-        if (cachedModels.length === 0 || modelsCachedKey !== openRouterKey) {
-          try {
-            await fetchOpenRouterModels(true);
-          } catch {
-            // proceed even if catalog refresh fails
-          }
-        }
+      await Promise.all([
+        openRouterKey && (cachedModels.length === 0 || modelsCachedKey !== openRouterKey)
+          ? fetchOpenRouterModels(true).catch(() => [])
+          : Promise.resolve(cachedModels),
+        huggingFaceKey && cachedHfModels.length === 0
+          ? fetchHuggingFaceCatalog(huggingFaceKey)
+              .then((list) => {
+                cachedHfModels = list;
+                return list;
+              })
+              .catch(() => [])
+          : Promise.resolve(cachedHfModels),
+        ngrokKey && cachedNgrokModels.length === 0
+          ? fetchNgrokCatalog(ngrokKey)
+              .then((list) => {
+                cachedNgrokModels = list;
+                return list;
+              })
+              .catch(() => [])
+          : Promise.resolve(cachedNgrokModels),
+      ]);
 
-        const candidates: string[] = [];
-        const addCandidate = (id: string | undefined) => {
-          const trimmed = id?.trim();
-          if (
-            trimmed &&
-            isCandidateFreeOpenRouterModel(trimmed, cachedModels) &&
-            !candidates.includes(trimmed)
-          ) {
-            candidates.push(trimmed);
-          }
-        };
+      const executionPlan = buildGatewayExecutionPlan({
+        requestedModel,
+        requestedGateway,
+        openRouterCatalog: cachedModels,
+        huggingFaceCatalog: cachedHfModels,
+        ngrokCatalog: cachedNgrokModels,
+      });
 
-        addCandidate(requestedModel);
-        addCandidate(process.env.OPENROUTER_FALLBACK_MODEL);
-        addCandidate('openrouter/free');
+      const failedAuthGateways = new Set<AiGatewayId>();
 
-        for (const m of cachedModels) {
-          if (m.isFree && candidates.length < 8) {
-            addCandidate(m.id);
-          }
-        }
-
-        for (let i = 0; i < candidates.length; i += 1) {
-          const candidateId = candidates[i];
+      // 1. Multi-Gateway Routing: OpenRouter (:free) -> Hugging Face Router -> ngrok AI Gateway
+      if (
+        !executionPlan.preferGeminiDirectly &&
+        executionPlan.openaiCandidates.length > 0
+      ) {
+        for (let i = 0; i < executionPlan.openaiCandidates.length; i += 1) {
+          const candidate = executionPlan.openaiCandidates[i];
           if (clientAbort.signal.aborted || pausedDueToCredits) break;
-
-          const modelInfo = resolveModelInfo(candidateId);
+          if (failedAuthGateways.has(candidate.gateway)) continue;
 
           try {
             if (i > 0) {
@@ -3625,9 +3692,10 @@ async function startServer() {
             sendEvent({
               type: 'meta',
               kind: 'chat',
-              modelId: modelInfo.id,
-              modelName: modelInfo.name,
-              provider: modelInfo.provider,
+              modelId: candidate.publicModelId,
+              modelName: candidate.modelName,
+              provider: candidate.provider,
+              gateway: candidate.gateway,
               isFallback: i > 0,
             });
 
@@ -3636,13 +3704,12 @@ async function startServer() {
                 type: 'phase',
                 phase: 'understanding',
                 kind: 'chat',
-                label: `Switching to ${modelInfo.name}...`,
+                label: `Switching to ${candidate.modelName}...`,
               });
             }
 
             await streamOpenRouterCompletion(
-              openRouterKey,
-              candidateId,
+              candidate,
               systemInstruction,
               conversationMessages,
               handleTextChunk,
@@ -3663,60 +3730,90 @@ async function startServer() {
             flushPendingStreamBuffer();
 
             if (pausedDueToCredits) {
-              modelUsed = candidateId;
+              modelUsed = candidate.publicModelId;
+              usedCandidate = candidate;
               break;
             }
 
             if (!fullRaw.trim()) {
-              throw new Error(`Model ${candidateId} returned an empty response.`);
+              throw new Error(
+                `Model ${candidate.publicModelId} returned an empty response.`
+              );
             }
 
             if (resolvedKind === 'build') {
               const extractedHtml = extractPreviewHtmlFromRaw(fullRaw);
-              if (!extractedHtml || extractedHtml.length < 60 || !/<[a-z]/i.test(extractedHtml)) {
+              if (
+                !extractedHtml ||
+                extractedHtml.length < 60 ||
+                !/<[a-z]/i.test(extractedHtml)
+              ) {
                 throw new Error(
-                  `Model ${candidateId} replied without runnable Preview HTML.`
+                  `Model ${candidate.publicModelId} replied without runnable Preview HTML.`
                 );
               }
             }
 
-            modelUsed = candidateId;
+            modelUsed = candidate.publicModelId;
+            usedCandidate = candidate;
             succeeded = true;
             break;
           } catch (err) {
             if (pausedDueToCredits) {
-              modelUsed = candidateId;
+              modelUsed = candidate.publicModelId;
+              usedCandidate = candidate;
               break;
             }
             if (clientAbort.signal.aborted) break;
             const errMsg = err instanceof Error ? err.message : String(err);
             const isGenuineInvalidKey =
-              err instanceof OpenRouterApiError &&
-              err.status === 401 &&
-              /no auth credentials|user not found|invalid api key|unauthorized/i.test(errMsg) &&
+              err instanceof GatewayApiError &&
+              (err.status === 401 || err.status === 403) &&
+              /no auth credentials|user not found|invalid api key|unauthorized|authentication failed|invalid token/i.test(
+                errMsg
+              ) &&
               !/harness|model|endpoint/i.test(errMsg);
 
             if (isGenuineInvalidKey) {
+              markGatewayCandidateCooldown(candidate.cooldownKey, 120_000);
+              failedAuthGateways.add(candidate.gateway);
+              const envVarName =
+                candidate.gateway === 'huggingface'
+                  ? 'HUGGING_FACE_API_KEY'
+                  : candidate.gateway === 'ngrok'
+                    ? 'NGROK_API_KEY'
+                    : 'OPENROUTER_API_KEY';
               lastError = new Error(
-                `OpenRouter authentication failed (${errMsg}). Please check OPENROUTER_API_KEY in Settings > Secrets.`
+                `${candidate.gatewayLabel} authentication failed (${errMsg}). Please check ${envVarName} in Settings > Secrets.`
               );
-              console.warn(`[OpenRouter] Auth error (${err.status}): ${errMsg}`);
-              break;
+              console.warn(
+                `[${candidate.gatewayLabel}] Auth error (${err.status}): ${errMsg}`
+              );
+              continue;
             }
 
-            // Never abort fallback on model-level 403/402/404/429 (e.g. agentic harness restrictions)
+            if (
+              err instanceof GatewayApiError &&
+              (err.status === 429 || err.status === 402 || err.status === 503 || err.status === 502)
+            ) {
+              markGatewayCandidateCooldown(candidate.cooldownKey, 75_000);
+            }
+
             lastError = err instanceof Error ? err : new Error(errMsg);
             console.warn(
-              `[OpenRouter] Candidate "${candidateId}" failed: ${lastError.message}`
+              `[${candidate.gatewayLabel}] Candidate "${candidate.publicModelId}" failed: ${lastError.message}`
             );
           }
         }
       }
 
-      // 2. Final Backend Fallback to Gemini if OpenRouter is unconfigured or all candidates failed
+      // 2. Final Backend Fallback to Gemini if gateways are unconfigured or all candidates failed
       if (!succeeded && !pausedDueToCredits && geminiClient && !clientAbort.signal.aborted) {
         try {
-          if (openRouterKey) {
+          if (
+            executionPlan.hasAnyOpenAiGatewayKey &&
+            !executionPlan.preferGeminiDirectly
+          ) {
             resetStreamParser();
           }
 
@@ -3726,7 +3823,10 @@ async function startServer() {
             modelId: 'google/gemini-4-hydrogen',
             modelName: 'Gemini 4 Hydrogen',
             provider: 'google',
-            isFallback: Boolean(openRouterKey),
+            gateway: 'gemini',
+            isFallback:
+              executionPlan.hasAnyOpenAiGatewayKey &&
+              !executionPlan.preferGeminiDirectly,
           });
 
           const conversationContext = history
@@ -3913,7 +4013,13 @@ async function startServer() {
         }
 
         const finalLogo = extractLogoDirectiveFromRaw(fullRaw) ?? undefined;
-        const finalInfo = resolveModelInfo(modelUsed || 'openrouter/free');
+        const finalInfo = usedCandidate
+          ? {
+              id: usedCandidate.publicModelId,
+              name: usedCandidate.modelName,
+              provider: usedCandidate.provider,
+            }
+          : resolveModelInfo(modelUsed || 'openrouter/free');
         sendEvent({
           type: 'paused',
           reason: exhaustInfo.code,
@@ -4024,7 +4130,13 @@ async function startServer() {
       }
 
       const finalLogo = extractLogoDirectiveFromRaw(fullRaw) ?? undefined;
-      const finalInfo = resolveModelInfo(modelUsed);
+      const finalInfo = usedCandidate
+        ? {
+            id: usedCandidate.publicModelId,
+            name: usedCandidate.modelName,
+            provider: usedCandidate.provider,
+          }
+        : resolveModelInfo(modelUsed);
       sendEvent({
         type: 'done',
         kind: resolvedKind,

@@ -38,6 +38,9 @@ export function ModelSelectorPopover({
 }: ModelSelectorPopoverProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
+  const [gatewayFilter, setGatewayFilter] = useState<
+    'all' | 'openrouter' | 'huggingface' | 'ngrok' | 'gemini'
+  >('all');
   const [categoryFilter, setCategoryFilter] = useState<
     'all' | 'code' | 'image' | 'music'
   >('all');
@@ -48,6 +51,14 @@ export function ModelSelectorPopover({
     () => models.find((m) => m.id === selectedModel) ?? null,
     [models, selectedModel]
   );
+
+  const availableGateways = useMemo(() => {
+    const set = new Set<string>();
+    for (const m of models) {
+      set.add(m.gateway || 'openrouter');
+    }
+    return Array.from(set);
+  }, [models]);
 
   const hasFreeImageModels = useMemo(
     () => models.some((m) => m.category === 'image' || m.capabilities?.includes('Image')),
@@ -61,6 +72,11 @@ export function ModelSelectorPopover({
   const filteredModels = useMemo(() => {
     const trimmed = query.trim().toLowerCase();
     return models.filter((m) => {
+      const gw = m.gateway || 'openrouter';
+      if (gatewayFilter !== 'all' && gw !== gatewayFilter) {
+        return false;
+      }
+
       if (categoryFilter === 'code') {
         const isCodeOrRouter =
           m.category === 'code' ||
@@ -78,10 +94,11 @@ export function ModelSelectorPopover({
         m.name.toLowerCase().includes(trimmed) ||
         m.id.toLowerCase().includes(trimmed) ||
         m.provider.toLowerCase().includes(trimmed) ||
+        gw.toLowerCase().includes(trimmed) ||
         Boolean(m.capabilities?.some((c) => c.toLowerCase().includes(trimmed)))
       );
     });
-  }, [models, query, categoryFilter]);
+  }, [models, query, gatewayFilter, categoryFilter]);
 
   useEffect(() => {
     if (!open) return;
@@ -194,17 +211,19 @@ export function ModelSelectorPopover({
             <div className="px-2.5 pt-2.5 pb-2 border-b border-black/[0.08] flex flex-col gap-1.5">
               <div className="flex items-center justify-between gap-2 px-0.5">
                 <span className="font-display font-semibold text-[12.5px] text-[#0B0B0F] tracking-[-0.01em]">
-                  Free AI Models
+                  {availableGateways.length > 1 ? 'AI Gateways' : 'Free AI Models'}
                 </span>
                 <div className="flex items-center gap-1.5">
                   <span className="text-[11px] text-[#52525B] tabular-nums">
-                    {modelsLoading ? 'Loading...' : `${filteredModels.length} free`}
+                    {modelsLoading
+                      ? 'Loading...'
+                      : `${filteredModels.length} ${availableGateways.length > 1 ? 'ready' : 'free'}`}
                   </span>
                   <button
                     type="button"
                     onClick={onRetryModels}
                     disabled={modelsLoading}
-                    aria-label="Refresh free models"
+                    aria-label="Refresh AI models"
                     className="p-1 rounded-full text-[#52525B] hover:text-[#0B0B0F] hover:bg-black/[0.05] disabled:opacity-40 transition-colors"
                   >
                     <RefreshCw
@@ -213,6 +232,44 @@ export function ModelSelectorPopover({
                   </button>
                 </div>
               </div>
+
+              {availableGateways.length > 1 && (
+                <div className="flex items-center gap-1 overflow-x-auto pb-0.5 text-[10.5px]">
+                  {(
+                    [
+                      { id: 'all', label: 'All' },
+                      ...(availableGateways.includes('openrouter')
+                        ? [{ id: 'openrouter', label: 'OpenRouter' }]
+                        : []),
+                      ...(availableGateways.includes('huggingface')
+                        ? [{ id: 'huggingface', label: 'HuggingFace' }]
+                        : []),
+                      ...(availableGateways.includes('ngrok')
+                        ? [{ id: 'ngrok', label: 'ngrok' }]
+                        : []),
+                    ] as Array<{
+                      id: 'all' | 'openrouter' | 'huggingface' | 'ngrok';
+                      label: string;
+                    }>
+                  ).map((gwTab) => {
+                    const active = gatewayFilter === gwTab.id;
+                    return (
+                      <button
+                        key={gwTab.id}
+                        type="button"
+                        onClick={() => setGatewayFilter(gwTab.id)}
+                        className={`px-2 py-0.5 rounded-md font-medium shrink-0 transition-colors ${
+                          active
+                            ? 'bg-[#0B0B0F] text-white'
+                            : 'bg-white/70 text-[#52525B] hover:text-[#0B0B0F]'
+                        }`}
+                      >
+                        {gwTab.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
 
               {(hasFreeImageModels || hasFreeMusicModels) && (
                 <div className="flex items-center gap-1 overflow-x-auto pb-0.5 text-[11px]">
@@ -249,8 +306,8 @@ export function ModelSelectorPopover({
                   type="text"
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Search free AI..."
-                  aria-label="Search free OpenRouter models"
+                  placeholder="Search models..."
+                  aria-label="Search AI gateway models"
                   className="w-full h-8 pl-7 pr-6 rounded-lg bg-white/80 border border-black/[0.07] text-[12.5px] text-[#0B0B0F] placeholder:text-[#71717A] focus:outline-none focus:bg-white"
                 />
                 {query && (
@@ -353,14 +410,14 @@ export function ModelSelectorPopover({
                               </span>
                             </>
                           )}
-                          {model.isFree && (
+                          {(model.tierLabel || model.isFree) && (
                             <>
                               <span aria-hidden="true">·</span>
                               <span
                                 className="shrink-0 font-semibold"
                                 style={{ color: theme.accentColor }}
                               >
-                                Free
+                                {model.tierLabel || 'Free'}
                               </span>
                             </>
                           )}

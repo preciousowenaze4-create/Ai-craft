@@ -890,11 +890,20 @@ export default function App() {
       if (fetched.length > 0) {
         setModels(fetched);
         setSelectedModel((prev) => {
-          const matched = prev ? fetched.find((m) => m.id === prev && m.isFree) : undefined;
+          const matched = prev
+            ? fetched.find(
+                (m) =>
+                  m.id === prev &&
+                  (m.isFree ||
+                    m.gateway === 'huggingface' ||
+                    m.gateway === 'ngrok' ||
+                    m.gateway === 'gemini')
+              )
+            : undefined;
           return matched ? matched.id : fetched[0].id;
         });
       } else if (!response.ok || data?.error) {
-        setModelsError(data?.error || 'Unable to load free OpenRouter models.');
+        setModelsError(data?.error || 'Unable to load AI gateway models.');
       }
     } catch (err) {
       setModelsError(
@@ -1776,6 +1785,7 @@ export default function App() {
           Intl.DateTimeFormat().resolvedOptions().timeZone || '';
         const clientTime = new Date().toLocaleString();
 
+        const matchedModel = models.find((m) => m.id === modelToUse);
         const response = await fetch('/api/craft/stream', {
           method: 'POST',
           headers: {
@@ -1786,6 +1796,7 @@ export default function App() {
             message,
             mode: targetMode,
             model: modelToUse || undefined,
+            gateway: matchedModel?.gateway || undefined,
             clientTime,
             clientTimeZone,
             previousHtml,

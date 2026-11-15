@@ -526,6 +526,20 @@ export function BuilderWorkspace({
       window.parent.postMessage({ type: 'aicraft:search', id: id, query: String(query || '') }, '*');
     });
   }
+  function generateMedia(kind, prompt, model) {
+    return fetch('/api/media', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: kind, prompt: String(prompt || ''), model: model || undefined })
+    }).then(function(r) {
+      return r.json().then(function(data) {
+        if (!r.ok || !data || data.error) {
+          throw new Error((data && data.error) || 'Media generation failed.');
+        }
+        return data;
+      });
+    });
+  }
   function getPreviewThemeColor() {
     var m = document.querySelector('meta[name="theme-color"]');
     return (m && m.getAttribute('content')) || '#0F172A';
@@ -603,6 +617,8 @@ export function BuilderWorkspace({
     ask: ask,
     chat: ask,
     search: search,
+    generateImage: function(prompt, model) { return generateMedia('image', prompt, model); },
+    generateMusic: function(prompt, model) { return generateMedia('music', prompt, model); },
     edit: function(instruction) {
       window.parent.postMessage({ type: 'aicraft:edit', instruction: String(instruction || '') }, '*');
     }

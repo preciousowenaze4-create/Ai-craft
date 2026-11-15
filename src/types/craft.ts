@@ -62,6 +62,9 @@ export interface OpenRouterModel {
   provider: string;
   contextLength: number;
   isFree: boolean;
+  gateway?: 'openrouter' | 'huggingface' | 'ngrok' | 'gemini';
+  upstreamModelId?: string;
+  tierLabel?: string;
   capabilities?: string[];
   category?: 'router' | 'code' | 'image' | 'music' | 'chat';
 }

@@ -201,7 +201,7 @@ export function filterPublicSafeEnv(
   for (const [key, val] of Object.entries(env)) {
     if (!key || typeof val !== 'string' || !val) continue;
     const isPrivate =
-      /(?:secret|service_role|private|password|passwd|webhook|signing|admin|oauth_client_secret|openrouter|gemini_api_key|openai_api_key)/i.test(
+      /(?:secret|service_role|private|password|passwd|webhook|signing|admin|oauth_client_secret|openrouter|gemini_api_key|openai_api_key|hugging_?face|hf_token|ngrok_api_key)/i.test(
         key
       ) || /^sk_(?:live|test)_/i.test(val);
     if (!isPrivate) {
@@ -565,6 +565,20 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
     browser: browserApi,
     search: function(query) {
       return fetch('/api/search?q=' + encodeURIComponent(String(query || ''))).then(function(r) { return r.json(); });
+    },
+    generateImage: function(prompt, model) {
+      return fetch('/api/media', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'image', prompt: String(prompt || ''), model: model || undefined })
+      }).then(function(r) { return r.json(); });
+    },
+    generateMusic: function(prompt, model) {
+      return fetch('/api/media', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'music', prompt: String(prompt || ''), model: model || undefined })
+      }).then(function(r) { return r.json(); });
     },
     ask: function() { return Promise.resolve(''); },
     chat: function() { return Promise.resolve(''); },

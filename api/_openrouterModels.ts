@@ -74,9 +74,34 @@ export function cleanEnvKey(
   return cleaned;
 }
 
-export function getOpenRouterApiKey(): string {
-  const candidates = [
+export function parseEnvKeyPool(
+  rawCandidates: Array<string | undefined>,
+  placeholders: string[]
+): string[] {
+  const pool: string[] = [];
+  const seen = new Set<string>();
+
+  for (const raw of rawCandidates) {
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    // Allow users to optionally provide comma/newline/semicolon-separated own backup keys
+    const parts = raw.split(/[\n,;]+/);
+    for (const part of parts) {
+      const cleaned = cleanEnvKey(part, placeholders);
+      if (!cleaned || seen.has(cleaned)) continue;
+      seen.add(cleaned);
+      pool.push(cleaned);
+    }
+  }
+  return pool;
+}
+
+export function getOpenRouterApiKeyPool(): string[] {
+  const rawCandidates = [
     process.env.OPENROUTER_API_KEY,
+    process.env.OPENROUTER_API_KEY_2,
+    process.env.OPENROUTER_API_KEY_3,
+    process.env.OPENROUTER_API_KEY_4,
+    process.env.OPENROUTER_API_KEY_5,
     process.env.OPEN_ROUTER_API_KEY,
     process.env.OPENROUTER_KEY,
     process.env.OPENROUTER_API,
@@ -84,28 +109,41 @@ export function getOpenRouterApiKey(): string {
     process.env.NEXT_PUBLIC_OPENROUTER_API_KEY,
     process.env.VITE_OPENROUTER_API_KEY,
   ];
-  for (const raw of candidates) {
-    const cleaned = cleanEnvKey(raw, ['MY_OPENROUTER_API_KEY']);
-    if (!cleaned || cleaned.startsWith('AIza')) continue;
-    return cleaned;
-  }
+  const pool = parseEnvKeyPool(rawCandidates, ['MY_OPENROUTER_API_KEY']).filter(
+    (k) => !k.startsWith('AIza')
+  );
   const apiKey = cleanEnvKey(process.env.API_KEY, ['MY_OPENROUTER_API_KEY']);
-  if (apiKey.startsWith('sk-or-')) return apiKey;
-  return '';
+  if (apiKey.startsWith('sk-or-') && !pool.includes(apiKey)) {
+    pool.push(apiKey);
+  }
+  return pool;
 }
 
-export function getGeminiApiKey(): string {
+export function getOpenRouterApiKey(): string {
+  return getOpenRouterApiKeyPool()[0] || '';
+}
+
+export function getGeminiApiKeyPool(): string[] {
   const candidates = [
     process.env.GEMINI_API_KEY,
+    process.env.GEMINI_API_KEY_2,
+    process.env.GEMINI_API_KEY_3,
     process.env.GOOGLE_API_KEY,
     process.env.GOOGLE_GENERATIVE_AI_API_KEY,
     process.env.VITE_GEMINI_API_KEY,
   ];
-  for (const raw of candidates) {
-    const cleaned = cleanEnvKey(raw, ['MY_GEMINI_API_KEY']);
-    if (cleaned) return cleaned;
-  }
-  return '';
+  return parseEnvKeyPool(candidates, ['MY_GEMINI_API_KEY']);
+}
+
+export function getGeminiApiKey(): string {
+  return getGeminiApiKeyPool()[0] || '';
+}
+
+export function isTextToSpeechModel(text: string | undefined): boolean {
+  if (!text) return false;
+  return /\b(?:tts|text-to-speech|text_to_speech|speech-synthesis|speecht5|voice-clone|voice\s+cloning|kokoro|bark|parler|fish-speech|xtts|piper|vits|mms-tts|orpheus|sesame-csm|chatterbox|f5-tts|cosyvoice|styletts|tortoise-tts|elevenlabs)\b/i.test(
+    text
+  );
 }
 
 export function isRestrictedHarnessModel(id: string): boolean {
@@ -136,6 +174,11 @@ function hasPaidFlatFeeDisclaimer(description: string | undefined): boolean {
 export function isTrulyFreeOpenRouterModel(item: OpenRouterApiModel): boolean {
   const id = typeof item?.id === 'string' ? item.id.trim() : '';
   if (!id || isRestrictedHarnessModel(id)) return false;
+
+  // Exclude Text-to-Speech models explicitly
+  if (isTextToSpeechModel(`${id} ${item?.name || ''} ${item?.description || ''}`)) {
+    return false;
+  }
 
   if (
     Array.isArray(item?.endpoints) &&
