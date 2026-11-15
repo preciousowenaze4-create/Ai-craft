@@ -131,7 +131,11 @@ export function PromptComposer({
           />
           <span className="text-[12.5px] font-medium text-[#18181B] truncate">
             {activeModel?.name ??
-              (modelsLoading ? 'Connecting AI...' : selectedModel || 'Select AI')}
+              (selectedModel === 'auto::architect'
+                ? 'AI Craft Architect (Smart Builder)'
+                : modelsLoading
+                  ? 'Connecting AI...'
+                  : selectedModel || 'AI Craft Architect (Smart Builder)')}
           </span>
         </div>
 

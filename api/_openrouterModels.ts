@@ -35,19 +35,20 @@ export interface OpenRouterKeyStatus {
 
 const PRIORITY_FREE_MODEL_ORDER: string[] = [
   'openrouter/free',
-  'cohere/north-mini-code:free',
-  'particle-ai/particle-1:free',
+  'deepseek/deepseek-chat-v3-0324:free',
+  'deepseek/deepseek-r1-0528:free',
+  'qwen/qwen3-coder:free',
+  'qwen/qwen3-235b-a22b:free',
   'google/gemma-4-31b-it:free',
+  'meta-llama/llama-3.3-70b-instruct:free',
   'nvidia/nemotron-3-ultra-550b-a55b:free',
+  'cohere/north-mini-code:free',
   'google/gemma-4-26b-a4b-it:free',
   'nvidia/nemotron-3.5-super-vl:free',
   'baidu/ernie-5.5-flash-preview:free',
   'recursive/flint-v1.0:free',
   'inclusionai/ling-3.2-flash:free',
-  'nvidia/nemotron-3.5-lightning:free',
   'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
-  'dots-studio/dots-3-note-preview:free',
-  'liquid/lfm-3-1.7b:free',
 ];
 
 const keyStatusCache = new Map<

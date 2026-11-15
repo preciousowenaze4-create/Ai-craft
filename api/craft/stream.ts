@@ -12,12 +12,16 @@ import {
   verifyUserCanGenerate,
 } from '../_billing.js';
 import {
+  buildCandidateCooldownKey,
   buildGatewayExecutionPlan,
+  fetchGroqCatalog,
   fetchHuggingFaceCatalog,
   fetchNgrokCatalog,
   fetchPollinationsCatalog,
+  getGroqApiKey,
   getHuggingFaceApiKey,
   getNgrokApiKey,
+  isGatewayCandidateCoolingDown,
   markGatewayCandidateCooldown,
   POLLINATIONS_FALLBACK_MODELS,
   type AiGatewayId,
@@ -30,7 +34,7 @@ import {
 } from '../_mediaService.js';
 import {
   fetchFreeOpenRouterCatalog,
-  getGeminiApiKey,
+  getGeminiApiKeyPool,
   getOpenRouterApiKey,
   resolveFreeModelInfo as resolveModelInfo,
   type NormalizedOpenRouterModel,
@@ -45,19 +49,41 @@ class GatewayApiError extends Error {
   }
 }
 
-function createGeminiClient() {
-  const apiKey = getGeminiApiKey();
-  if (!apiKey) {
-    return null;
+interface GeminiKeyClientEntry {
+  apiKey: string;
+  cooldownKey: string;
+  client: GoogleGenAI;
+}
+
+function createGeminiClientPool(): GeminiKeyClientEntry[] {
+  const keys = getGeminiApiKeyPool();
+  const ready: GeminiKeyClientEntry[] = [];
+  const cooling: GeminiKeyClientEntry[] = [];
+  for (const apiKey of keys) {
+    const cooldownKey = buildCandidateCooldownKey(
+      'gemini',
+      apiKey,
+      'gemini-4-hydrogen'
+    );
+    const entry: GeminiKeyClientEntry = {
+      apiKey,
+      cooldownKey,
+      client: new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      }),
+    };
+    if (isGatewayCandidateCoolingDown(cooldownKey)) {
+      cooling.push(entry);
+    } else {
+      ready.push(entry);
+    }
   }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
+  return [...ready, ...cooling];
 }
 
 async function fetchFreeOpenRouterFallbacks(
@@ -1338,10 +1364,11 @@ export async function POST(request: Request): Promise<Response> {
       };
 
       try {
+        const groqKey = getGroqApiKey();
         const openRouterKey = getOpenRouterApiKey();
         const huggingFaceKey = getHuggingFaceApiKey();
         const ngrokKey = getNgrokApiKey();
-        const geminiClient = createGeminiClient();
+        const geminiClients = createGeminiClientPool();
 
         // Always begin in normal Thinking mode — never jump straight to Building
         sendEvent({
@@ -1351,7 +1378,7 @@ export async function POST(request: Request): Promise<Response> {
           label: 'Thinking...',
         });
 
-        const [orList, hfList, ngrokList, polList] = await Promise.all([
+        const [orList, hfList, ngrokList, groqList, polList] = await Promise.all([
           openRouterKey
             ? fetchFreeOpenRouterFallbacks(openRouterKey, referer)
             : Promise.resolve([]),
@@ -1361,11 +1388,15 @@ export async function POST(request: Request): Promise<Response> {
           ngrokKey
             ? fetchNgrokCatalog(ngrokKey).catch(() => [])
             : Promise.resolve([]),
+          groqKey
+            ? fetchGroqCatalog(groqKey).catch(() => [])
+            : Promise.resolve([]),
           fetchPollinationsCatalog().catch(() => [...POLLINATIONS_FALLBACK_MODELS]),
         ]);
         const catalog: NormalizedOpenRouterModel[] = orList;
         const hfCatalog: UnifiedAiModel[] = hfList;
         const ngrokCatalog: UnifiedAiModel[] = ngrokList;
+        const groqCatalog: UnifiedAiModel[] = groqList;
         const polCatalog: UnifiedAiModel[] = polList;
 
         const executionPlan = buildGatewayExecutionPlan({
@@ -1374,6 +1405,7 @@ export async function POST(request: Request): Promise<Response> {
           openRouterCatalog: catalog,
           huggingFaceCatalog: hfCatalog,
           ngrokCatalog,
+          groqCatalog,
           pollinationsCatalog: polCatalog,
         });
 
@@ -1954,21 +1986,29 @@ export async function POST(request: Request): Promise<Response> {
 
         let succeeded = false;
         let lastError: Error | null = null;
-        let usedCandidate: GatewayExecutionCandidate | null = null;
+        const runtimeSelection: { candidate: GatewayExecutionCandidate | null } = {
+          candidate: null,
+        };
+        let hasAttemptedAnyEngine = false;
 
         const failedAuthGateways = new Set<AiGatewayId>();
 
-        if (
-          !executionPlan.preferGeminiDirectly &&
-          executionPlan.openaiCandidates.length > 0
-        ) {
-          for (let i = 0; i < executionPlan.openaiCandidates.length; i += 1) {
-            const candidate = executionPlan.openaiCandidates[i];
-            if (request.signal.aborted || pausedDueToCredits || pausedDueToStreamLimit) break;
+        const runOpenAiPool = async (
+          candidates: GatewayExecutionCandidate[],
+          isFallbackPhase: boolean
+        ) => {
+          for (let i = 0; i < candidates.length; i += 1) {
+            const candidate = candidates[i];
+            if (request.signal.aborted || pausedDueToCredits || pausedDueToStreamLimit) {
+              break;
+            }
             if (failedAuthGateways.has(candidate.gateway)) continue;
 
+            const isRetryAttempt = hasAttemptedAnyEngine;
+            hasAttemptedAnyEngine = true;
+
             try {
-              if (i > 0) {
+              if (isRetryAttempt) {
                 resetStreamParser();
               }
 
@@ -1981,16 +2021,16 @@ export async function POST(request: Request): Promise<Response> {
                   modelName: candidate.modelName,
                   provider: candidate.provider,
                   gateway: candidate.gateway,
-                  isFallback: i > 0,
+                  isFallback: isFallbackPhase || i > 0,
                 });
               }
 
-              if (i > 0 && mediaKind === null) {
+              if ((isFallbackPhase || i > 0) && mediaKind === null) {
                 sendEvent({
                   type: 'phase',
                   phase: 'understanding',
                   kind: 'chat',
-                  label: `Switching to ${candidate.modelName}...`,
+                  label: `Routing via ${candidate.modelName}...`,
                 });
               }
 
@@ -2018,7 +2058,7 @@ export async function POST(request: Request): Promise<Response> {
 
               if (pausedDueToCredits || pausedDueToStreamLimit) {
                 modelUsed = candidate.publicModelId;
-                usedCandidate = candidate;
+                runtimeSelection.candidate = candidate;
                 break;
               }
 
@@ -2042,13 +2082,13 @@ export async function POST(request: Request): Promise<Response> {
               }
 
               modelUsed = candidate.publicModelId;
-              usedCandidate = candidate;
+              runtimeSelection.candidate = candidate;
               succeeded = true;
               break;
             } catch (err) {
               if (pausedDueToCredits || pausedDueToStreamLimit) {
                 modelUsed = candidate.publicModelId;
-                usedCandidate = candidate;
+                runtimeSelection.candidate = candidate;
                 break;
               }
               if (request.signal.aborted) break;
@@ -2065,11 +2105,13 @@ export async function POST(request: Request): Promise<Response> {
                 markGatewayCandidateCooldown(candidate.cooldownKey, 120_000);
                 failedAuthGateways.add(candidate.gateway);
                 const envVarName =
-                  candidate.gateway === 'huggingface'
-                    ? 'HUGGING_FACE_API_KEY'
-                    : candidate.gateway === 'ngrok'
-                      ? 'NGROK_API_KEY'
-                      : 'OPENROUTER_API_KEY';
+                  candidate.gateway === 'groq'
+                    ? 'GROQ_API_KEY'
+                    : candidate.gateway === 'huggingface'
+                      ? 'HUGGING_FACE_API_KEY'
+                      : candidate.gateway === 'ngrok'
+                        ? 'NGROK_API_KEY'
+                        : 'OPENROUTER_API_KEY';
                 lastError = new Error(
                   `${candidate.gatewayLabel} authentication failed (${errMsg}). Please check ${envVarName} in your environment variables.`
                 );
@@ -2088,145 +2130,216 @@ export async function POST(request: Request): Promise<Response> {
               lastError = err instanceof Error ? err : new Error(errMsg);
             }
           }
-        }
+        };
 
-        if (
-          !succeeded &&
-          !pausedDueToCredits &&
-          !pausedDueToStreamLimit &&
-          geminiClient &&
-          !request.signal.aborted
-        ) {
-          try {
-            if (executionPlan.hasAnyOpenAiGatewayKey && !executionPlan.preferGeminiDirectly) {
-              resetStreamParser();
-            }
+        const runGeminiPool = async (isFallbackPhase: boolean) => {
+          if (geminiClients.length === 0) return;
 
-            if (mediaKind === null) {
-              sendEvent({
-                type: 'meta',
-                kind: 'chat',
-                modelId: 'google/gemini-4-hydrogen',
-                modelName: 'Gemini 4 Hydrogen',
-                provider: 'google',
-                gateway: 'gemini',
-                isFallback:
-                  executionPlan.hasAnyOpenAiGatewayKey &&
-                  !executionPlan.preferGeminiDirectly,
-              });
-            }
+          const conversationContext = history
+            .slice(-6)
+            .map((item) => `${item.role === 'user' ? 'User' : 'AI Craft'}: ${item.text}`)
+            .join('\n');
 
-            const conversationContext = history
-              .slice(-6)
-              .map((item) => `${item.role === 'user' ? 'User' : 'AI Craft'}: ${item.text}`)
-              .join('\n');
+          const promptParts: string[] = [];
+          if (conversationContext) {
+            promptParts.push(`Conversation history:\n${conversationContext}`);
+          }
+          if (previousHtml && initialRoute !== 'chat') {
+            promptParts.push(
+              `Existing Preview app HTML (for context or surgical updates if building/editing):\n${previousHtml.slice(0, 28000)}`
+            );
+          } else if (previousHtml && initialRoute === 'chat') {
+            promptParts.push(
+              `Current Preview app summary (user is chatting/asking a question):\n${previewSummary}`
+            );
+          }
+          if (attachmentText) {
+            promptParts.push(
+              `Attached reference text (${options.attachmentName || 'file'}):\n${attachmentText}`
+            );
+          } else if (attachmentDataUrl) {
+            promptParts.push(
+              `The user attached a screenshot (${options.attachmentName || 'screenshot.jpg'}). Inspect it visually together with the Live Preview app and apply the exact edits or build requested.`
+            );
+          }
+          promptParts.push(`User request:\n${message}`);
+          const fullPrompt = promptParts.join('\n\n');
 
-            const promptParts: string[] = [];
-            if (conversationContext) {
-              promptParts.push(`Conversation history:\n${conversationContext}`);
-            }
-            if (previousHtml && initialRoute !== 'chat') {
-              promptParts.push(
-                `Existing Preview app HTML (for context or surgical updates if building/editing):\n${previousHtml.slice(0, 28000)}`
-              );
-            } else if (previousHtml && initialRoute === 'chat') {
-              promptParts.push(
-                `Current Preview app summary (user is chatting/asking a question):\n${previewSummary}`
-              );
-            }
-            if (attachmentText) {
-              promptParts.push(
-                `Attached reference text (${options.attachmentName || 'file'}):\n${attachmentText}`
-              );
-            } else if (attachmentDataUrl) {
-              promptParts.push(
-                `The user attached a screenshot (${options.attachmentName || 'screenshot.jpg'}). Inspect it visually together with the Live Preview app and apply the exact edits or build requested.`
-              );
-            }
-            promptParts.push(`User request:\n${message}`);
-            const fullPrompt = promptParts.join('\n\n');
+          let geminiContents:
+            | string
+            | {
+                parts: Array<
+                  | { inlineData: { mimeType: string; data: string } }
+                  | { text: string }
+                >;
+              } = fullPrompt;
 
-            let geminiContents:
-              | string
-              | {
-                  parts: Array<
-                    | { inlineData: { mimeType: string; data: string } }
-                    | { text: string }
-                  >;
-                } = fullPrompt;
-
-            if (attachmentDataUrl) {
-              const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/i.exec(
-                attachmentDataUrl
-              );
-              if (match) {
-                geminiContents = {
-                  parts: [
-                    {
-                      inlineData: {
-                        mimeType: attachmentMimeType || match[1],
-                        data: match[2],
-                      },
+          if (attachmentDataUrl) {
+            const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/i.exec(
+              attachmentDataUrl
+            );
+            if (match) {
+              geminiContents = {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: attachmentMimeType || match[1],
+                      data: match[2],
                     },
-                    { text: fullPrompt },
-                  ],
-                };
-              }
-            }
-
-            const runGeminiStream = async (withSearchTool: boolean) =>
-              geminiClient.models.generateContentStream({
-                model: 'gemini-4-hydrogen',
-                contents: geminiContents,
-                config: {
-                  systemInstruction,
-                  thinkingConfig: {
-                    thinkingLevel:
-                      initialRoute === 'chat'
-                        ? ThinkingLevel.MEDIUM
-                        : ThinkingLevel.HIGH,
                   },
-                  ...(withSearchTool ? { tools: [{ googleSearch: {} }] } : {}),
-                },
-              });
+                  { text: fullPrompt },
+                ],
+              };
+            }
+          }
 
-            let geminiStream;
+          for (let gIdx = 0; gIdx < geminiClients.length; gIdx += 1) {
+            const entry = geminiClients[gIdx];
+            if (request.signal.aborted || pausedDueToCredits || pausedDueToStreamLimit) {
+              break;
+            }
+
+            const isRetryAttempt = hasAttemptedAnyEngine;
+            hasAttemptedAnyEngine = true;
+
             try {
-              geminiStream = await runGeminiStream(webSearchEnabled);
-            } catch {
-              if (webSearchEnabled) {
-                geminiStream = await runGeminiStream(false);
-              } else {
-                throw new Error('Gemini stream request failed.');
+              if (isRetryAttempt) {
+                resetStreamParser();
               }
-            }
 
-            for await (const chunk of geminiStream) {
-              if (request.signal.aborted || pausedDueToCredits || pausedDueToStreamLimit) break;
-              if (chunk.text) {
-                handleTextChunk(chunk.text);
-                if (pausedDueToCredits || pausedDueToStreamLimit) break;
+              if (mediaKind === null) {
+                sendEvent({
+                  type: 'meta',
+                  kind: 'chat',
+                  modelId: 'google/gemini-4-hydrogen',
+                  modelName: 'AI Craft Architect · Gemini',
+                  provider: 'google',
+                  gateway: 'gemini',
+                  isFallback: isFallbackPhase || gIdx > 0,
+                });
               }
-            }
 
-            flushPendingStreamBuffer();
+              const runGeminiStream = async (withSearchTool: boolean) =>
+                entry.client.models.generateContentStream({
+                  model: 'gemini-4-hydrogen',
+                  contents: geminiContents,
+                  config: {
+                    systemInstruction,
+                    thinkingConfig: {
+                      thinkingLevel:
+                        initialRoute === 'chat'
+                          ? ThinkingLevel.MEDIUM
+                          : ThinkingLevel.HIGH,
+                    },
+                    ...(withSearchTool ? { tools: [{ googleSearch: {} }] } : {}),
+                  },
+                });
 
-            if (pausedDueToCredits || pausedDueToStreamLimit) {
-              modelUsed = 'google/gemini-4-hydrogen';
-            } else {
+              let geminiStream;
+              try {
+                geminiStream = await runGeminiStream(webSearchEnabled);
+              } catch (toolErr) {
+                if (webSearchEnabled) {
+                  geminiStream = await runGeminiStream(false);
+                } else {
+                  throw toolErr;
+                }
+              }
+
+              for await (const chunk of geminiStream) {
+                if (request.signal.aborted || pausedDueToCredits || pausedDueToStreamLimit) {
+                  break;
+                }
+                if (chunk.text) {
+                  handleTextChunk(chunk.text);
+                  if (pausedDueToCredits || pausedDueToStreamLimit) break;
+                }
+              }
+
+              flushPendingStreamBuffer();
+
+              if (pausedDueToCredits || pausedDueToStreamLimit) {
+                modelUsed = 'google/gemini-4-hydrogen';
+                runtimeSelection.candidate = null;
+                break;
+              }
+
               if (!fullRaw.trim()) {
-                throw new Error('Fallback AI engine returned an empty response.');
+                throw new Error('Gemini returned an empty response.');
+              }
+
+              if (resolvedKind === 'build' && mediaKind === null) {
+                const extractedHtml = extractPreviewHtmlFromRaw(fullRaw);
+                if (
+                  !extractedHtml ||
+                  extractedHtml.length < 60 ||
+                  !/<[a-z]/i.test(extractedHtml)
+                ) {
+                  throw new Error('Gemini replied without runnable Preview HTML.');
+                }
               }
 
               modelUsed = 'google/gemini-4-hydrogen';
+              runtimeSelection.candidate = null;
               succeeded = true;
+              break;
+            } catch (err) {
+              if (pausedDueToCredits || pausedDueToStreamLimit) {
+                modelUsed = 'google/gemini-4-hydrogen';
+                runtimeSelection.candidate = null;
+                break;
+              }
+              if (request.signal.aborted) break;
+              const errMsg = err instanceof Error ? err.message : String(err);
+              if (
+                /429|quota|rate.?limit|resource_exhausted|too many requests|exceeded/i.test(
+                  errMsg
+                )
+              ) {
+                markGatewayCandidateCooldown(entry.cooldownKey, 75_000);
+              } else if (/api key not valid|invalid api key|unauthorized|401|403/i.test(errMsg)) {
+                markGatewayCandidateCooldown(entry.cooldownKey, 120_000);
+              }
+              lastError = err instanceof Error ? err : new Error(errMsg);
             }
-          } catch (err) {
-            if (pausedDueToCredits || pausedDueToStreamLimit) {
-              modelUsed = 'google/gemini-4-hydrogen';
-            } else {
-              lastError = err instanceof Error ? err : new Error(String(err));
-            }
+          }
+        };
+
+        if (executionPlan.preferGeminiFirst) {
+          await runGeminiPool(false);
+          if (
+            !succeeded &&
+            !pausedDueToCredits &&
+            !pausedDueToStreamLimit &&
+            !request.signal.aborted
+          ) {
+            await runOpenAiPool(executionPlan.keyedOpenAiCandidates, geminiClients.length > 0);
+          }
+          if (
+            !succeeded &&
+            !pausedDueToCredits &&
+            !pausedDueToStreamLimit &&
+            !request.signal.aborted
+          ) {
+            await runOpenAiPool(executionPlan.pollinationsCandidates, true);
+          }
+        } else {
+          await runOpenAiPool(executionPlan.keyedOpenAiCandidates, false);
+          if (
+            !succeeded &&
+            !pausedDueToCredits &&
+            !pausedDueToStreamLimit &&
+            !request.signal.aborted
+          ) {
+            await runGeminiPool(executionPlan.keyedOpenAiCandidates.length > 0);
+          }
+          if (
+            !succeeded &&
+            !pausedDueToCredits &&
+            !pausedDueToStreamLimit &&
+            !request.signal.aborted
+          ) {
+            await runOpenAiPool(executionPlan.pollinationsCandidates, true);
           }
         }
 
@@ -2314,11 +2427,11 @@ export async function POST(request: Request): Promise<Response> {
           }
 
           const finalLogo = extractLogoDirectiveFromRaw(fullRaw) ?? undefined;
-          const finalInfo = usedCandidate
+          const finalInfo = runtimeSelection.candidate
             ? {
-                id: usedCandidate.publicModelId,
-                name: usedCandidate.modelName,
-                provider: usedCandidate.provider,
+                id: runtimeSelection.candidate.publicModelId,
+                name: runtimeSelection.candidate.modelName,
+                provider: runtimeSelection.candidate.provider,
               }
             : resolveModelInfo(modelUsed || 'openrouter/free', catalog);
           sendEvent({
@@ -2418,11 +2531,11 @@ export async function POST(request: Request): Promise<Response> {
             return;
           }
 
-          const finalInfo = usedCandidate
+          const finalInfo = runtimeSelection.candidate
             ? {
-                id: usedCandidate.publicModelId,
-                name: usedCandidate.modelName,
-                provider: usedCandidate.provider,
+                id: runtimeSelection.candidate.publicModelId,
+                name: runtimeSelection.candidate.modelName,
+                provider: runtimeSelection.candidate.provider,
               }
             : resolveModelInfo(modelUsed, catalog);
 
@@ -2533,11 +2646,11 @@ export async function POST(request: Request): Promise<Response> {
         }
 
         const finalLogo = extractLogoDirectiveFromRaw(fullRaw) ?? undefined;
-        const finalInfo = usedCandidate
+        const finalInfo = runtimeSelection.candidate
           ? {
-              id: usedCandidate.publicModelId,
-              name: usedCandidate.modelName,
-              provider: usedCandidate.provider,
+              id: runtimeSelection.candidate.publicModelId,
+              name: runtimeSelection.candidate.modelName,
+              provider: runtimeSelection.candidate.provider,
             }
           : resolveModelInfo(modelUsed, catalog);
         sendEvent({

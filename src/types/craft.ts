@@ -71,7 +71,14 @@ export interface OpenRouterModel {
   provider: string;
   contextLength: number;
   isFree: boolean;
-  gateway?: 'openrouter' | 'huggingface' | 'ngrok' | 'pollinations' | 'gemini';
+  gateway?:
+    | 'auto'
+    | 'gemini'
+    | 'groq'
+    | 'openrouter'
+    | 'huggingface'
+    | 'ngrok'
+    | 'pollinations';
   upstreamModelId?: string;
   tierLabel?: string;
   capabilities?: string[];

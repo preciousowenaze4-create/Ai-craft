@@ -1,4 +1,9 @@
-import { fetchAllGatewayModels } from './_aiGateways.js';
+import {
+  ARCHITECT_PUBLIC_MODEL,
+  POLLINATIONS_FALLBACK_MODELS,
+  fetchAllGatewayModels,
+  getGroqApiKey,
+} from './_aiGateways.js';
 import { getGeminiApiKey, getOpenRouterApiKey } from './_openrouterModels.js';
 
 export async function GET(request: Request): Promise<Response> {
@@ -13,6 +18,7 @@ export async function GET(request: Request): Promise<Response> {
       {
         models: result.models,
         gateways: result.gateways,
+        groqConfigured: result.groqConfigured,
         openRouterConfigured: result.openRouterConfigured,
         huggingFaceConfigured: result.huggingFaceConfigured,
         ngrokConfigured: result.ngrokConfigured,
@@ -31,35 +37,23 @@ export async function GET(request: Request): Promise<Response> {
     const message =
       err instanceof Error ? err.message : 'Unable to load AI gateway models.';
     const geminiConfigured = Boolean(getGeminiApiKey());
+    const groqConfigured = Boolean(getGroqApiKey());
     const openRouterConfigured = Boolean(getOpenRouterApiKey());
 
-    const fallbackModels = geminiConfigured
-      ? [
-          {
-            id: 'google/gemini-4-hydrogen',
-            upstreamModelId: 'gemini-4-hydrogen',
-            gateway: 'gemini' as const,
-            name: 'Google: Gemini 4 Hydrogen',
-            provider: 'google',
-            contextLength: 1048576,
-            isFree: true,
-            tierLabel: 'Built-in',
-            capabilities: ['Code', 'Build', 'Vision'],
-            category: 'code' as const,
-          },
-        ]
-      : [];
+    const fallbackModels = [ARCHITECT_PUBLIC_MODEL, ...POLLINATIONS_FALLBACK_MODELS.filter((m) => m.category !== 'code')];
 
     return Response.json(
       {
         models: fallbackModels,
+        groqConfigured,
         openRouterConfigured,
         geminiConfigured,
+        pollinationsConfigured: true,
         freeOnly: true,
         error: fallbackModels.length > 0 ? undefined : message,
       },
       {
-        status: fallbackModels.length > 0 ? 200 : 502,
+        status: 200,
         headers: {
           'Cache-Control': 'no-store',
         },

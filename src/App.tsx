@@ -411,8 +411,8 @@ export default function App() {
   const [swipedProjectId, setSwipedProjectId] = useState<string | null>(null);
   const [inlineNotice, setInlineNotice] = useState<string | null>(null);
   const [models, setModels] = useState<OpenRouterModel[]>([]);
-  const [selectedModel, setSelectedModel] = useState<string>(() =>
-    loadSavedString(STORAGE_MODEL_KEY)
+  const [selectedModel, setSelectedModel] = useState<string>(
+    () => loadSavedString(STORAGE_MODEL_KEY) || 'auto::architect'
   );
   const [modelsLoading, setModelsLoading] = useState<boolean>(true);
   const [modelsError, setModelsError] = useState<string | null>(null);
@@ -893,8 +893,11 @@ export default function App() {
                 (m) =>
                   m.id === prev &&
                   (m.isFree ||
+                    m.gateway === 'auto' ||
+                    m.gateway === 'groq' ||
                     m.gateway === 'huggingface' ||
                     m.gateway === 'ngrok' ||
+                    m.gateway === 'pollinations' ||
                     m.gateway === 'gemini')
               )
             : undefined;

@@ -15,11 +15,13 @@ import {
 } from './_openrouterModels.js';
 
 export type AiGatewayId =
+  | 'auto'
+  | 'gemini'
+  | 'groq'
   | 'openrouter'
   | 'huggingface'
   | 'ngrok'
-  | 'pollinations'
-  | 'gemini';
+  | 'pollinations';
 
 export interface UnifiedAiModel extends NormalizedOpenRouterModel {
   gateway: AiGatewayId;
@@ -53,6 +55,22 @@ export interface GatewayExecutionCandidate {
   cooldownKey: string;
 }
 
+export const ARCHITECT_MODEL_ID = 'auto::architect';
+
+export const ARCHITECT_PUBLIC_MODEL: UnifiedAiModel = {
+  id: ARCHITECT_MODEL_ID,
+  upstreamModelId: ARCHITECT_MODEL_ID,
+  gateway: 'auto',
+  name: 'AI Craft Architect (Smart Builder)',
+  provider: 'aicraft',
+  contextLength: 1048576,
+  isFree: true,
+  tierLabel: 'Smart Auto',
+  capabilities: ['Code', 'Build', 'Search'],
+  category: 'code',
+};
+
+export const DEFAULT_GROQ_BASE_URL = 'https://api.groq.com/openai/v1';
 export const DEFAULT_HUGGING_FACE_BASE_URL = 'https://router.huggingface.co/v1';
 export const DEFAULT_HUGGING_FACE_INFERENCE_URL =
   'https://router.huggingface.co/hf-inference/models';
@@ -61,11 +79,63 @@ export const DEFAULT_POLLINATIONS_TEXT_URL = 'https://text.pollinations.ai';
 export const DEFAULT_POLLINATIONS_IMAGE_URL = 'https://image.pollinations.ai';
 
 const DEFAULT_GATEWAY_ORDER: AiGatewayId[] = [
+  'gemini',
+  'groq',
   'openrouter',
   'huggingface',
   'ngrok',
   'pollinations',
-  'gemini',
+];
+
+export const CURATED_GROQ_CODE_MODELS: UnifiedAiModel[] = [
+  {
+    id: 'groq::llama-3.3-70b-versatile',
+    upstreamModelId: 'llama-3.3-70b-versatile',
+    gateway: 'groq',
+    name: 'Groq: Llama 3.3 70B Versatile',
+    provider: 'groq',
+    contextLength: 131072,
+    isFree: true,
+    tierLabel: 'Free Fast',
+    capabilities: ['Code', 'Build', 'Reasoning'],
+    category: 'code',
+  },
+  {
+    id: 'groq::qwen/qwen3-32b',
+    upstreamModelId: 'qwen/qwen3-32b',
+    gateway: 'groq',
+    name: 'Groq: Qwen 3 32B',
+    provider: 'groq',
+    contextLength: 131072,
+    isFree: true,
+    tierLabel: 'Free Fast',
+    capabilities: ['Code', 'Build', 'Reasoning'],
+    category: 'code',
+  },
+  {
+    id: 'groq::openai/gpt-oss-120b',
+    upstreamModelId: 'openai/gpt-oss-120b',
+    gateway: 'groq',
+    name: 'Groq: GPT-OSS 120B',
+    provider: 'groq',
+    contextLength: 131072,
+    isFree: true,
+    tierLabel: 'Free Fast',
+    capabilities: ['Code', 'Build', 'Reasoning'],
+    category: 'code',
+  },
+  {
+    id: 'groq::moonshotai/kimi-k2-instruct',
+    upstreamModelId: 'moonshotai/kimi-k2-instruct',
+    gateway: 'groq',
+    name: 'Groq: Kimi K2 Instruct',
+    provider: 'groq',
+    contextLength: 131072,
+    isFree: true,
+    tierLabel: 'Free Fast',
+    capabilities: ['Code', 'Build', 'Reasoning'],
+    category: 'code',
+  },
 ];
 
 // Rate-limit & quota cooldown tracker so throttled models/keys are automatically
@@ -297,6 +367,28 @@ export function getNgrokGatewayBaseUrl(): string {
   );
 }
 
+export function getGroqBaseUrl(): string {
+  return normalizeBaseUrl(process.env.GROQ_BASE_URL, DEFAULT_GROQ_BASE_URL);
+}
+
+export function getGroqApiKeyPool(): string[] {
+  const candidates = [
+    process.env.GROQ_API_KEY,
+    process.env.GROQ_API_KEY_2,
+    process.env.GROQ_API_KEY_3,
+    process.env.GROQ_API_KEY_4,
+    process.env.GROQ_API_KEY_5,
+    process.env.GROQ_KEY,
+    process.env.NEXT_PUBLIC_GROQ_API_KEY,
+    process.env.VITE_GROQ_API_KEY,
+  ];
+  return parseEnvKeyPool(candidates, ['MY_GROQ_API_KEY']);
+}
+
+export function getGroqApiKey(): string {
+  return getGroqApiKeyPool()[0] || '';
+}
+
 export function getHuggingFaceApiKeyPool(): string[] {
   const candidates = [
     process.env.HUGGING_FACE_API_KEY,
@@ -353,17 +445,19 @@ export function getGatewayOrder(): AiGatewayId[] {
   const pushValid = (token: string) => {
     const t = token.trim();
     const mapped: AiGatewayId | null =
-      t === 'openrouter' || t === 'or'
-        ? 'openrouter'
-        : t === 'huggingface' || t === 'hugging_face' || t === 'hf'
-          ? 'huggingface'
-          : t === 'ngrok' || t === 'ngrok_ai'
-            ? 'ngrok'
-            : t === 'pollinations' || t === 'public'
-              ? 'pollinations'
-              : t === 'gemini' || t === 'google'
-                ? 'gemini'
-                : null;
+      t === 'groq'
+        ? 'groq'
+        : t === 'openrouter' || t === 'or'
+          ? 'openrouter'
+          : t === 'huggingface' || t === 'hugging_face' || t === 'hf'
+            ? 'huggingface'
+            : t === 'ngrok' || t === 'ngrok_ai'
+              ? 'ngrok'
+              : t === 'pollinations' || t === 'public'
+                ? 'pollinations'
+                : t === 'gemini' || t === 'google'
+                  ? 'gemini'
+                  : null;
     if (mapped && !order.includes(mapped)) {
       order.push(mapped);
     }
@@ -381,6 +475,85 @@ export function getGatewayOrder(): AiGatewayId[] {
   return order;
 }
 
+export function isStrongCodingCandidate(
+  modelId: string,
+  contextLength = 0
+): boolean {
+  const id = modelId.toLowerCase();
+  if (!id || isTextToSpeechModel(id)) return false;
+  if (
+    /(?:whisper|guard|safeguard|embed|rerank|moderation|transcribe|1\.5b|1\.7b|\b1b\b|\b2b\b|\b3b\b|\b4b\b|dots-3-note)/i.test(
+      id
+    )
+  ) {
+    return false;
+  }
+  if (contextLength > 0 && contextLength < 8192) {
+    return false;
+  }
+  return true;
+}
+
+export async function fetchGroqCatalog(apiKey: string): Promise<UnifiedAiModel[]> {
+  if (!apiKey) return [];
+  const baseUrl = getGroqBaseUrl();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const res = await fetch(`${baseUrl}/models`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
+    if (!res.ok) return [...CURATED_GROQ_CODE_MODELS];
+    const json = (await res.json()) as {
+      data?: Array<{ id?: string; context_window?: number; active?: boolean }>;
+    };
+    const raw = Array.isArray(json?.data) ? json.data : [];
+    const availableIds = new Set(
+      raw
+        .filter((item) => item?.id && item.active !== false)
+        .map((item) => item.id!.trim())
+    );
+    const curatedActive = CURATED_GROQ_CODE_MODELS.filter((m) =>
+      availableIds.size === 0 ? true : availableIds.has(m.upstreamModelId)
+    );
+    const extras: UnifiedAiModel[] = raw
+      .filter((item) => {
+        const id = item?.id?.trim() || '';
+        return (
+          Boolean(id) &&
+          item.active !== false &&
+          !curatedActive.some((m) => m.upstreamModelId === id) &&
+          isStrongCodingCandidate(id, item.context_window || 0) &&
+          /(?:llama-3\.3-70b|qwen|gpt-oss|kimi|deepseek)/i.test(id)
+        );
+      })
+      .map((item) => {
+        const id = item.id!.trim();
+        return {
+          id: `groq::${id}`,
+          upstreamModelId: id,
+          gateway: 'groq',
+          name: `Groq: ${id}`,
+          provider: 'groq',
+          contextLength: item.context_window || 131072,
+          isFree: true,
+          tierLabel: 'Free Fast',
+          capabilities: ['Code', 'Build', 'Reasoning'],
+          category: 'code',
+        };
+      });
+
+    const combined = [...curatedActive, ...extras];
+    return combined.length > 0 ? combined : [...CURATED_GROQ_CODE_MODELS];
+  } catch {
+    return [...CURATED_GROQ_CODE_MODELS];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function parseGatewayModelIdentifier(
   rawId: string | undefined,
   explicitGateway?: string
@@ -392,18 +565,28 @@ export function parseGatewayModelIdentifier(
       : '';
 
   const explicitGw: AiGatewayId | undefined =
-    cleanExplicit === 'openrouter'
-      ? 'openrouter'
-      : cleanExplicit === 'huggingface' || cleanExplicit === 'hf'
-        ? 'huggingface'
-        : cleanExplicit === 'ngrok'
-          ? 'ngrok'
-          : cleanExplicit === 'pollinations'
-            ? 'pollinations'
-            : cleanExplicit === 'gemini'
-              ? 'gemini'
-              : undefined;
+    cleanExplicit === 'auto' || cleanExplicit === 'aicraft'
+      ? 'auto'
+      : cleanExplicit === 'groq'
+        ? 'groq'
+        : cleanExplicit === 'openrouter'
+          ? 'openrouter'
+          : cleanExplicit === 'huggingface' || cleanExplicit === 'hf'
+            ? 'huggingface'
+            : cleanExplicit === 'ngrok'
+              ? 'ngrok'
+              : cleanExplicit === 'pollinations'
+                ? 'pollinations'
+                : cleanExplicit === 'gemini'
+                  ? 'gemini'
+                  : undefined;
 
+  if (!trimmed || trimmed === ARCHITECT_MODEL_ID || trimmed === 'auto') {
+    return { gateway: 'auto', upstreamModelId: ARCHITECT_MODEL_ID };
+  }
+  if (trimmed.startsWith('groq::')) {
+    return { gateway: 'groq', upstreamModelId: trimmed.slice(6).trim() };
+  }
   if (trimmed.startsWith('hf::')) {
     return { gateway: 'huggingface', upstreamModelId: trimmed.slice(4).trim() };
   }
@@ -1172,6 +1355,7 @@ export async function fetchAllGatewayModels(
 ): Promise<{
   models: UnifiedAiModel[];
   gateways: GatewayStatusSummary[];
+  groqConfigured: boolean;
   openRouterConfigured: boolean;
   huggingFaceConfigured: boolean;
   ngrokConfigured: boolean;
@@ -1179,24 +1363,29 @@ export async function fetchAllGatewayModels(
   geminiConfigured: boolean;
   keyStatus: OpenRouterKeyStatus;
 }> {
+  const groqPool = getGroqApiKeyPool();
   const openRouterPool = getOpenRouterApiKeyPool();
   const huggingFacePool = getHuggingFaceApiKeyPool();
   const ngrokPool = getNgrokApiKeyPool();
   const geminiPool = getGeminiApiKeyPool();
 
+  const groqKey = groqPool[0] || '';
   const openRouterKey = openRouterPool[0] || '';
   const huggingFaceKey = huggingFacePool[0] || '';
   const ngrokKey = ngrokPool[0] || '';
   const geminiConfigured = geminiPool.length > 0;
 
-  const [orResult, orKeyStatus, hfModels, ngrokModels, pollinationsModels] =
+  const [orResult, orKeyStatus, hfModels, ngrokModels, groqModels, pollinationsModels] =
     await Promise.all([
-      fetchFreeOpenRouterCatalog(openRouterKey, referer)
-        .then((list) => ({ ok: true as const, list }))
-        .catch(() => ({ ok: false as const, list: [] as NormalizedOpenRouterModel[] })),
+      openRouterKey
+        ? fetchFreeOpenRouterCatalog(openRouterKey, referer)
+            .then((list) => ({ ok: true as const, list }))
+            .catch(() => ({ ok: false as const, list: [] as NormalizedOpenRouterModel[] }))
+        : Promise.resolve({ ok: true as const, list: [] as NormalizedOpenRouterModel[] }),
       fetchOpenRouterKeyStatus(openRouterKey, referer, forceRefresh),
       huggingFaceKey ? fetchHuggingFaceCatalog(huggingFaceKey) : Promise.resolve([]),
       ngrokKey ? fetchNgrokCatalog(ngrokKey) : Promise.resolve([]),
+      groqKey ? fetchGroqCatalog(groqKey) : Promise.resolve([]),
       fetchPollinationsCatalog().catch(() => [...POLLINATIONS_FALLBACK_MODELS]),
     ]);
 
@@ -1209,51 +1398,69 @@ export async function fetchAllGatewayModels(
       tierLabel: 'Free',
     }));
 
-  const geminiModels: UnifiedAiModel[] =
-    geminiConfigured &&
-    orModels.length === 0 &&
-    hfModels.length === 0 &&
-    ngrokModels.length === 0
-      ? [
-          {
-            id: 'google/gemini-4-hydrogen',
-            upstreamModelId: 'gemini-4-hydrogen',
-            gateway: 'gemini',
-            name: 'Google: Gemini 4 Hydrogen',
-            provider: 'google',
-            contextLength: 1048576,
-            isFree: true,
-            tierLabel: 'Built-in',
-            capabilities: ['Code', 'Build', 'Vision'],
-            category: 'code',
-          },
-        ]
-      : [];
+  // Curated UI Catalog: Present ONE smart flagship builder brain ("AI Craft Architect")
+  // plus clean Image / Music / Video studios instead of cluttering the dropdown with 40+ confusing free models.
+  // All strong Gemini, Groq, OpenRouter, HF, ngrok & Pollinations brains automatically run behind AI Craft Architect.
+  const models: UnifiedAiModel[] = [ARCHITECT_PUBLIC_MODEL];
 
-  const anyGatewayKeyConfigured = Boolean(
-    openRouterKey || huggingFaceKey || ngrokKey || geminiConfigured
+  const freeImageModel =
+    pollinationsModels.find(
+      (m) => m.category === 'image' && m.upstreamModelId === 'sana'
+    ) || pollinationsModels.find((m) => m.category === 'image');
+  if (freeImageModel) {
+    models.push({
+      ...freeImageModel,
+      name: 'AI Craft: Image Studio (Free)',
+      tierLabel: 'No Key Needed',
+    });
+  }
+
+  const hfTopImage = hfModels.find((m) => m.category === 'image');
+  if (huggingFaceKey && hfTopImage) {
+    models.push(hfTopImage);
+  }
+
+  const freeMusicModel = pollinationsModels.find(
+    (m) => m.upstreamModelId === 'music-composer'
   );
+  if (freeMusicModel) {
+    models.push({
+      ...freeMusicModel,
+      name: 'AI Craft: Free Music Studio',
+      tierLabel: 'No Key Needed',
+    });
+  }
 
-  const gatewayOrder = getGatewayOrder();
-  const models: UnifiedAiModel[] = [];
+  const hfTopMusic = hfModels.find((m) => m.category === 'music');
+  if (huggingFaceKey && hfTopMusic) {
+    models.push(hfTopMusic);
+  }
 
-  for (const gw of gatewayOrder) {
-    if (gw === 'openrouter') {
-      if (openRouterKey || !anyGatewayKeyConfigured) {
-        models.push(...orModels);
-      }
-    } else if (gw === 'huggingface' && huggingFaceKey) {
-      models.push(...hfModels);
-    } else if (gw === 'ngrok' && ngrokKey) {
-      models.push(...ngrokModels);
-    } else if (gw === 'pollinations') {
-      models.push(...pollinationsModels);
-    } else if (gw === 'gemini') {
-      models.push(...geminiModels);
-    }
+  const hfTopVideo = hfModels.find((m) => m.category === 'video');
+  if (huggingFaceKey && hfTopVideo) {
+    models.push(hfTopVideo);
   }
 
   const gateways: GatewayStatusSummary[] = [
+    {
+      id: 'gemini',
+      label: 'Google Gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com',
+      configured: geminiConfigured,
+      keyCount: geminiPool.length,
+      modelCount: geminiConfigured ? 1 : 0,
+      defaultModel: 'gemini-4-hydrogen',
+    },
+    {
+      id: 'groq',
+      label: 'Groq Free Tier',
+      baseUrl: getGroqBaseUrl(),
+      configured: groqPool.length > 0,
+      keyCount: groqPool.length,
+      modelCount: groqModels.length,
+      defaultModel:
+        cleanEnvKey(process.env.GROQ_DEFAULT_MODEL, []) || 'llama-3.3-70b-versatile',
+    },
     {
       id: 'openrouter',
       label: 'OpenRouter (:free)',
@@ -1298,20 +1505,12 @@ export async function fetchAllGatewayModels(
       modelCount: pollinationsModels.length,
       defaultModel: 'openai-fast',
     },
-    {
-      id: 'gemini',
-      label: 'Google Gemini',
-      baseUrl: 'https://generativelanguage.googleapis.com',
-      configured: geminiConfigured,
-      keyCount: geminiPool.length,
-      modelCount: geminiConfigured ? 1 : 0,
-      defaultModel: 'gemini-4-hydrogen',
-    },
   ];
 
   return {
     models,
     gateways,
+    groqConfigured: groqPool.length > 0,
     openRouterConfigured: openRouterPool.length > 0,
     huggingFaceConfigured: huggingFacePool.length > 0,
     ngrokConfigured: ngrokPool.length > 0,
@@ -1327,18 +1526,27 @@ export function buildGatewayExecutionPlan(params: {
   openRouterCatalog: NormalizedOpenRouterModel[];
   huggingFaceCatalog: UnifiedAiModel[];
   ngrokCatalog: UnifiedAiModel[];
+  groqCatalog?: UnifiedAiModel[];
   pollinationsCatalog?: UnifiedAiModel[];
 }): {
   openaiCandidates: GatewayExecutionCandidate[];
+  keyedOpenAiCandidates: GatewayExecutionCandidate[];
+  pollinationsCandidates: GatewayExecutionCandidate[];
   hasAnyOpenAiGatewayKey: boolean;
+  preferGeminiFirst: boolean;
   preferGeminiDirectly: boolean;
   requestedMediaKind: 'image' | 'music' | 'video' | null;
   requestedModelLabel?: string;
 } {
+  const groqPool = getGroqApiKeyPool();
   const openRouterPool = getOpenRouterApiKeyPool();
   const huggingFacePool = getHuggingFaceApiKeyPool();
   const ngrokPool = getNgrokApiKeyPool();
   const geminiPool = getGeminiApiKeyPool();
+  const groqList =
+    params.groqCatalog && params.groqCatalog.length > 0
+      ? params.groqCatalog
+      : CURATED_GROQ_CODE_MODELS;
   const polList =
     params.pollinationsCatalog && params.pollinationsCatalog.length > 0
       ? params.pollinationsCatalog
@@ -1352,6 +1560,10 @@ export function buildGatewayExecutionPlan(params: {
   let preferredGateway = parsed.gateway;
   if (!preferredGateway && parsed.upstreamModelId) {
     if (
+      groqList.some((m) => m.upstreamModelId === parsed.upstreamModelId)
+    ) {
+      preferredGateway = 'groq';
+    } else if (
       params.huggingFaceCatalog.some(
         (m) => m.upstreamModelId === parsed.upstreamModelId
       )
@@ -1379,7 +1591,7 @@ export function buildGatewayExecutionPlan(params: {
   let requestedMediaKind: 'image' | 'music' | 'video' | null = null;
   let requestedModelLabel: string | undefined;
 
-  if (parsed.upstreamModelId) {
+  if (parsed.upstreamModelId && parsed.gateway !== 'auto') {
     const matchedHf = params.huggingFaceCatalog.find(
       (m) => m.upstreamModelId === parsed.upstreamModelId
     );
@@ -1400,18 +1612,27 @@ export function buildGatewayExecutionPlan(params: {
         requestedMediaKind = category;
       }
     }
+  } else if (parsed.gateway === 'auto') {
+    requestedModelLabel = ARCHITECT_PUBLIC_MODEL.name;
   }
 
-  const baseOrder = getGatewayOrder().filter(
-    (g): g is Exclude<AiGatewayId, 'gemini'> => g !== 'gemini'
+  const gatewayOrder = getGatewayOrder();
+  const baseOrder = gatewayOrder.filter(
+    (g): g is Exclude<AiGatewayId, 'gemini' | 'auto'> =>
+      g !== 'gemini' && g !== 'auto'
   );
   const orderedGateways =
-    preferredGateway && preferredGateway !== 'gemini' && requestedMediaKind === null
+    preferredGateway &&
+    preferredGateway !== 'gemini' &&
+    preferredGateway !== 'auto' &&
+    requestedMediaKind === null
       ? [preferredGateway, ...baseOrder.filter((g) => g !== preferredGateway)]
       : baseOrder;
 
-  const readyCandidates: GatewayExecutionCandidate[] = [];
-  const coolingCandidates: GatewayExecutionCandidate[] = [];
+  const readyKeyed: GatewayExecutionCandidate[] = [];
+  const coolingKeyed: GatewayExecutionCandidate[] = [];
+  const readyPol: GatewayExecutionCandidate[] = [];
+  const coolingPol: GatewayExecutionCandidate[] = [];
   const seenKey = new Set<string>();
 
   const pushCandidate = (cand: Omit<GatewayExecutionCandidate, 'cooldownKey'>) => {
@@ -1425,15 +1646,56 @@ export function buildGatewayExecutionPlan(params: {
     seenKey.add(cooldownKey);
 
     const fullCand: GatewayExecutionCandidate = { ...cand, cooldownKey };
+    const isPol = cand.gateway === 'pollinations';
     if (isGatewayCandidateCoolingDown(cooldownKey)) {
-      coolingCandidates.push(fullCand);
+      if (isPol) coolingPol.push(fullCand);
+      else coolingKeyed.push(fullCand);
     } else {
-      readyCandidates.push(fullCand);
+      if (isPol) readyPol.push(fullCand);
+      else readyKeyed.push(fullCand);
     }
   };
 
   for (const gw of orderedGateways) {
-    if (gw === 'openrouter' && openRouterPool.length > 0) {
+    if (gw === 'groq' && groqPool.length > 0) {
+      const groqBase = getGroqBaseUrl();
+      const groqCodeList = groqList.filter(
+        (m) =>
+          m.category !== 'image' &&
+          m.category !== 'music' &&
+          m.category !== 'video' &&
+          isStrongCodingCandidate(m.upstreamModelId, m.contextLength)
+      );
+      const addGroqForAllKeys = (upstreamId: string | undefined, name?: string) => {
+        const trimmed = upstreamId?.trim();
+        if (!trimmed || !isStrongCodingCandidate(trimmed)) return;
+        const matched = groqCodeList.find((m) => m.upstreamModelId === trimmed);
+        for (const apiKey of groqPool) {
+          pushCandidate({
+            gateway: 'groq',
+            gatewayLabel: 'Groq Free Tier',
+            baseUrl: groqBase,
+            apiKey,
+            publicModelId: `groq::${trimmed}`,
+            upstreamModelId: trimmed,
+            modelName: name || matched?.name || `Groq: ${trimmed}`,
+            provider: 'groq',
+          });
+        }
+      };
+
+      if (
+        preferredGateway === 'groq' &&
+        parsed.upstreamModelId &&
+        requestedMediaKind === null
+      ) {
+        addGroqForAllKeys(parsed.upstreamModelId);
+      }
+      addGroqForAllKeys(cleanEnvKey(process.env.GROQ_DEFAULT_MODEL, []));
+      for (const m of groqCodeList) {
+        addGroqForAllKeys(m.upstreamModelId, m.name);
+      }
+    } else if (gw === 'openrouter' && openRouterPool.length > 0) {
       const orBase = getOpenRouterBaseUrl();
       const addOrForAllKeys = (id: string | undefined) => {
         const trimmed = id?.trim();
@@ -1468,13 +1730,14 @@ export function buildGatewayExecutionPlan(params: {
       }
       addOrForAllKeys(process.env.OPENROUTER_FALLBACK_MODEL);
       addOrForAllKeys('openrouter/free');
-      // Add ALL remaining healthy :free OpenRouter models for automatic limit failover
+      // Add curated strong :free OpenRouter coding models (skip weak tiny models)
       for (const m of params.openRouterCatalog) {
         if (
           m.isFree &&
           m.category !== 'image' &&
           m.category !== 'music' &&
-          m.category !== 'video'
+          m.category !== 'video' &&
+          isStrongCodingCandidate(m.id, m.contextLength)
         ) {
           addOrForAllKeys(m.id);
         }
@@ -1486,12 +1749,16 @@ export function buildGatewayExecutionPlan(params: {
           ? params.huggingFaceCatalog
           : buildFallbackHuggingFaceCodeModels()
       ).filter(
-        (m) => m.category !== 'image' && m.category !== 'music' && m.category !== 'video'
+        (m) =>
+          m.category !== 'image' &&
+          m.category !== 'music' &&
+          m.category !== 'video' &&
+          isStrongCodingCandidate(m.upstreamModelId, m.contextLength)
       );
 
       const addHfForAllKeys = (upstreamId: string | undefined, name?: string) => {
         const trimmed = upstreamId?.trim();
-        if (!trimmed) return;
+        if (!trimmed || !isStrongCodingCandidate(trimmed)) return;
         const matched = hfCodeList.find((m) => m.upstreamModelId === trimmed);
         for (const apiKey of huggingFacePool) {
           pushCandidate({
@@ -1524,7 +1791,11 @@ export function buildGatewayExecutionPlan(params: {
     } else if (gw === 'ngrok' && ngrokPool.length > 0) {
       const ngrokBase = getNgrokGatewayBaseUrl();
       const ngrokList = params.ngrokCatalog.filter(
-        (m) => m.category !== 'image' && m.category !== 'music' && m.category !== 'video'
+        (m) =>
+          m.category !== 'image' &&
+          m.category !== 'music' &&
+          m.category !== 'video' &&
+          isStrongCodingCandidate(m.upstreamModelId, m.contextLength)
       );
 
       const addNgrokForAllKeys = (upstreamId: string | undefined, name?: string) => {
@@ -1598,18 +1869,33 @@ export function buildGatewayExecutionPlan(params: {
     }
   }
 
-  // Try non-cooling-down candidates first, then cooling candidates as last resort (capped at 22)
-  const openaiCandidates = [...readyCandidates, ...coolingCandidates].slice(0, 22);
+  const keyedOpenAiCandidates = [...readyKeyed, ...coolingKeyed].slice(0, 20);
+  const pollinationsCandidates = [...readyPol, ...coolingPol].slice(0, 4);
+  const openaiCandidates = [...keyedOpenAiCandidates, ...pollinationsCandidates];
+
+  const isExplicitNonGeminiGateway =
+    preferredGateway !== undefined &&
+    preferredGateway !== 'gemini' &&
+    preferredGateway !== 'auto';
+  const preferGeminiFirst =
+    geminiPool.length > 0 &&
+    requestedMediaKind === null &&
+    !isExplicitNonGeminiGateway &&
+    (preferredGateway === 'gemini' ||
+      preferredGateway === 'auto' ||
+      gatewayOrder[0] === 'gemini');
 
   return {
     openaiCandidates,
+    keyedOpenAiCandidates,
+    pollinationsCandidates,
     hasAnyOpenAiGatewayKey:
+      groqPool.length > 0 ||
       openRouterPool.length > 0 ||
       huggingFacePool.length > 0 ||
-      ngrokPool.length > 0 ||
-      openaiCandidates.length > 0,
-    preferGeminiDirectly:
-      preferredGateway === 'gemini' && geminiPool.length > 0 && requestedMediaKind === null,
+      ngrokPool.length > 0,
+    preferGeminiFirst,
+    preferGeminiDirectly: preferGeminiFirst,
     requestedMediaKind,
     requestedModelLabel,
   };

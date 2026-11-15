@@ -39,7 +39,7 @@ export function ModelSelectorPopover({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [gatewayFilter, setGatewayFilter] = useState<
-    'all' | 'openrouter' | 'huggingface' | 'ngrok' | 'pollinations' | 'gemini'
+    'all' | 'auto' | 'gemini' | 'groq' | 'openrouter' | 'huggingface' | 'ngrok' | 'pollinations'
   >('all');
   const [categoryFilter, setCategoryFilter] = useState<
     'all' | 'code' | 'image' | 'music' | 'video'
@@ -55,7 +55,7 @@ export function ModelSelectorPopover({
   const availableGateways = useMemo(() => {
     const set = new Set<string>();
     for (const m of models) {
-      set.add(m.gateway || 'openrouter');
+      set.add(m.gateway || 'auto');
     }
     return Array.from(set);
   }, [models]);
@@ -76,7 +76,7 @@ export function ModelSelectorPopover({
   const filteredModels = useMemo(() => {
     const trimmed = query.trim().toLowerCase();
     return models.filter((m) => {
-      const gw = m.gateway || 'openrouter';
+      const gw = m.gateway || 'auto';
       if (gatewayFilter !== 'all' && gw !== gatewayFilter) {
         return false;
       }
@@ -211,19 +211,19 @@ export function ModelSelectorPopover({
             role="dialog"
             aria-label="Available AI models"
             style={dynamicPanelStyle}
-            className="absolute right-0 bottom-full mb-2 z-50 w-[min(248px,calc(100vw-3rem))] rounded-[18px] border backdrop-blur-xl overflow-hidden flex flex-col"
+            className="absolute right-0 bottom-full mb-2 z-50 w-[min(256px,calc(100vw-3rem))] rounded-[18px] border backdrop-blur-xl overflow-hidden flex flex-col"
           >
-            {/* Compact Header + Search */}
+            {/* Compact Header + Studio Tabs */}
             <div className="px-2.5 pt-2.5 pb-2 border-b border-black/[0.08] flex flex-col gap-1.5">
               <div className="flex items-center justify-between gap-2 px-0.5">
                 <span className="font-display font-semibold text-[12.5px] text-[#0B0B0F] tracking-[-0.01em]">
-                  {availableGateways.length > 1 ? 'AI Gateways' : 'Free AI Models'}
+                  AI Craft Engine
                 </span>
                 <div className="flex items-center gap-1.5">
                   <span className="text-[11px] text-[#52525B] tabular-nums">
                     {modelsLoading
                       ? 'Loading...'
-                      : `${filteredModels.length} ${availableGateways.length > 1 ? 'ready' : 'free'}`}
+                      : `${filteredModels.length} active`}
                   </span>
                   <button
                     type="button"
@@ -239,25 +239,28 @@ export function ModelSelectorPopover({
                 </div>
               </div>
 
-              {availableGateways.length > 1 && (
+              {availableGateways.length > 1 && models.length > 8 && (
                 <div className="flex items-center gap-1 overflow-x-auto pb-0.5 text-[10.5px]">
                   {(
                     [
                       { id: 'all', label: 'All' },
+                      ...(availableGateways.includes('auto')
+                        ? [{ id: 'auto', label: 'Architect' }]
+                        : []),
+                      ...(availableGateways.includes('groq')
+                        ? [{ id: 'groq', label: 'Groq' }]
+                        : []),
                       ...(availableGateways.includes('openrouter')
                         ? [{ id: 'openrouter', label: 'OpenRouter' }]
                         : []),
                       ...(availableGateways.includes('huggingface')
                         ? [{ id: 'huggingface', label: 'HuggingFace' }]
                         : []),
-                      ...(availableGateways.includes('ngrok')
-                        ? [{ id: 'ngrok', label: 'ngrok' }]
-                        : []),
                       ...(availableGateways.includes('pollinations')
-                        ? [{ id: 'pollinations', label: 'Public Free' }]
+                        ? [{ id: 'pollinations', label: 'Built-in' }]
                         : []),
                     ] as Array<{
-                      id: 'all' | 'openrouter' | 'huggingface' | 'ngrok' | 'pollinations';
+                      id: 'all' | 'auto' | 'groq' | 'openrouter' | 'huggingface' | 'pollinations';
                       label: string;
                     }>
                   ).map((gwTab) => {
@@ -310,27 +313,29 @@ export function ModelSelectorPopover({
                 </div>
               )}
 
-              <div className="relative flex items-center">
-                <Search className="w-3.5 h-3.5 text-[#52525B] absolute left-2.5 pointer-events-none" />
-                <input
-                  type="text"
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Search models..."
-                  aria-label="Search AI gateway models"
-                  className="w-full h-8 pl-7 pr-6 rounded-lg bg-white/80 border border-black/[0.07] text-[12.5px] text-[#0B0B0F] placeholder:text-[#71717A] focus:outline-none focus:bg-white"
-                />
-                {query && (
-                  <button
-                    type="button"
-                    onClick={() => setQuery('')}
-                    aria-label="Clear search"
-                    className="absolute right-1.5 p-0.5 rounded-full text-[#52525B] hover:text-[#0B0B0F]"
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
-                )}
-              </div>
+              {models.length > 6 && (
+                <div className="relative flex items-center">
+                  <Search className="w-3.5 h-3.5 text-[#52525B] absolute left-2.5 pointer-events-none" />
+                  <input
+                    type="text"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search models..."
+                    aria-label="Search AI gateway models"
+                    className="w-full h-8 pl-7 pr-6 rounded-lg bg-white/80 border border-black/[0.07] text-[12.5px] text-[#0B0B0F] placeholder:text-[#71717A] focus:outline-none focus:bg-white"
+                  />
+                  {query && (
+                    <button
+                      type="button"
+                      onClick={() => setQuery('')}
+                      aria-label="Clear search"
+                      className="absolute right-1.5 p-0.5 rounded-full text-[#52525B] hover:text-[#0B0B0F]"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Compact, Smoothly Scrollable Dynamic-Color List */}

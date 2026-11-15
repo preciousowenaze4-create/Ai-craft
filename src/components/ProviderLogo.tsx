@@ -7,9 +7,12 @@ interface ProviderLogoProps {
 }
 
 function resolveProviderKey(provider?: string, modelId?: string): string {
-  const raw = (provider || modelId?.split('/')[0] || 'openrouter')
+  const raw = (provider || modelId?.split('/')[0] || 'aicraft')
     .toLowerCase()
     .trim();
+  if (raw === 'auto' || raw.includes('aicraft') || modelId === 'auto::architect') {
+    return 'aicraft';
+  }
   if (raw.includes('openai')) return 'openai';
   if (raw.includes('anthropic')) return 'anthropic';
   if (raw.includes('google')) return 'google';
@@ -56,6 +59,34 @@ export function ProviderLogo({
 
   const renderMark = () => {
     switch (key) {
+      case 'aicraft':
+        return (
+          <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path
+              d="M12 2.5L14.4 9.6L21.5 12L14.4 14.4L12 21.5L9.6 14.4L2.5 12L9.6 9.6L12 2.5Z"
+              fill="url(#aicraftAutoGrad)"
+            />
+            <circle cx="12" cy="12" r="2.2" fill="#FFFFFF" />
+            <defs>
+              <linearGradient id="aicraftAutoGrad" x1="2.5" y1="2.5" x2="21.5" y2="21.5" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stopColor="#6D4AFF" />
+                <stop offset="50%" stopColor="#A855F7" />
+                <stop offset="100%" stopColor="#F59E0B" />
+              </linearGradient>
+            </defs>
+          </svg>
+        );
+
+      case 'groq':
+        return (
+          <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path
+              d="M12 3.5a8.5 8.5 0 1 0 8.5 8.5V9.5h-6.2v3h3.2a5.5 5.5 0 1 1-1.6-3.9l2.1-2.1A8.45 8.45 0 0 0 12 3.5Z"
+              fill="#F55036"
+            />
+          </svg>
+        );
+
       case 'google':
         return (
           <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" aria-hidden="true">
