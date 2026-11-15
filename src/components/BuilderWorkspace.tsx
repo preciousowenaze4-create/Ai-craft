@@ -11,15 +11,19 @@ import {
   ChevronRight,
   Copy,
   Database,
+  Download,
   Eye,
   ExternalLink,
+  Film,
   Globe,
   HelpCircle,
+  Image as ImageIcon,
   KeyRound,
   Lightbulb,
   Link2,
   Loader2,
   MoreVertical,
+  Music,
   Paperclip,
   Rocket,
   Volume2,
@@ -77,6 +81,8 @@ function formatBuildStepLabel(filePath: string): string {
 function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
   const cleaned = raw
     .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]/gi, '')
+    .replace(/\[\[\s*MODE\s*:\s*(?:CHAT|GENERATE)\s*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*MEDIA_PROMPT\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*TITLE\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*LOGO\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
@@ -619,6 +625,7 @@ export function BuilderWorkspace({
     search: search,
     generateImage: function(prompt, model) { return generateMedia('image', prompt, model); },
     generateMusic: function(prompt, model) { return generateMedia('music', prompt, model); },
+    generateVideo: function(prompt, model) { return generateMedia('video', prompt, model); },
     edit: function(instruction) {
       window.parent.postMessage({ type: 'aicraft:edit', instruction: String(instruction || '') }, '*');
     }
@@ -917,13 +924,13 @@ export function BuilderWorkspace({
             const { value, done } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
-            const events = buffer.split('\n\n');
+            const events = buffer.split(/\r?\n\r?\n/);
             buffer = events.pop() ?? '';
             for (const rawEvent of events) {
-              const line = rawEvent.split('\n').find((l) => l.startsWith('data: '));
+              const line = rawEvent.split(/\r?\n/).find((l) => l.trim().startsWith('data:'));
               if (!line) continue;
               try {
-                const evt = JSON.parse(line.slice(6)) as {
+                const evt = JSON.parse(line.trim().slice(5).trim()) as {
                   type: string;
                   text?: string;
                   fullText?: string;
@@ -1279,16 +1286,18 @@ export function BuilderWorkspace({
           </div>
 
           <div className="flex items-center gap-1.5 shrink-0">
-            {/* Small rounded-box Preview button beside the top-right menu */}
-            <button
-              type="button"
-              onClick={() => onSetView('preview')}
-              aria-label={`Preview ${projectTitle}`}
-              className="h-9 px-2.5 rounded-xl border bg-white text-[#0B0B0F] border-black/15 hover:bg-black/[0.03] flex items-center gap-1.5 text-[13px] font-medium whitespace-nowrap shrink-0 active:scale-95 transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6]"
-            >
-              <Eye className="w-4 h-4 stroke-[2]" />
-              <span>Preview</span>
-            </button>
+            {/* Hide Preview button for pure Image/Music/Video media chats with no web app */}
+            {(hasBuiltApp || !turns.some((t) => t.kind === 'media' || Boolean(t.media))) && (
+              <button
+                type="button"
+                onClick={() => onSetView('preview')}
+                aria-label={`Preview ${projectTitle}`}
+                className="h-9 px-2.5 rounded-xl border bg-white text-[#0B0B0F] border-black/15 hover:bg-black/[0.03] flex items-center gap-1.5 text-[13px] font-medium whitespace-nowrap shrink-0 active:scale-95 transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6]"
+              >
+                <Eye className="w-4 h-4 stroke-[2]" />
+                <span>Preview</span>
+              </button>
+            )}
 
             <button
               type="button"
@@ -1344,7 +1353,8 @@ export function BuilderWorkspace({
           <div className="w-full max-w-[500px] mx-auto flex flex-col gap-6 pb-4">
             {turns.map((turn) => {
               const isExpanded = !collapsedTurnIds[turn.id];
-              const isBuildTurn = turn.kind === 'build';
+              const isMediaTurn = turn.kind === 'media' || Boolean(turn.media);
+              const isBuildTurn = turn.kind === 'build' && !isMediaTurn;
               const isTurnWorking =
                 turn.phase === 'understanding' || turn.phase === 'building';
               const displayAiText = sanitizeDisplayProse(turn.aiText, isBuildTurn);
@@ -1406,7 +1416,12 @@ export function BuilderWorkspace({
                             style={{ color: theme.accentColor }}
                           >
                             {turn.phase === 'building'
-                              ? 'Building'
+                              ? isMediaTurn ||
+                                activeModel?.category === 'image' ||
+                                activeModel?.category === 'music' ||
+                                activeModel?.category === 'video'
+                                ? 'Creating'
+                                : 'Building'
                               : displayAiText.length > 0
                                 ? 'Responding'
                                 : 'Thinking'}
@@ -1640,8 +1655,18 @@ export function BuilderWorkspace({
 
                   {/* Live Streaming AI Response Prose (Raw code strictly excluded) */}
                   {turn.errorMessage ? (
-                    <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-[14.5px] text-red-700 leading-relaxed">
-                      {turn.errorMessage}
+                    <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-[14px] text-red-700 leading-relaxed flex flex-col gap-2.5">
+                      <span>{turn.errorMessage}</span>
+                      <div>
+                        <button
+                          type="button"
+                          disabled={isStreaming}
+                          onClick={() => onContinueTurn(turn)}
+                          className="px-3.5 py-1.5 rounded-xl bg-red-600 hover:bg-red-700 text-white text-[12.5px] font-semibold active:scale-95 transition-all disabled:opacity-50"
+                        >
+                          Continue / Retry
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     <div className="flex items-start justify-between gap-2.5">
@@ -1656,9 +1681,11 @@ export function BuilderWorkspace({
                                       : 'full-stack web'
                                   } app...`
                                 : 'Your real-time app is ready. Tap Preview to open it.'
-                              : turn.phase === 'understanding'
-                                ? 'Thinking...'
-                                : 'Waiting for response...'}
+                              : turn.phase === 'building'
+                                ? turn.phaseLabel || 'Creating media...'
+                                : turn.phase === 'understanding'
+                                  ? 'Thinking...'
+                                  : 'Waiting for response...'}
                           </span>
                         )}
                         {isTurnWorking && displayAiText && (
@@ -1698,7 +1725,80 @@ export function BuilderWorkspace({
                     </div>
                   )}
 
-                  {/* Inline Build Status Card (Shown once building starts) */}
+                  {/* Generated Media Card (Image / Music / Video) — No web browser link */}
+                  {turn.media && turn.media.dataUrl && (
+                    <div className="rounded-[20px] border border-black/[0.08] bg-[#FAFAFC] overflow-hidden shadow-[0_2px_12px_rgba(15,15,30,0.04)]">
+                      <div className="px-3.5 py-2.5 bg-[#F2F2F6] flex items-center justify-between gap-2 border-b border-black/[0.05]">
+                        <div className="flex items-center gap-2 min-w-0">
+                          {turn.media.kind === 'video' ? (
+                            <Film className="w-4 h-4 text-[#6D4AFF] shrink-0" />
+                          ) : turn.media.kind === 'music' ? (
+                            <Music className="w-4 h-4 text-[#6D4AFF] shrink-0" />
+                          ) : (
+                            <ImageIcon className="w-4 h-4 text-[#6D4AFF] shrink-0" />
+                          )}
+                          <span className="text-[13px] font-semibold text-[#0B0B0F] truncate">
+                            {turn.media.kind === 'video'
+                              ? 'Generated Video'
+                              : turn.media.kind === 'music'
+                                ? 'Generated Music'
+                                : 'Generated Image'}
+                          </span>
+                        </div>
+
+                        <a
+                          href={turn.media.dataUrl}
+                          download={`aicraft-${turn.media.kind}-${turn.id}.${
+                            turn.media.kind === 'video'
+                              ? 'mp4'
+                              : turn.media.kind === 'music'
+                                ? turn.media.mimeType.includes('wav')
+                                  ? 'wav'
+                                  : 'mp3'
+                                : 'jpg'
+                          }`}
+                          className="h-8 px-2.5 rounded-lg bg-white border border-black/10 hover:bg-black/[0.03] text-[12px] font-medium text-[#0B0B0F] inline-flex items-center gap-1.5 shrink-0 active:scale-95 transition-all"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Save</span>
+                        </a>
+                      </div>
+
+                      <div className="p-3 flex flex-col gap-2">
+                        {turn.media.kind === 'image' && (
+                          <img
+                            src={turn.media.dataUrl}
+                            alt={turn.media.prompt}
+                            className="w-full max-h-[380px] rounded-xl object-contain bg-black/[0.04]"
+                          />
+                        )}
+                        {turn.media.kind === 'music' && (
+                          <audio
+                            controls
+                            src={turn.media.dataUrl}
+                            className="w-full"
+                          />
+                        )}
+                        {turn.media.kind === 'video' && (
+                          <video
+                            controls
+                            playsInline
+                            loop
+                            preload="metadata"
+                            src={turn.media.dataUrl}
+                            className="w-full max-h-[380px] rounded-xl bg-black"
+                          />
+                        )}
+                        {turn.media.prompt && (
+                          <p className="text-[12px] text-[#71717A] leading-snug px-0.5 line-clamp-2">
+                            {turn.media.prompt}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Inline Build Status Card (Shown once building starts, strictly for Code & Build) */}
                   {isBuildTurn &&
                     !isPausedTurn &&
                     (turn.phase === 'building' ||
@@ -1879,8 +1979,10 @@ export function BuilderWorkspace({
                     </div>
                   )}
 
-                  {/* Paused Build Card — Stops at 0 Credits & Unlocks "Continue" Automatically on Reset/Top-Up */}
+                  {/* Paused Build Card — Stops at 0 Credits OR Near Serverless Limit & Unlocks "Continue" */}
                   {isPausedTurn && (() => {
+                    const isStreamInterrupted =
+                      turn.pausedReason === 'STREAM_INTERRUPTED';
                     const resetCountdown = monthlyExhausted
                       ? formatCountdown(billing?.monthlyResetAt, nowMs)
                       : dailyExhausted
@@ -1893,27 +1995,37 @@ export function BuilderWorkspace({
                         : savedBytes > 0
                           ? `${savedBytes} B saved`
                           : '';
+                    const allowResume = canResumeCreditsNow || isStreamInterrupted;
 
                     return (
                       <div className="rounded-2xl border border-black/[0.08] bg-white p-4 shadow-[0_2px_10px_rgba(15,15,30,0.03)] flex flex-col gap-3">
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
                             <h3 className="font-display font-bold text-[15px] text-[#0B0B0F] tracking-[-0.01em]">
-                              {canResumeCreditsNow
-                                ? 'Credits ready · Resume build'
-                                : 'Build paused · 0 tokens remaining'}
+                              {isStreamInterrupted
+                                ? 'Build paused · Ready to continue'
+                                : canResumeCreditsNow
+                                  ? 'Credits ready · Resume build'
+                                  : 'Build paused · 0 tokens remaining'}
                             </h3>
                             <p className="mt-1 text-[13.5px] leading-relaxed text-[#52525B]">
-                              {canResumeCreditsNow
-                                ? 'Your tokens are available again. Tap Continue Building to finish from your saved progress.'
-                                : turn.pausedMessage ||
-                                  'All remaining tokens were used and your progress is saved. Building resumes automatically once tokens reset or you upgrade.'}
+                              {isStreamInterrupted
+                                ? turn.pausedMessage ||
+                                  'Your progress so far is safely saved. Tap Continue Building to finish the rest.'
+                                : canResumeCreditsNow
+                                  ? 'Your tokens are available again. Tap Continue Building to finish from your saved progress.'
+                                  : turn.pausedMessage ||
+                                    'All remaining tokens were used and your progress is saved. Building resumes automatically once tokens reset or you upgrade.'}
                             </p>
                           </div>
                         </div>
 
                         <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-[12px] text-[#71717A] tabular-nums">
-                          {canResumeCreditsNow ? (
+                          {isStreamInterrupted ? (
+                            <span className="font-medium text-[#6D4AFF]">
+                              Progress saved
+                            </span>
+                          ) : canResumeCreditsNow ? (
                             <span className="font-medium text-[#6D4AFF]">
                               {credits.toLocaleString()} credits available
                             </span>
@@ -1947,7 +2059,7 @@ export function BuilderWorkspace({
                         </div>
 
                         <div className="flex items-center gap-2 pt-0.5">
-                          {canResumeCreditsNow ? (
+                          {allowResume ? (
                             <button
                               type="button"
                               disabled={isStreaming}
@@ -2143,9 +2255,15 @@ export function BuilderWorkspace({
                     ? 'Listening... speak now'
                     : isVoiceTranscribing
                       ? 'Transcribing speech...'
-                      : mode === 'mobile'
-                        ? 'Ask or describe your mobile app...'
-                        : 'Ask or describe your web app...'
+                      : activeModel?.category === 'video'
+                        ? 'Describe the video scene to generate...'
+                        : activeModel?.category === 'music'
+                          ? 'Describe the song, beat, or vibe to compose...'
+                          : activeModel?.category === 'image'
+                            ? 'Describe the image you want to generate...'
+                            : mode === 'mobile'
+                              ? 'Ask or describe your mobile app...'
+                              : 'Ask or describe your web app...'
                 }
                 rows={2}
                 aria-label="Send message or follow-up to AI Craft"

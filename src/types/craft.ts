@@ -11,7 +11,16 @@ export type BuildPhase =
   | 'complete'
   | 'error';
 
-export type TurnKind = 'chat' | 'build';
+export type TurnKind = 'chat' | 'build' | 'media';
+
+export interface GeneratedMediaPayload {
+  kind: 'image' | 'music' | 'video';
+  dataUrl: string;
+  mimeType: string;
+  prompt: string;
+  modelId?: string;
+  gateway?: string;
+}
 
 export interface UserProfile {
   name: string;
@@ -62,11 +71,11 @@ export interface OpenRouterModel {
   provider: string;
   contextLength: number;
   isFree: boolean;
-  gateway?: 'openrouter' | 'huggingface' | 'ngrok' | 'gemini';
+  gateway?: 'openrouter' | 'huggingface' | 'ngrok' | 'pollinations' | 'gemini';
   upstreamModelId?: string;
   tierLabel?: string;
   capabilities?: string[];
-  category?: 'router' | 'code' | 'image' | 'music' | 'chat';
+  category?: 'router' | 'code' | 'image' | 'music' | 'video' | 'chat';
 }
 
 export interface ProjectSecret {
@@ -152,6 +161,7 @@ export interface BuilderTurn {
   modelName?: string;
   modelProvider?: string;
   previewHtml?: string;
+  media?: GeneratedMediaPayload;
   bytesBuilt?: number;
   creditsUsed?: number;
   pausedReason?:

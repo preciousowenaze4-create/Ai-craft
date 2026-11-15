@@ -31,6 +31,7 @@ function resolveProviderKey(provider?: string, modelId?: string): string {
   if (raw.includes('groq')) return 'groq';
   if (raw.includes('huggingface') || modelId?.startsWith('hf::')) return 'huggingface';
   if (raw.includes('ngrok') || modelId?.startsWith('ngrok::')) return 'ngrok';
+  if (raw.includes('pollinations') || modelId?.startsWith('pollinations::')) return 'pollinations';
   if (raw.includes('openrouter')) return 'openrouter';
   return raw;
 }
@@ -202,6 +203,18 @@ export function ProviderLogo({
           <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" stroke="#1E3A8A" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <rect x="4" y="4" width="16" height="16" rx="4" fill="#EEF2FF" stroke="#4338CA" />
             <path d="M8.5 15.5V9L15.5 15V8.5" stroke="#312E81" strokeWidth="2.1" />
+          </svg>
+        );
+
+      case 'pollinations':
+        return (
+          <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <circle cx="12" cy="6.2" r="2.6" fill="#10B981" />
+            <circle cx="17.4" cy="10" r="2.6" fill="#06B6D4" />
+            <circle cx="15.4" cy="16.4" r="2.6" fill="#8B5CF6" />
+            <circle cx="8.6" cy="16.4" r="2.6" fill="#EC4899" />
+            <circle cx="6.6" cy="10" r="2.6" fill="#F59E0B" />
+            <circle cx="12" cy="12" r="2.4" fill="#0B0B0F" />
           </svg>
         );
 

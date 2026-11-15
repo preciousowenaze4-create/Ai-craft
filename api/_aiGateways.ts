@@ -14,7 +14,12 @@ import {
   type OpenRouterKeyStatus,
 } from './_openrouterModels.js';
 
-export type AiGatewayId = 'openrouter' | 'huggingface' | 'ngrok' | 'gemini';
+export type AiGatewayId =
+  | 'openrouter'
+  | 'huggingface'
+  | 'ngrok'
+  | 'pollinations'
+  | 'gemini';
 
 export interface UnifiedAiModel extends NormalizedOpenRouterModel {
   gateway: AiGatewayId;
@@ -52,11 +57,14 @@ export const DEFAULT_HUGGING_FACE_BASE_URL = 'https://router.huggingface.co/v1';
 export const DEFAULT_HUGGING_FACE_INFERENCE_URL =
   'https://router.huggingface.co/hf-inference/models';
 export const DEFAULT_NGROK_AI_GATEWAY_URL = 'https://gateway.ngrok.ai/v1';
+export const DEFAULT_POLLINATIONS_TEXT_URL = 'https://text.pollinations.ai';
+export const DEFAULT_POLLINATIONS_IMAGE_URL = 'https://image.pollinations.ai';
 
 const DEFAULT_GATEWAY_ORDER: AiGatewayId[] = [
   'openrouter',
   'huggingface',
   'ngrok',
+  'pollinations',
   'gemini',
 ];
 
@@ -127,6 +135,55 @@ export const HUGGING_FACE_MUSIC_FALLBACKS: Array<{
   {
     id: 'facebook/musicgen-small',
     name: 'HF: MusicGen Small (Music)',
+  },
+];
+
+export const HUGGING_FACE_VIDEO_FALLBACKS: Array<{
+  id: string;
+  name: string;
+}> = [
+  {
+    id: 'Wan-AI/Wan2.2-TI2V-5B',
+    name: 'HF: Wan 2.2 TI2V 5B (Video)',
+  },
+  {
+    id: 'Wan-AI/Wan2.1-T2V-1.3B',
+    name: 'HF: Wan 2.1 T2V 1.3B (Video)',
+  },
+  {
+    id: 'tencent/HunyuanVideo',
+    name: 'HF: HunyuanVideo (Video)',
+  },
+  {
+    id: 'Lightricks/LTX-Video-0.9.5',
+    name: 'HF: LTX Video 0.9.5 (Video)',
+  },
+];
+
+export const POLLINATIONS_FALLBACK_MODELS: UnifiedAiModel[] = [
+  {
+    id: 'pollinations::openai-fast',
+    upstreamModelId: 'openai-fast',
+    gateway: 'pollinations',
+    name: 'Pollinations: GPT-OSS 20B (Public Free)',
+    provider: 'pollinations',
+    contextLength: 128000,
+    isFree: true,
+    tierLabel: 'No Key Needed',
+    capabilities: ['Code', 'Build', 'Reasoning'],
+    category: 'code',
+  },
+  {
+    id: 'pollinations::sana',
+    upstreamModelId: 'sana',
+    gateway: 'pollinations',
+    name: 'Pollinations: Sana Image (Public Free)',
+    provider: 'pollinations',
+    contextLength: 0,
+    isFree: true,
+    tierLabel: 'No Key Needed',
+    capabilities: ['Image'],
+    category: 'image',
   },
 ];
 
@@ -290,9 +347,11 @@ export function getGatewayOrder(): AiGatewayId[] {
           ? 'huggingface'
           : t === 'ngrok' || t === 'ngrok_ai'
             ? 'ngrok'
-            : t === 'gemini' || t === 'google'
-              ? 'gemini'
-              : null;
+            : t === 'pollinations' || t === 'public'
+              ? 'pollinations'
+              : t === 'gemini' || t === 'google'
+                ? 'gemini'
+                : null;
     if (mapped && !order.includes(mapped)) {
       order.push(mapped);
     }
@@ -327,9 +386,11 @@ export function parseGatewayModelIdentifier(
         ? 'huggingface'
         : cleanExplicit === 'ngrok'
           ? 'ngrok'
-          : cleanExplicit === 'gemini'
-            ? 'gemini'
-            : undefined;
+          : cleanExplicit === 'pollinations'
+            ? 'pollinations'
+            : cleanExplicit === 'gemini'
+              ? 'gemini'
+              : undefined;
 
   if (trimmed.startsWith('hf::')) {
     return { gateway: 'huggingface', upstreamModelId: trimmed.slice(4).trim() };
@@ -339,6 +400,9 @@ export function parseGatewayModelIdentifier(
   }
   if (trimmed.startsWith('ngrok::')) {
     return { gateway: 'ngrok', upstreamModelId: trimmed.slice(7).trim() };
+  }
+  if (trimmed.startsWith('pollinations::')) {
+    return { gateway: 'pollinations', upstreamModelId: trimmed.slice(14).trim() };
   }
   if (trimmed.startsWith('openrouter::')) {
     return { gateway: 'openrouter', upstreamModelId: trimmed.slice(12).trim() };
@@ -387,24 +451,33 @@ function classifyGatewayModelCapabilities(
 ): { capabilities: string[]; category: FreeModelCategory } {
   const blob = modelId.toLowerCase();
   const caps: string[] = [];
-  const canImage =
-    outMods.includes('image') ||
-    /(?:flux|stable-diffusion|sdxl|z-image|qwen-image|krea|ideogram|dall-e|imagen)/.test(
+  const canVideo =
+    outMods.includes('video') ||
+    /(?:text-to-video|t2v|ti2v|hunyuanvideo|ltx-video|wan2|cogvideo|mochi-1|sora|veo)/.test(
       blob
     );
+  const canImage =
+    !canVideo &&
+    (outMods.includes('image') ||
+      /(?:flux|stable-diffusion|sdxl|z-image|qwen-image|krea|ideogram|dall-e|imagen|sana|gpt-image)/.test(
+        blob
+      ));
   const canMusic =
+    !canVideo &&
     (outMods.includes('audio') ||
       /(?:stable-audio|musicgen|audiogen|riffusion|music)/.test(blob)) &&
     !isTextToSpeechModel(blob);
   const canVision = inMods.includes('image') || inMods.includes('video');
   const canCode =
+    !canVideo &&
     !canImage &&
     !canMusic &&
-    (/code|coder|deepseek|qwen|gemma|llama|gpt-oss|gpt-4|gpt-5|claude|gemini|glm|flash|mini|instruct|reasoning|ultra|super|particle/.test(
+    (/code|coder|deepseek|qwen|gemma|llama|gpt-oss|gpt-4|gpt-5|claude|gemini|glm|flash|mini|instruct|reasoning|ultra|super|particle|openai-fast/.test(
       blob
     ) ||
       contextLength >= 16000);
 
+  if (canVideo) caps.push('Video');
   if (canImage) caps.push('Image');
   if (canMusic) caps.push('Music');
   if (canCode) {
@@ -414,13 +487,15 @@ function classifyGatewayModelCapabilities(
   if (canVision) caps.push('Vision');
   if (caps.length === 0) caps.push('Chat');
 
-  const category: FreeModelCategory = canImage
-    ? 'image'
-    : canMusic
-      ? 'music'
-      : canCode
-        ? 'code'
-        : 'chat';
+  const category: FreeModelCategory = canVideo
+    ? 'video'
+    : canImage
+      ? 'image'
+      : canMusic
+        ? 'music'
+        : canCode
+          ? 'code'
+          : 'chat';
 
   return { capabilities: caps, category };
 }
@@ -432,19 +507,24 @@ async function fetchWarmHuggingFaceMediaModels(
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3200);
+  const timer = setTimeout(() => controller.abort(), 3500);
 
   const imageModels: UnifiedAiModel[] = [];
   const musicModels: UnifiedAiModel[] = [];
+  const videoModels: UnifiedAiModel[] = [];
 
   try {
-    const [imgRes, audioRes] = await Promise.all([
+    const [imgRes, audioRes, videoRes] = await Promise.all([
       fetch(
         'https://huggingface.co/api/models?pipeline_tag=text-to-image&inference=warm&sort=downloads&direction=-1&limit=10',
         { headers, signal: controller.signal }
       ).catch(() => null),
       fetch(
         'https://huggingface.co/api/models?pipeline_tag=text-to-audio&inference=warm&sort=downloads&direction=-1&limit=15',
+        { headers, signal: controller.signal }
+      ).catch(() => null),
+      fetch(
+        'https://huggingface.co/api/models?pipeline_tag=text-to-video&inference=warm&sort=downloads&direction=-1&limit=12',
         { headers, signal: controller.signal }
       ).catch(() => null),
     ]);
@@ -510,6 +590,36 @@ async function fetchWarmHuggingFaceMediaModels(
         }
       }
     }
+
+    const seenVideo = new Set<string>();
+    if (videoRes && videoRes.ok) {
+      const list = (await videoRes.json()) as HfHubModelItem[];
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          const id = typeof item?.id === 'string' ? item.id.trim() : '';
+          if (!id || seenVideo.has(id)) continue;
+          const tags = Array.isArray(item.tags) ? item.tags.join(' ') : '';
+          const tagsBlob = `${id} ${tags}`;
+          if (isTextToSpeechModel(tagsBlob)) continue;
+          if (/lora|nsfw|controlnet|adapter/i.test(tagsBlob)) continue;
+          seenVideo.add(id);
+          const shortName = id.split('/').pop() || id;
+          videoModels.push({
+            id: `hf::${id}`,
+            upstreamModelId: id,
+            gateway: 'huggingface',
+            name: `HF: ${shortName} (Video)`,
+            provider: 'huggingface',
+            contextLength: 0,
+            isFree: true,
+            tierLabel: 'Free Tier',
+            capabilities: ['Video'],
+            category: 'video',
+          });
+          if (videoModels.length >= 5) break;
+        }
+      }
+    }
   } catch {
     // Fall back to curated warm models below
   } finally {
@@ -550,7 +660,121 @@ async function fetchWarmHuggingFaceMediaModels(
     }
   }
 
-  return [...imageModels.slice(0, 6), ...musicModels.slice(0, 4)];
+  for (const fb of HUGGING_FACE_VIDEO_FALLBACKS) {
+    if (!videoModels.some((m) => m.upstreamModelId === fb.id)) {
+      videoModels.push({
+        id: `hf::${fb.id}`,
+        upstreamModelId: fb.id,
+        gateway: 'huggingface',
+        name: fb.name,
+        provider: 'huggingface',
+        contextLength: 0,
+        isFree: true,
+        tierLabel: 'Free Tier',
+        capabilities: ['Video'],
+        category: 'video',
+      });
+    }
+  }
+
+  return [
+    ...imageModels.slice(0, 6),
+    ...musicModels.slice(0, 4),
+    ...videoModels.slice(0, 5),
+  ];
+}
+
+export async function fetchPollinationsCatalog(): Promise<UnifiedAiModel[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2800);
+  const collected: UnifiedAiModel[] = [];
+  const seen = new Set<string>();
+
+  try {
+    const [textRes, imgRes] = await Promise.all([
+      fetch(`${DEFAULT_POLLINATIONS_TEXT_URL}/models`, {
+        signal: controller.signal,
+      }).catch(() => null),
+      fetch(`${DEFAULT_POLLINATIONS_IMAGE_URL}/models`, {
+        signal: controller.signal,
+      }).catch(() => null),
+    ]);
+
+    if (textRes && textRes.ok) {
+      const list = (await textRes.json()) as Array<{
+        name?: string;
+        description?: string;
+        tier?: string;
+        output_modalities?: string[];
+      }>;
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          const id = typeof item?.name === 'string' ? item.name.trim() : '';
+          if (!id || seen.has(`text:${id}`)) continue;
+          const outMods = Array.isArray(item.output_modalities)
+            ? item.output_modalities.map((m) => String(m).toLowerCase())
+            : ['text'];
+          // Strictly skip audio/TTS text endpoints on Pollinations
+          if (outMods.includes('audio')) continue;
+          if (isTextToSpeechModel(`${id} ${item.description || ''}`)) continue;
+          seen.add(`text:${id}`);
+          collected.push({
+            id: `pollinations::${id}`,
+            upstreamModelId: id,
+            gateway: 'pollinations',
+            name: `Pollinations: ${item.description || id}`,
+            provider: 'pollinations',
+            contextLength: 128000,
+            isFree: true,
+            tierLabel: 'No Key Needed',
+            capabilities: ['Code', 'Build', 'Reasoning'],
+            category: 'code',
+          });
+        }
+      }
+    }
+
+    if (imgRes && imgRes.ok) {
+      const list = (await imgRes.json()) as Array<string | { name?: string }>;
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          const id =
+            typeof item === 'string'
+              ? item.trim()
+              : typeof item?.name === 'string'
+                ? item.name.trim()
+                : '';
+          if (!id || seen.has(`img:${id}`)) continue;
+          if (isTextToSpeechModel(id)) continue;
+          seen.add(`img:${id}`);
+          collected.push({
+            id: `pollinations::${id}`,
+            upstreamModelId: id,
+            gateway: 'pollinations',
+            name: `Pollinations: ${id.charAt(0).toUpperCase() + id.slice(1)} (Image)`,
+            provider: 'pollinations',
+            contextLength: 0,
+            isFree: true,
+            tierLabel: 'No Key Needed',
+            capabilities: ['Image'],
+            category: 'image',
+          });
+        }
+      }
+    }
+  } catch {
+    // Use curated fallbacks below
+  } finally {
+    clearTimeout(timer);
+  }
+
+  for (const fb of POLLINATIONS_FALLBACK_MODELS) {
+    if (!collected.some((m) => m.id === fb.id)) {
+      collected.push(fb);
+    }
+  }
+
+  return collected;
 }
 
 export async function fetchHuggingFaceCatalog(
@@ -750,6 +974,18 @@ export async function fetchHuggingFaceCatalog(
         capabilities: ['Music'],
         category: 'music' as const,
       })),
+      ...HUGGING_FACE_VIDEO_FALLBACKS.map((fb) => ({
+        id: `hf::${fb.id}`,
+        upstreamModelId: fb.id,
+        gateway: 'huggingface' as const,
+        name: fb.name,
+        provider: 'huggingface',
+        contextLength: 0,
+        isFree: true,
+        tierLabel: 'Free Tier',
+        capabilities: ['Video'],
+        category: 'video' as const,
+      })),
     ];
   } finally {
     clearTimeout(timer);
@@ -927,6 +1163,7 @@ export async function fetchAllGatewayModels(
   openRouterConfigured: boolean;
   huggingFaceConfigured: boolean;
   ngrokConfigured: boolean;
+  pollinationsConfigured: boolean;
   geminiConfigured: boolean;
   keyStatus: OpenRouterKeyStatus;
 }> {
@@ -940,14 +1177,16 @@ export async function fetchAllGatewayModels(
   const ngrokKey = ngrokPool[0] || '';
   const geminiConfigured = geminiPool.length > 0;
 
-  const [orResult, orKeyStatus, hfModels, ngrokModels] = await Promise.all([
-    fetchFreeOpenRouterCatalog(openRouterKey, referer)
-      .then((list) => ({ ok: true as const, list }))
-      .catch(() => ({ ok: false as const, list: [] as NormalizedOpenRouterModel[] })),
-    fetchOpenRouterKeyStatus(openRouterKey, referer, forceRefresh),
-    huggingFaceKey ? fetchHuggingFaceCatalog(huggingFaceKey) : Promise.resolve([]),
-    ngrokKey ? fetchNgrokCatalog(ngrokKey) : Promise.resolve([]),
-  ]);
+  const [orResult, orKeyStatus, hfModels, ngrokModels, pollinationsModels] =
+    await Promise.all([
+      fetchFreeOpenRouterCatalog(openRouterKey, referer)
+        .then((list) => ({ ok: true as const, list }))
+        .catch(() => ({ ok: false as const, list: [] as NormalizedOpenRouterModel[] })),
+      fetchOpenRouterKeyStatus(openRouterKey, referer, forceRefresh),
+      huggingFaceKey ? fetchHuggingFaceCatalog(huggingFaceKey) : Promise.resolve([]),
+      ngrokKey ? fetchNgrokCatalog(ngrokKey) : Promise.resolve([]),
+      fetchPollinationsCatalog().catch(() => [...POLLINATIONS_FALLBACK_MODELS]),
+    ]);
 
   const orModels: UnifiedAiModel[] = orResult.list
     .filter((m) => !isTextToSpeechModel(`${m.id} ${m.name}`))
@@ -995,6 +1234,8 @@ export async function fetchAllGatewayModels(
       models.push(...hfModels);
     } else if (gw === 'ngrok' && ngrokKey) {
       models.push(...ngrokModels);
+    } else if (gw === 'pollinations') {
+      models.push(...pollinationsModels);
     } else if (gw === 'gemini') {
       models.push(...geminiModels);
     }
@@ -1037,6 +1278,15 @@ export async function fetchAllGatewayModels(
         'gpt-4o-mini',
     },
     {
+      id: 'pollinations',
+      label: 'Pollinations Public AI',
+      baseUrl: DEFAULT_POLLINATIONS_TEXT_URL,
+      configured: true,
+      keyCount: 0,
+      modelCount: pollinationsModels.length,
+      defaultModel: 'openai-fast',
+    },
+    {
       id: 'gemini',
       label: 'Google Gemini',
       baseUrl: 'https://generativelanguage.googleapis.com',
@@ -1053,6 +1303,7 @@ export async function fetchAllGatewayModels(
     openRouterConfigured: openRouterPool.length > 0,
     huggingFaceConfigured: huggingFacePool.length > 0,
     ngrokConfigured: ngrokPool.length > 0,
+    pollinationsConfigured: true,
     geminiConfigured,
     keyStatus: orKeyStatus,
   };
@@ -1064,16 +1315,22 @@ export function buildGatewayExecutionPlan(params: {
   openRouterCatalog: NormalizedOpenRouterModel[];
   huggingFaceCatalog: UnifiedAiModel[];
   ngrokCatalog: UnifiedAiModel[];
+  pollinationsCatalog?: UnifiedAiModel[];
 }): {
   openaiCandidates: GatewayExecutionCandidate[];
   hasAnyOpenAiGatewayKey: boolean;
   preferGeminiDirectly: boolean;
-  requestedMediaKind: 'image' | 'music' | null;
+  requestedMediaKind: 'image' | 'music' | 'video' | null;
+  requestedModelLabel?: string;
 } {
   const openRouterPool = getOpenRouterApiKeyPool();
   const huggingFacePool = getHuggingFaceApiKeyPool();
   const ngrokPool = getNgrokApiKeyPool();
   const geminiPool = getGeminiApiKeyPool();
+  const polList =
+    params.pollinationsCatalog && params.pollinationsCatalog.length > 0
+      ? params.pollinationsCatalog
+      : POLLINATIONS_FALLBACK_MODELS;
 
   const parsed = parseGatewayModelIdentifier(
     params.requestedModel,
@@ -1093,6 +1350,10 @@ export function buildGatewayExecutionPlan(params: {
     ) {
       preferredGateway = 'ngrok';
     } else if (
+      polList.some((m) => m.upstreamModelId === parsed.upstreamModelId)
+    ) {
+      preferredGateway = 'pollinations';
+    } else if (
       isCandidateFreeOpenRouterModel(
         parsed.upstreamModelId,
         params.openRouterCatalog
@@ -1102,8 +1363,10 @@ export function buildGatewayExecutionPlan(params: {
     }
   }
 
-  // Detect if the user explicitly picked a dedicated Image or Music generation model
-  let requestedMediaKind: 'image' | 'music' | null = null;
+  // Detect if the user explicitly picked a dedicated Image, Music, or Video model
+  let requestedMediaKind: 'image' | 'music' | 'video' | null = null;
+  let requestedModelLabel: string | undefined;
+
   if (parsed.upstreamModelId) {
     const matchedHf = params.huggingFaceCatalog.find(
       (m) => m.upstreamModelId === parsed.upstreamModelId
@@ -1111,16 +1374,27 @@ export function buildGatewayExecutionPlan(params: {
     const matchedNgrok = params.ngrokCatalog.find(
       (m) => m.upstreamModelId === parsed.upstreamModelId
     );
-    const matched = matchedHf || matchedNgrok;
-    if (matched?.category === 'image') requestedMediaKind = 'image';
+    const matchedPol = polList.find(
+      (m) => m.upstreamModelId === parsed.upstreamModelId
+    );
+    const matched = matchedHf || matchedNgrok || matchedPol;
+    requestedModelLabel = matched?.name;
+    if (matched?.category === 'video') requestedMediaKind = 'video';
+    else if (matched?.category === 'image') requestedMediaKind = 'image';
     else if (matched?.category === 'music') requestedMediaKind = 'music';
+    else {
+      const { category } = classifyGatewayModelCapabilities(parsed.upstreamModelId);
+      if (category === 'video' || category === 'image' || category === 'music') {
+        requestedMediaKind = category;
+      }
+    }
   }
 
   const baseOrder = getGatewayOrder().filter(
     (g): g is Exclude<AiGatewayId, 'gemini'> => g !== 'gemini'
   );
   const orderedGateways =
-    preferredGateway && preferredGateway !== 'gemini'
+    preferredGateway && preferredGateway !== 'gemini' && requestedMediaKind === null
       ? [preferredGateway, ...baseOrder.filter((g) => g !== preferredGateway)]
       : baseOrder;
 
@@ -1173,14 +1447,23 @@ export function buildGatewayExecutionPlan(params: {
         }
       };
 
-      if (preferredGateway === 'openrouter' && parsed.upstreamModelId) {
+      if (
+        preferredGateway === 'openrouter' &&
+        parsed.upstreamModelId &&
+        requestedMediaKind === null
+      ) {
         addOrForAllKeys(parsed.upstreamModelId);
       }
       addOrForAllKeys(process.env.OPENROUTER_FALLBACK_MODEL);
       addOrForAllKeys('openrouter/free');
       // Add ALL remaining healthy :free OpenRouter models for automatic limit failover
       for (const m of params.openRouterCatalog) {
-        if (m.isFree && m.category !== 'image' && m.category !== 'music') {
+        if (
+          m.isFree &&
+          m.category !== 'image' &&
+          m.category !== 'music' &&
+          m.category !== 'video'
+        ) {
           addOrForAllKeys(m.id);
         }
       }
@@ -1190,7 +1473,9 @@ export function buildGatewayExecutionPlan(params: {
         params.huggingFaceCatalog.length > 0
           ? params.huggingFaceCatalog
           : buildFallbackHuggingFaceCodeModels()
-      ).filter((m) => m.category !== 'image' && m.category !== 'music');
+      ).filter(
+        (m) => m.category !== 'image' && m.category !== 'music' && m.category !== 'video'
+      );
 
       const addHfForAllKeys = (upstreamId: string | undefined, name?: string) => {
         const trimmed = upstreamId?.trim();
@@ -1227,7 +1512,7 @@ export function buildGatewayExecutionPlan(params: {
     } else if (gw === 'ngrok' && ngrokPool.length > 0) {
       const ngrokBase = getNgrokGatewayBaseUrl();
       const ngrokList = params.ngrokCatalog.filter(
-        (m) => m.category !== 'image' && m.category !== 'music'
+        (m) => m.category !== 'image' && m.category !== 'music' && m.category !== 'video'
       );
 
       const addNgrokForAllKeys = (upstreamId: string | undefined, name?: string) => {
@@ -1263,20 +1548,57 @@ export function buildGatewayExecutionPlan(params: {
         addNgrokForAllKeys('gpt-4o-mini', 'ngrok: gpt-4o-mini');
         addNgrokForAllKeys('gpt-4o', 'ngrok: gpt-4o');
       }
+    } else if (gw === 'pollinations') {
+      const polTextModels = polList.filter(
+        (m) => m.category !== 'image' && m.category !== 'music' && m.category !== 'video'
+      );
+      if (
+        preferredGateway === 'pollinations' &&
+        parsed.upstreamModelId &&
+        requestedMediaKind === null
+      ) {
+        const matched = polTextModels.find(
+          (m) => m.upstreamModelId === parsed.upstreamModelId
+        );
+        pushCandidate({
+          gateway: 'pollinations',
+          gatewayLabel: 'Pollinations Public AI',
+          baseUrl: DEFAULT_POLLINATIONS_TEXT_URL,
+          apiKey: '',
+          publicModelId: `pollinations::${parsed.upstreamModelId}`,
+          upstreamModelId: parsed.upstreamModelId,
+          modelName: matched?.name || `Pollinations: ${parsed.upstreamModelId}`,
+          provider: 'pollinations',
+        });
+      }
+      for (const m of polTextModels) {
+        pushCandidate({
+          gateway: 'pollinations',
+          gatewayLabel: 'Pollinations Public AI',
+          baseUrl: DEFAULT_POLLINATIONS_TEXT_URL,
+          apiKey: '',
+          publicModelId: m.id,
+          upstreamModelId: m.upstreamModelId,
+          modelName: m.name,
+          provider: 'pollinations',
+        });
+      }
     }
   }
 
-  // Try non-cooling-down candidates first, then cooling candidates as last resort (capped at 20)
-  const openaiCandidates = [...readyCandidates, ...coolingCandidates].slice(0, 20);
+  // Try non-cooling-down candidates first, then cooling candidates as last resort (capped at 22)
+  const openaiCandidates = [...readyCandidates, ...coolingCandidates].slice(0, 22);
 
   return {
     openaiCandidates,
     hasAnyOpenAiGatewayKey:
       openRouterPool.length > 0 ||
       huggingFacePool.length > 0 ||
-      ngrokPool.length > 0,
+      ngrokPool.length > 0 ||
+      openaiCandidates.length > 0,
     preferGeminiDirectly:
-      preferredGateway === 'gemini' && geminiPool.length > 0,
+      preferredGateway === 'gemini' && geminiPool.length > 0 && requestedMediaKind === null,
     requestedMediaKind,
+    requestedModelLabel,
   };
 }

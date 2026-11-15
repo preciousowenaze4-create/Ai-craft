@@ -14,13 +14,19 @@ import {
   buildGatewayExecutionPlan,
   fetchHuggingFaceCatalog,
   fetchNgrokCatalog,
+  fetchPollinationsCatalog,
   getHuggingFaceApiKey,
   getNgrokApiKey,
   markGatewayCandidateCooldown,
+  POLLINATIONS_FALLBACK_MODELS,
   type AiGatewayId,
   type GatewayExecutionCandidate,
   type UnifiedAiModel,
 } from '../_aiGateways.js';
+import {
+  generateMediaAsset,
+  type GeneratedMediaResult,
+} from '../_mediaService.js';
 import {
   fetchFreeOpenRouterCatalog,
   getGeminiApiKey,
@@ -804,6 +810,8 @@ function extractSessionTitleFromRaw(raw: string): string {
 function stripTagMarkers(text: string): string {
   return text
     .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*MODE\s*:\s*(?:CHAT|GENERATE)\s*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*MEDIA_PROMPT\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*TITLE\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*LOGO\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
@@ -973,118 +981,206 @@ async function streamOpenRouterCompletion(
   signal?: AbortSignal
 ): Promise<void> {
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${candidate.apiKey}`,
     'Content-Type': 'application/json',
   };
+  if (candidate.apiKey) {
+    headers.Authorization = `Bearer ${candidate.apiKey}`;
+  }
   if (candidate.isOpenRouter) {
     headers['HTTP-Referer'] = referer;
     headers['X-Title'] = 'AI Craft';
   }
 
-  const sendRequest = async (payloadMessages: OpenRouterChatMessage[]) =>
-    fetch(`${candidate.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: candidate.upstreamModelId,
-        stream: true,
-        messages: [
-          { role: 'system', content: systemInstruction },
-          ...payloadMessages,
-        ],
-      }),
-      signal,
-    });
+  const endpointUrl =
+    candidate.gateway === 'pollinations'
+      ? `${candidate.baseUrl}/openai`
+      : `${candidate.baseUrl}/chat/completions`;
 
-  let response = await sendRequest(messages);
-  const hasImages = messages.some(
-    (m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url')
-  );
+  const attemptController = new AbortController();
+  let timedOutReason = '';
+  let receivedAnyStreamData = false;
 
-  if (
-    hasImages &&
-    (!response.ok || !response.body) &&
-    (response.status === 400 || response.status === 404 || response.status === 422)
-  ) {
-    await response.text().catch(() => '');
-    response = await sendRequest(stripImagesFromMessages(messages));
-  }
-
-  if (!response.ok || !response.body) {
-    let errorDetail = `${candidate.gatewayLabel} error (${response.status})`;
-    try {
-      const errBody = (await response.json()) as {
-        error?: { message?: string };
-        message?: string;
-      };
-      if (errBody?.error?.message) {
-        errorDetail = errBody.error.message;
-      } else if (errBody?.message) {
-        errorDetail = errBody.message;
-      }
-    } catch {
-      const text = await response.text().catch(() => '');
-      if (text) errorDetail = text.slice(0, 200);
+  const forwardAbort = () => {
+    if (!attemptController.signal.aborted) {
+      attemptController.abort();
     }
-    throw new GatewayApiError(errorDetail, response.status);
+  };
+  if (signal) {
+    if (signal.aborted) forwardAbort();
+    else signal.addEventListener('abort', forwardAbort, { once: true });
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const resetWatchdog = (ms: number, reason: string) => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      timedOutReason = reason;
+      if (!attemptController.signal.aborted) {
+        attemptController.abort();
+      }
+    }, ms);
+  };
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
+  // Initial connect / first-byte timeout: 12s so hung free models fail over immediately
+  resetWatchdog(12_000, `${candidate.modelName} timed out before responding`);
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() ?? '';
+  try {
+    const sendRequest = async (payloadMessages: OpenRouterChatMessage[]) =>
+      fetch(endpointUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: candidate.upstreamModelId,
+          stream: true,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            ...payloadMessages,
+          ],
+        }),
+        signal: attemptController.signal,
+      });
 
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith(':')) continue;
-      if (!line.startsWith('data:')) continue;
+    let response = await sendRequest(messages);
+    const hasImages = messages.some(
+      (m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url')
+    );
 
-      const data = line.slice(5).trim();
-      if (!data || data === '[DONE]') continue;
+    if (
+      hasImages &&
+      (!response.ok || !response.body) &&
+      (response.status === 400 || response.status === 404 || response.status === 422)
+    ) {
+      await response.text().catch(() => '');
+      response = await sendRequest(stripImagesFromMessages(messages));
+    }
 
-      let parsed: {
-        error?: { message?: string };
-        choices?: Array<{
-          delta?: {
-            reasoning?: string;
-            reasoning_content?: string;
-            content?: string | Array<{ type?: string; text?: string }>;
-          };
-        }>;
-      };
-
+    if (!response.ok || !response.body) {
+      let errorDetail = `${candidate.gatewayLabel} error (${response.status})`;
       try {
-        parsed = JSON.parse(data);
+        const errBody = (await response.json()) as {
+          error?: { message?: string };
+          message?: string;
+        };
+        if (errBody?.error?.message) {
+          errorDetail = errBody.error.message;
+        } else if (errBody?.message) {
+          errorDetail = errBody.message;
+        }
       } catch {
-        continue;
+        const text = await response.text().catch(() => '');
+        if (text) errorDetail = text.slice(0, 200);
       }
+      throw new GatewayApiError(errorDetail, response.status);
+    }
 
-      if (parsed?.error?.message) {
-        throw new Error(parsed.error.message);
-      }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
 
-      const delta = parsed?.choices?.[0]?.delta;
-      if ((delta?.reasoning || delta?.reasoning_content) && onReasoningChunk) {
-        onReasoningChunk();
-      }
+    // Extend watchdog once headers arrive; allow 18s per chunk gap
+    resetWatchdog(18_000, `${candidate.modelName} stalled mid-stream`);
 
-      const content = delta?.content;
-      if (typeof content === 'string' && content.length > 0) {
-        onTextChunk(content);
-      } else if (Array.isArray(content)) {
-        for (const part of content) {
-          if (typeof part?.text === 'string' && part.text.length > 0) {
-            onTextChunk(part.text);
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      receivedAnyStreamData = true;
+      resetWatchdog(18_000, `${candidate.modelName} stalled mid-stream`);
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? '';
+
+      for (const rawLine of lines) {
+        const trimmedLine = rawLine.trim();
+        if (!trimmedLine || trimmedLine.startsWith(':')) continue;
+
+        // Handle gateways (like Pollinations) that occasionally concatenate multiple `data:` frames without newlines
+        const subFrames = trimmedLine.includes('}data:')
+          ? trimmedLine.split(/(?=data:\s*)/)
+          : [trimmedLine];
+
+        for (const frame of subFrames) {
+          const line = frame.trim();
+          if (!line.startsWith('data:')) continue;
+
+          const data = line.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+
+          let parsed: {
+            error?: { message?: string };
+            choices?: Array<{
+              delta?: {
+                reasoning?: string;
+                reasoning_content?: string;
+                content?: string | Array<{ type?: string; text?: string }>;
+              };
+            }>;
+          };
+
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            continue;
+          }
+
+          if (parsed?.error?.message) {
+            throw new Error(parsed.error.message);
+          }
+
+          const delta = parsed?.choices?.[0]?.delta;
+          if ((delta?.reasoning || delta?.reasoning_content) && onReasoningChunk) {
+            onReasoningChunk();
+          }
+
+          const content = delta?.content;
+          if (typeof content === 'string' && content.length > 0) {
+            onTextChunk(content);
+          } else if (Array.isArray(content)) {
+            for (const part of content) {
+              if (typeof part?.text === 'string' && part.text.length > 0) {
+                onTextChunk(part.text);
+              }
+            }
           }
         }
       }
+    }
+
+    // Flush any final complete frame left in buffer if upstream closed without trailing newline
+    if (buffer.trim().startsWith('data:')) {
+      const tailFrames = buffer.trim().split(/(?=data:\s*)/);
+      for (const frame of tailFrames) {
+        const data = frame.trim().slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(data) as {
+            choices?: Array<{
+              delta?: { content?: string | Array<{ type?: string; text?: string }> };
+            }>;
+          };
+          const content = parsed?.choices?.[0]?.delta?.content;
+          if (typeof content === 'string' && content.length > 0) {
+            onTextChunk(content);
+          }
+        } catch {
+          // ignore partial tail
+        }
+      }
+    }
+
+    if (!receivedAnyStreamData) {
+      throw new Error(`${candidate.modelName} closed without returning data`);
+    }
+  } catch (err) {
+    if (timedOutReason) {
+      throw new GatewayApiError(timedOutReason, 504);
+    }
+    throw err;
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (signal) {
+      signal.removeEventListener('abort', forwardAbort);
     }
   }
 }
@@ -1233,24 +1329,53 @@ export async function POST(request: Request): Promise<Response> {
         const ngrokKey = getNgrokApiKey();
         const geminiClient = createGeminiClient();
 
-        if (!openRouterKey && !huggingFaceKey && !ngrokKey && !geminiClient) {
-          sendEvent({
-            type: 'error',
-            message:
-              'No AI API key detected yet. Configure OPENROUTER_API_KEY, HUGGING_FACE_API_KEY, NGROK_API_KEY, or GEMINI_API_KEY in Vercel or Google AI Studio environment variables.',
-          });
-          closeStream();
-          return;
-        }
+        // Always begin in normal Thinking mode — never jump straight to Building
+        sendEvent({
+          type: 'phase',
+          phase: 'understanding',
+          kind: 'chat',
+          label: 'Thinking...',
+        });
 
-        const initialRoute: InitialRoute = options.forceChat
-          ? 'chat'
-          : classifyInitialRoute(
-              message,
-              previousHtml,
-              options.attachmentName,
-              Boolean(attachmentDataUrl || attachmentText)
-            );
+        const [orList, hfList, ngrokList, polList] = await Promise.all([
+          openRouterKey
+            ? fetchFreeOpenRouterFallbacks(openRouterKey, referer)
+            : Promise.resolve([]),
+          huggingFaceKey
+            ? fetchHuggingFaceCatalog(huggingFaceKey).catch(() => [])
+            : Promise.resolve([]),
+          ngrokKey
+            ? fetchNgrokCatalog(ngrokKey).catch(() => [])
+            : Promise.resolve([]),
+          fetchPollinationsCatalog().catch(() => [...POLLINATIONS_FALLBACK_MODELS]),
+        ]);
+        const catalog: NormalizedOpenRouterModel[] = orList;
+        const hfCatalog: UnifiedAiModel[] = hfList;
+        const ngrokCatalog: UnifiedAiModel[] = ngrokList;
+        const polCatalog: UnifiedAiModel[] = polList;
+
+        const executionPlan = buildGatewayExecutionPlan({
+          requestedModel,
+          requestedGateway,
+          openRouterCatalog: catalog,
+          huggingFaceCatalog: hfCatalog,
+          ngrokCatalog,
+          pollinationsCatalog: polCatalog,
+        });
+
+        const mediaKind = executionPlan.requestedMediaKind;
+
+        const initialRoute: InitialRoute =
+          mediaKind !== null
+            ? 'chat'
+            : options.forceChat
+              ? 'chat'
+              : classifyInitialRoute(
+                  message,
+                  previousHtml,
+                  options.attachmentName,
+                  Boolean(attachmentDataUrl || attachmentText)
+                );
 
         const now = new Date();
         const timeContext = [
@@ -1261,16 +1386,9 @@ export async function POST(request: Request): Promise<Response> {
           .filter(Boolean)
           .join(' | ');
 
-        // Always begin in normal Thinking mode — never jump straight to Building
-        sendEvent({
-          type: 'phase',
-          phase: 'understanding',
-          kind: 'chat',
-          label: 'Thinking...',
-        });
-
         let webSearchContext = '';
         if (
+          mediaKind === null &&
           webSearchEnabled &&
           (initialRoute !== 'chat' ||
             shouldRunChatSearch(message, previousHtml.trim().length > 0))
@@ -1315,7 +1433,7 @@ export async function POST(request: Request): Promise<Response> {
           '- REAL SUPABASE + GOOGLE LOGIN + REAL DATABASE WIRING: When Supabase secrets (`supabase-project-url` and `supabase-anon-key`/`jwt-token`/`supabase-credential`) are configured in Secrets OR requested by the user (e.g. WhatsApp/chat app with Google Login & real DB): load `@supabase/supabase-js@2` via `<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>`, initialize `window.supabase.createClient(sbUrl, sbKey)` using the exact key names found in Secrets (`getSecret` + `findSecret` fallback), wire real `supabaseClient.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } })` + `onAuthStateChange` + real `supabaseClient.from(table).select/insert/update/delete`, AND sync records into `window.AICraft.db` (`list`, `insert`, `update`, `remove`) while emitting `[[DB_SCHEMA: ...]]` lines so BOTH real cloud Postgres AND AI Craft Database explorer reflect real live data.',
           '- BUILT-IN REAL-TIME DATABASE API: For every app with data persistence, persist records via `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, `await window.AICraft.db.remove("table", id)`.',
           '- FULL STANDALONE PWA, CUSTOM BRAND LOGO & BROWSER ACCESS: Every app you build gets its own standalone hosted browser link (`/app/...`), its own Web App Manifest, its own scoped Service Worker, and its own generated PNG/SVG Home Screen icons — it NEVER inherits AI Craft\'s logo! Inside generated apps, you have FULL browser & PWA access via `window.AICraft.pwa` (`isStandalone()`, `isIOS()`, `canInstall()`, `promptInstall()`, `onInstallReady(cb)`, `logoUrl`, `themeColor`) and `window.AICraft.browser` (`setThemeColor(hex)`, `setTitle(str)`, `share(data)`, `copy(text)`, `vibrate(ms)`, `requestFullscreen()`, `getGeolocation()`, `notify(title, opts)`), plus standard Web APIs (`navigator.mediaDevices`, `localStorage`, `fetch`, Canvas, Audio, etc.).',
-          '- REAL FREE-TIER IMAGE & MUSIC GENERATION (NO TTS): When building apps that generate images or music, call `await window.AICraft.generateImage(prompt)` or `await window.AICraft.generateMusic(prompt)` (each returns `{ dataUrl, mimeType, modelId, gateway }`), routed automatically across configured free/low-cost gateways with automatic failover.',
+          '- REAL FREE-TIER IMAGE, MUSIC & VIDEO GENERATION (NO TTS): When building apps that generate images, music, or videos, call `await window.AICraft.generateImage(prompt)`, `await window.AICraft.generateMusic(prompt)`, or `await window.AICraft.generateVideo(prompt)` (each returns `{ dataUrl, mimeType, modelId, gateway }`), routed automatically across configured free/low-cost and public keyless gateways with automatic failover.',
         ].join('\n');
 
         const previewSummary = extractPreviewStructureSummary(previousHtml);
@@ -1366,7 +1484,32 @@ export async function POST(request: Request): Promise<Response> {
 
         let systemInstruction = '';
 
-        if (initialRoute === 'chat') {
+        if (mediaKind !== null) {
+          const mediaLabel =
+            mediaKind === 'video'
+              ? 'Video Generator'
+              : mediaKind === 'music'
+                ? 'Music Generator'
+                : 'Image Generator';
+          const selectedLabel = executionPlan.requestedModelLabel || requestedModel || mediaLabel;
+
+          systemInstruction = [
+            `You are AI Craft acting specifically in ${mediaLabel} mode (selected model: "${selectedLabel}").`,
+            `Real-time clock context: ${timeContext}.`,
+            shouldGenerateTitle
+              ? 'First output `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline.'
+              : '',
+            `YOUR ROLE & CAPABILITY RULES (STRICT):`,
+            `- Right now the user has selected a dedicated ${mediaLabel}. You CANNOT build apps, websites, HTML, or code in this mode — app building belongs to **Code & Build** mode.`,
+            `- Decide dynamically and naturally from the user's message:`,
+            `  (1) CHAT / APP-BUILD REQUEST / QUESTION: If the user asks to build an app or website (for example "build an app like TikTok"), greets you, or asks a general question:`,
+            `      Start with exactly \`[[MODE:CHAT]]\` followed by a newline, then reply naturally in your own words (warm, concise, never robotic). Naturally explain that you are currently in ${mediaLabel} mode (${selectedLabel}) so you can't build apps right now, suggest switching the model selector to **Code & Build** to build an app, OR invite them to describe the ${mediaKind === 'music' ? 'music track' : mediaKind} they'd like you to generate!`,
+            `  (2) CREATE / GENERATE ${mediaKind.toUpperCase()}: If the user asks you to generate, create, make, draw, compose, or render a/an ${mediaKind} (or directly describes a visual scene, song, beat, or video clip):`,
+            `      Start with exactly \`[[MODE:GENERATE]]\` followed by a newline, write ONE short, natural sentence confirming what ${mediaKind} you are creating right now, and finish with \`[[MEDIA_PROMPT: <clean, descriptive prompt tailored for ${selectedLabel}>]]\`. Never output HTML, code blocks, or web links.`,
+          ]
+            .filter(Boolean)
+            .join('\n');
+        } else if (initialRoute === 'chat') {
           systemInstruction = [
             'You are AI Craft, a helpful, natural, real-time AI assistant with live browser search access.',
             `Real-time clock context: ${timeContext}.`,
@@ -1480,6 +1623,7 @@ export async function POST(request: Request): Promise<Response> {
         let modelUsed = '';
         let noticedReasoning = false;
         let pausedDueToCredits = false;
+        let pausedDueToStreamLimit = false;
         const generationAbort = new AbortController();
         const forwardRequestAbort = () => {
           if (!generationAbort.signal.aborted) {
@@ -1491,6 +1635,15 @@ export async function POST(request: Request): Promise<Response> {
         } else {
           request.signal.addEventListener('abort', forwardRequestAbort, { once: true });
         }
+
+        // Graceful 48s Vercel timeout guard so partial builds flush cleanly instead of dropping socket mid-stream
+        const serverlessBudgetTimer = setTimeout(() => {
+          if (pausedDueToCredits || pausedDueToStreamLimit) return;
+          pausedDueToStreamLimit = true;
+          if (!generationAbort.signal.aborted) {
+            generationAbort.abort();
+          }
+        }, 48_000);
 
         const triggerCreditPause = () => {
           if (pausedDueToCredits) return;
@@ -1811,33 +1964,7 @@ export async function POST(request: Request): Promise<Response> {
 
         let succeeded = false;
         let lastError: Error | null = null;
-        let catalog: NormalizedOpenRouterModel[] = [];
-        let hfCatalog: UnifiedAiModel[] = [];
-        let ngrokCatalog: UnifiedAiModel[] = [];
         let usedCandidate: GatewayExecutionCandidate | null = null;
-
-        const [orList, hfList, ngrokList] = await Promise.all([
-          openRouterKey
-            ? fetchFreeOpenRouterFallbacks(openRouterKey, referer)
-            : Promise.resolve([]),
-          huggingFaceKey
-            ? fetchHuggingFaceCatalog(huggingFaceKey).catch(() => [])
-            : Promise.resolve([]),
-          ngrokKey
-            ? fetchNgrokCatalog(ngrokKey).catch(() => [])
-            : Promise.resolve([]),
-        ]);
-        catalog = orList;
-        hfCatalog = hfList;
-        ngrokCatalog = ngrokList;
-
-        const executionPlan = buildGatewayExecutionPlan({
-          requestedModel,
-          requestedGateway,
-          openRouterCatalog: catalog,
-          huggingFaceCatalog: hfCatalog,
-          ngrokCatalog,
-        });
 
         const failedAuthGateways = new Set<AiGatewayId>();
 
@@ -1847,7 +1974,7 @@ export async function POST(request: Request): Promise<Response> {
         ) {
           for (let i = 0; i < executionPlan.openaiCandidates.length; i += 1) {
             const candidate = executionPlan.openaiCandidates[i];
-            if (request.signal.aborted || pausedDueToCredits) break;
+            if (request.signal.aborted || pausedDueToCredits || pausedDueToStreamLimit) break;
             if (failedAuthGateways.has(candidate.gateway)) continue;
 
             try {
@@ -1855,17 +1982,20 @@ export async function POST(request: Request): Promise<Response> {
                 resetStreamParser();
               }
 
-              sendEvent({
-                type: 'meta',
-                kind: 'chat',
-                modelId: candidate.publicModelId,
-                modelName: candidate.modelName,
-                provider: candidate.provider,
-                gateway: candidate.gateway,
-                isFallback: i > 0,
-              });
+              // When generating via dedicated Image/Music/Video model, keep active branding on that media model
+              if (mediaKind === null) {
+                sendEvent({
+                  type: 'meta',
+                  kind: 'chat',
+                  modelId: candidate.publicModelId,
+                  modelName: candidate.modelName,
+                  provider: candidate.provider,
+                  gateway: candidate.gateway,
+                  isFallback: i > 0,
+                });
+              }
 
-              if (i > 0) {
+              if (i > 0 && mediaKind === null) {
                 sendEvent({
                   type: 'phase',
                   phase: 'understanding',
@@ -1896,7 +2026,7 @@ export async function POST(request: Request): Promise<Response> {
 
               flushPendingStreamBuffer();
 
-              if (pausedDueToCredits) {
+              if (pausedDueToCredits || pausedDueToStreamLimit) {
                 modelUsed = candidate.publicModelId;
                 usedCandidate = candidate;
                 break;
@@ -1908,7 +2038,7 @@ export async function POST(request: Request): Promise<Response> {
                 );
               }
 
-              if (resolvedKind === 'build') {
+              if (resolvedKind === 'build' && mediaKind === null) {
                 const extractedHtml = extractPreviewHtmlFromRaw(fullRaw);
                 if (
                   !extractedHtml ||
@@ -1926,7 +2056,7 @@ export async function POST(request: Request): Promise<Response> {
               succeeded = true;
               break;
             } catch (err) {
-              if (pausedDueToCredits) {
+              if (pausedDueToCredits || pausedDueToStreamLimit) {
                 modelUsed = candidate.publicModelId;
                 usedCandidate = candidate;
                 break;
@@ -1957,7 +2087,11 @@ export async function POST(request: Request): Promise<Response> {
               }
               if (
                 err instanceof GatewayApiError &&
-                (err.status === 429 || err.status === 402 || err.status === 503 || err.status === 502)
+                (err.status === 429 ||
+                  err.status === 402 ||
+                  err.status === 503 ||
+                  err.status === 502 ||
+                  err.status === 504)
               ) {
                 markGatewayCandidateCooldown(candidate.cooldownKey, 75_000);
               }
@@ -1966,23 +2100,31 @@ export async function POST(request: Request): Promise<Response> {
           }
         }
 
-        if (!succeeded && !pausedDueToCredits && geminiClient && !request.signal.aborted) {
+        if (
+          !succeeded &&
+          !pausedDueToCredits &&
+          !pausedDueToStreamLimit &&
+          geminiClient &&
+          !request.signal.aborted
+        ) {
           try {
             if (executionPlan.hasAnyOpenAiGatewayKey && !executionPlan.preferGeminiDirectly) {
               resetStreamParser();
             }
 
-            sendEvent({
-              type: 'meta',
-              kind: 'chat',
-              modelId: 'google/gemini-4-hydrogen',
-              modelName: 'Gemini 4 Hydrogen',
-              provider: 'google',
-              gateway: 'gemini',
-              isFallback:
-                executionPlan.hasAnyOpenAiGatewayKey &&
-                !executionPlan.preferGeminiDirectly,
-            });
+            if (mediaKind === null) {
+              sendEvent({
+                type: 'meta',
+                kind: 'chat',
+                modelId: 'google/gemini-4-hydrogen',
+                modelName: 'Gemini 4 Hydrogen',
+                provider: 'google',
+                gateway: 'gemini',
+                isFallback:
+                  executionPlan.hasAnyOpenAiGatewayKey &&
+                  !executionPlan.preferGeminiDirectly,
+              });
+            }
 
             const conversationContext = history
               .slice(-6)
@@ -2070,16 +2212,16 @@ export async function POST(request: Request): Promise<Response> {
             }
 
             for await (const chunk of geminiStream) {
-              if (request.signal.aborted || pausedDueToCredits) break;
+              if (request.signal.aborted || pausedDueToCredits || pausedDueToStreamLimit) break;
               if (chunk.text) {
                 handleTextChunk(chunk.text);
-                if (pausedDueToCredits) break;
+                if (pausedDueToCredits || pausedDueToStreamLimit) break;
               }
             }
 
             flushPendingStreamBuffer();
 
-            if (pausedDueToCredits) {
+            if (pausedDueToCredits || pausedDueToStreamLimit) {
               modelUsed = 'google/gemini-4-hydrogen';
             } else {
               if (!fullRaw.trim()) {
@@ -2090,7 +2232,7 @@ export async function POST(request: Request): Promise<Response> {
               succeeded = true;
             }
           } catch (err) {
-            if (pausedDueToCredits) {
+            if (pausedDueToCredits || pausedDueToStreamLimit) {
               modelUsed = 'google/gemini-4-hydrogen';
             } else {
               lastError = err instanceof Error ? err : new Error(String(err));
@@ -2098,7 +2240,9 @@ export async function POST(request: Request): Promise<Response> {
           }
         }
 
-        if (request.signal.aborted && !pausedDueToCredits) {
+        clearTimeout(serverlessBudgetTimer);
+
+        if (request.signal.aborted && !pausedDueToCredits && !pausedDueToStreamLimit) {
           if (!creditsCommitted && resolvedKind === 'build' && buildCreditsEmitted > 0) {
             creditsCommitted = true;
             const toCommit =
@@ -2111,7 +2255,7 @@ export async function POST(request: Request): Promise<Response> {
           return;
         }
 
-        if (pausedDueToCredits) {
+        if (pausedDueToCredits || pausedDueToStreamLimit) {
           const partialHtml = finalizePartialPreviewHtml(fullRaw);
           const codeStart = findCodeStart(fullRaw);
           const partialProse = codeStart
@@ -2129,10 +2273,14 @@ export async function POST(request: Request): Promise<Response> {
             sendEvent({ type: 'schema', tables: partialDbTables });
           }
 
-          const creditsToConsume =
-            effectiveCreditBudget !== null
+          const creditsToConsume = pausedDueToCredits
+            ? effectiveCreditBudget !== null
               ? Math.max(0, effectiveCreditBudget)
-              : buildCreditsEmitted;
+              : buildCreditsEmitted
+            : Math.min(
+                effectiveCreditBudget ?? Number.MAX_SAFE_INTEGER,
+                buildCreditsEmitted
+              );
           let updatedBilling = creditCheck.billing;
           if (!creditsCommitted && creditsToConsume > 0) {
             creditsCommitted = true;
@@ -2141,23 +2289,29 @@ export async function POST(request: Request): Promise<Response> {
                 () => null
               )) ?? creditCheck.billing;
           }
-          const exhaustInfo = creditCheck.context
-            ? getCreditExhaustionInfo({
-                ...creditCheck.context.state,
-                monthlyCreditsRemaining: Math.max(
-                  0,
-                  (updatedBilling?.monthlyCreditsRemaining ??
-                    creditCheck.context.state.monthlyCreditsRemaining - creditsToConsume)
-                ),
-                dailyCreditsUsed:
-                  updatedBilling?.dailyCreditsUsed ??
-                  creditCheck.context.state.dailyCreditsUsed + creditsToConsume,
-              })
-            : {
-                code: 'MONTHLY_LIMIT_REACHED' as const,
+          const exhaustInfo = pausedDueToStreamLimit
+            ? {
+                code: 'STREAM_INTERRUPTED' as const,
                 error:
-                  'Your remaining credits reached 0 during building. Building is paused with all progress saved until credits reset or you upgrade.',
-              };
+                  'Paused near serverless timeout with your build progress safely saved. Tap Continue to finish the rest.',
+              }
+            : creditCheck.context
+              ? getCreditExhaustionInfo({
+                  ...creditCheck.context.state,
+                  monthlyCreditsRemaining: Math.max(
+                    0,
+                    updatedBilling?.monthlyCreditsRemaining ??
+                      creditCheck.context.state.monthlyCreditsRemaining - creditsToConsume
+                  ),
+                  dailyCreditsUsed:
+                    updatedBilling?.dailyCreditsUsed ??
+                    creditCheck.context.state.dailyCreditsUsed + creditsToConsume,
+                })
+              : {
+                  code: 'MONTHLY_LIMIT_REACHED' as const,
+                  error:
+                    'Your remaining credits reached 0 during building. Building is paused with all progress saved until credits reset or you upgrade.',
+                };
 
           const finalTitle =
             emittedTitle ||
@@ -2181,12 +2335,13 @@ export async function POST(request: Request): Promise<Response> {
             type: 'paused',
             reason: exhaustInfo.code,
             message: exhaustInfo.error,
-            kind: 'build',
+            phaseLabel: pausedDueToStreamLimit ? 'Paused · Ready to continue' : undefined,
+            kind: partialHtml || resolvedKind === 'build' ? 'build' : 'chat',
             title: finalTitle,
             logo: finalLogo,
             fullText:
               partialProse ||
-              'Build progress was automatically saved right when your remaining tokens ran out.',
+              'Build progress was automatically saved. Tap Continue to pick up right where we left off.',
             previewHtml: partialHtml,
             allFiles: partialFiles,
             dbTables: partialDbTables,
@@ -2203,6 +2358,102 @@ export async function POST(request: Request): Promise<Response> {
 
         if (!succeeded) {
           throw lastError ?? new Error('Unable to reach AI Craft engine right now.');
+        }
+
+        // Dynamic role-aware Image / Music / Video generation (NO web link, NO HTML preview)
+        if (mediaKind !== null) {
+          const isGenerateMode =
+            /\[\[\s*MODE\s*:\s*GENERATE\s*\]\]/i.test(fullRaw) ||
+            /\[\[\s*MEDIA_PROMPT\s*:/i.test(fullRaw);
+          const mediaPromptMatch = /\[\[\s*MEDIA_PROMPT\s*:\s*([^\]]+?)\s*\]\]/i.exec(
+            fullRaw
+          );
+          const finalTitle =
+            emittedTitle ||
+            (shouldGenerateTitle
+              ? deriveServerSessionTitle(message, mode, '')
+              : undefined);
+          if (finalTitle && finalTitle !== emittedTitle) {
+            emittedTitle = finalTitle;
+            sendEvent({ type: 'title', title: finalTitle });
+          }
+
+          const cleanReplyText = stripTagMarkers(fullRaw).trim();
+
+          if (isGenerateMode) {
+            const generationPrompt = (mediaPromptMatch?.[1] || message).trim();
+            sendEvent({
+              type: 'phase',
+              phase: 'building',
+              kind: 'media',
+              label:
+                mediaKind === 'video'
+                  ? 'Generating video...'
+                  : mediaKind === 'music'
+                    ? 'Composing music...'
+                    : 'Generating image...',
+            });
+
+            const mediaResult: GeneratedMediaResult = await generateMediaAsset({
+              kind: mediaKind,
+              prompt: generationPrompt,
+              requestedModel,
+            });
+
+            sendEvent({
+              type: 'media',
+              media: mediaResult,
+            });
+
+            sendEvent({
+              type: 'done',
+              kind: 'media',
+              title: finalTitle,
+              fullText:
+                cleanReplyText ||
+                `Generated your ${mediaKind}: "${generationPrompt.slice(0, 120)}"`,
+              previewHtml: '',
+              allFiles: [],
+              suggestions: [],
+              dbTables: [],
+              bytesBuilt: 0,
+              creditsUsed: 0,
+              billing: creditCheck.billing,
+              media: mediaResult,
+              modelUsed: requestedModel || mediaResult.modelId,
+              modelName: executionPlan.requestedModelLabel || mediaResult.modelId,
+              provider: mediaResult.gateway,
+            });
+            closeStream();
+            return;
+          }
+
+          const finalInfo = usedCandidate
+            ? {
+                id: usedCandidate.publicModelId,
+                name: usedCandidate.modelName,
+                provider: usedCandidate.provider,
+              }
+            : resolveModelInfo(modelUsed, catalog);
+
+          sendEvent({
+            type: 'done',
+            kind: 'chat',
+            title: finalTitle,
+            fullText: cleanReplyText,
+            previewHtml: '',
+            allFiles: [],
+            suggestions: [],
+            dbTables: [],
+            bytesBuilt: 0,
+            creditsUsed: 0,
+            billing: creditCheck.billing,
+            modelUsed: requestedModel || finalInfo.id,
+            modelName: executionPlan.requestedModelLabel || finalInfo.name,
+            provider: finalInfo.provider,
+          });
+          closeStream();
+          return;
         }
 
         let finalProse = '';

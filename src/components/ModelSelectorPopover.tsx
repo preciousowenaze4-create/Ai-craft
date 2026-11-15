@@ -39,10 +39,10 @@ export function ModelSelectorPopover({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [gatewayFilter, setGatewayFilter] = useState<
-    'all' | 'openrouter' | 'huggingface' | 'ngrok' | 'gemini'
+    'all' | 'openrouter' | 'huggingface' | 'ngrok' | 'pollinations' | 'gemini'
   >('all');
   const [categoryFilter, setCategoryFilter] = useState<
-    'all' | 'code' | 'image' | 'music'
+    'all' | 'code' | 'image' | 'music' | 'video'
   >('all');
   const containerRef = useRef<HTMLDivElement | null>(null);
   const theme = MODE_THEMES[mode];
@@ -68,6 +68,10 @@ export function ModelSelectorPopover({
     () => models.some((m) => m.category === 'music' || m.capabilities?.includes('Music')),
     [models]
   );
+  const hasFreeVideoModels = useMemo(
+    () => models.some((m) => m.category === 'video' || m.capabilities?.includes('Video')),
+    [models]
+  );
 
   const filteredModels = useMemo(() => {
     const trimmed = query.trim().toLowerCase();
@@ -87,6 +91,8 @@ export function ModelSelectorPopover({
         if (m.category !== 'image' && !m.capabilities?.includes('Image')) return false;
       } else if (categoryFilter === 'music') {
         if (m.category !== 'music' && !m.capabilities?.includes('Music')) return false;
+      } else if (categoryFilter === 'video') {
+        if (m.category !== 'video' && !m.capabilities?.includes('Video')) return false;
       }
 
       if (!trimmed) return true;
@@ -247,8 +253,11 @@ export function ModelSelectorPopover({
                       ...(availableGateways.includes('ngrok')
                         ? [{ id: 'ngrok', label: 'ngrok' }]
                         : []),
+                      ...(availableGateways.includes('pollinations')
+                        ? [{ id: 'pollinations', label: 'Public Free' }]
+                        : []),
                     ] as Array<{
-                      id: 'all' | 'openrouter' | 'huggingface' | 'ngrok';
+                      id: 'all' | 'openrouter' | 'huggingface' | 'ngrok' | 'pollinations';
                       label: string;
                     }>
                   ).map((gwTab) => {
@@ -271,7 +280,7 @@ export function ModelSelectorPopover({
                 </div>
               )}
 
-              {(hasFreeImageModels || hasFreeMusicModels) && (
+              {(hasFreeImageModels || hasFreeMusicModels || hasFreeVideoModels) && (
                 <div className="flex items-center gap-1 overflow-x-auto pb-0.5 text-[11px]">
                   {(
                     [
@@ -279,7 +288,8 @@ export function ModelSelectorPopover({
                       { id: 'code', label: 'Code & Build' },
                       ...(hasFreeImageModels ? [{ id: 'image', label: 'Image' }] : []),
                       ...(hasFreeMusicModels ? [{ id: 'music', label: 'Music' }] : []),
-                    ] as Array<{ id: 'all' | 'code' | 'image' | 'music'; label: string }>
+                      ...(hasFreeVideoModels ? [{ id: 'video', label: 'Video' }] : []),
+                    ] as Array<{ id: 'all' | 'code' | 'image' | 'music' | 'video'; label: string }>
                   ).map((tab) => {
                     const active = categoryFilter === tab.id;
                     return (

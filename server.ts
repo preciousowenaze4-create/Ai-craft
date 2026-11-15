@@ -58,15 +58,20 @@ import {
   fetchAllGatewayModels,
   fetchHuggingFaceCatalog,
   fetchNgrokCatalog,
+  fetchPollinationsCatalog,
   getGatewayOrder,
   getHuggingFaceApiKey,
   getNgrokApiKey,
   markGatewayCandidateCooldown,
+  POLLINATIONS_FALLBACK_MODELS,
   type AiGatewayId,
   type GatewayExecutionCandidate,
   type UnifiedAiModel,
 } from './api/_aiGateways.js';
-import { generateMediaAsset } from './api/_mediaService.js';
+import {
+  generateMediaAsset,
+  type GeneratedMediaResult,
+} from './api/_mediaService.js';
 import {
   cleanEnvKey,
   fetchFreeOpenRouterCatalog,
@@ -81,6 +86,7 @@ const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 let cachedModels: NormalizedOpenRouterModel[] = [];
 let cachedHfModels: UnifiedAiModel[] = [];
 let cachedNgrokModels: UnifiedAiModel[] = [];
+let cachedPollinationsModels: UnifiedAiModel[] = [];
 let modelsCachedAt = 0;
 let modelsCachedKey = '';
 
@@ -731,119 +737,204 @@ async function streamOpenRouterCompletion(
   signal?: AbortSignal
 ): Promise<void> {
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${candidate.apiKey}`,
     'Content-Type': 'application/json',
   };
+  if (candidate.apiKey) {
+    headers.Authorization = `Bearer ${candidate.apiKey}`;
+  }
   if (candidate.isOpenRouter) {
     headers['HTTP-Referer'] = process.env.APP_URL || `http://localhost:${PORT}`;
     headers['X-Title'] = 'AI Craft';
   }
 
-  const sendRequest = async (payloadMessages: OpenRouterChatMessage[]) =>
-    fetch(`${candidate.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: candidate.upstreamModelId,
-        stream: true,
-        messages: [
-          { role: 'system', content: systemInstruction },
-          ...payloadMessages,
-        ],
-      }),
-      signal,
-    });
+  const endpointUrl =
+    candidate.gateway === 'pollinations'
+      ? `${candidate.baseUrl}/openai`
+      : `${candidate.baseUrl}/chat/completions`;
 
-  let response = await sendRequest(messages);
-  const hasImages = messages.some(
-    (m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url')
-  );
+  const attemptController = new AbortController();
+  let timedOutReason = '';
+  let receivedAnyStreamData = false;
 
-  // If a text-only model rejects multimodal image_url blocks, retry once as text-only
-  if (
-    hasImages &&
-    (!response.ok || !response.body) &&
-    (response.status === 400 || response.status === 404 || response.status === 422)
-  ) {
-    await response.text().catch(() => '');
-    response = await sendRequest(stripImagesFromMessages(messages));
-  }
-
-  if (!response.ok || !response.body) {
-    let errorDetail = `${candidate.gatewayLabel} error (${response.status})`;
-    try {
-      const errBody = (await response.json()) as {
-        error?: { message?: string };
-        message?: string;
-      };
-      if (errBody?.error?.message) {
-        errorDetail = errBody.error.message;
-      } else if (errBody?.message) {
-        errorDetail = errBody.message;
-      }
-    } catch {
-      const text = await response.text().catch(() => '');
-      if (text) errorDetail = text.slice(0, 200);
+  const forwardAbort = () => {
+    if (!attemptController.signal.aborted) {
+      attemptController.abort();
     }
-    throw new GatewayApiError(errorDetail, response.status);
+  };
+  if (signal) {
+    if (signal.aborted) forwardAbort();
+    else signal.addEventListener('abort', forwardAbort, { once: true });
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const resetWatchdog = (ms: number, reason: string) => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      timedOutReason = reason;
+      if (!attemptController.signal.aborted) {
+        attemptController.abort();
+      }
+    }, ms);
+  };
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
+  // Initial connect / first-byte timeout: 12s so hung free models fail over immediately
+  resetWatchdog(12_000, `${candidate.modelName} timed out before responding`);
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() ?? '';
+  try {
+    const sendRequest = async (payloadMessages: OpenRouterChatMessage[]) =>
+      fetch(endpointUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: candidate.upstreamModelId,
+          stream: true,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            ...payloadMessages,
+          ],
+        }),
+        signal: attemptController.signal,
+      });
 
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith(':')) continue;
-      if (!line.startsWith('data:')) continue;
+    let response = await sendRequest(messages);
+    const hasImages = messages.some(
+      (m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url')
+    );
 
-      const data = line.slice(5).trim();
-      if (!data || data === '[DONE]') continue;
+    // If a text-only model rejects multimodal image_url blocks, retry once as text-only
+    if (
+      hasImages &&
+      (!response.ok || !response.body) &&
+      (response.status === 400 || response.status === 404 || response.status === 422)
+    ) {
+      await response.text().catch(() => '');
+      response = await sendRequest(stripImagesFromMessages(messages));
+    }
 
-      let parsed: {
-        error?: { message?: string };
-        choices?: Array<{
-          delta?: {
-            reasoning?: string;
-            reasoning_content?: string;
-            content?: string | Array<{ type?: string; text?: string }>;
-          };
-        }>;
-      };
-
+    if (!response.ok || !response.body) {
+      let errorDetail = `${candidate.gatewayLabel} error (${response.status})`;
       try {
-        parsed = JSON.parse(data);
+        const errBody = (await response.json()) as {
+          error?: { message?: string };
+          message?: string;
+        };
+        if (errBody?.error?.message) {
+          errorDetail = errBody.error.message;
+        } else if (errBody?.message) {
+          errorDetail = errBody.message;
+        }
       } catch {
-        continue;
+        const text = await response.text().catch(() => '');
+        if (text) errorDetail = text.slice(0, 200);
       }
+      throw new GatewayApiError(errorDetail, response.status);
+    }
 
-      if (parsed?.error?.message) {
-        throw new Error(parsed.error.message);
-      }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
 
-      const delta = parsed?.choices?.[0]?.delta;
-      if ((delta?.reasoning || delta?.reasoning_content) && onReasoningChunk) {
-        onReasoningChunk();
-      }
+    resetWatchdog(18_000, `${candidate.modelName} stalled mid-stream`);
 
-      const content = delta?.content;
-      if (typeof content === 'string' && content.length > 0) {
-        onTextChunk(content);
-      } else if (Array.isArray(content)) {
-        for (const part of content) {
-          if (typeof part?.text === 'string' && part.text.length > 0) {
-            onTextChunk(part.text);
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      receivedAnyStreamData = true;
+      resetWatchdog(18_000, `${candidate.modelName} stalled mid-stream`);
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? '';
+
+      for (const rawLine of lines) {
+        const trimmedLine = rawLine.trim();
+        if (!trimmedLine || trimmedLine.startsWith(':')) continue;
+
+        const subFrames = trimmedLine.includes('}data:')
+          ? trimmedLine.split(/(?=data:\s*)/)
+          : [trimmedLine];
+
+        for (const frame of subFrames) {
+          const line = frame.trim();
+          if (!line.startsWith('data:')) continue;
+
+          const data = line.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+
+          let parsed: {
+            error?: { message?: string };
+            choices?: Array<{
+              delta?: {
+                reasoning?: string;
+                reasoning_content?: string;
+                content?: string | Array<{ type?: string; text?: string }>;
+              };
+            }>;
+          };
+
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            continue;
+          }
+
+          if (parsed?.error?.message) {
+            throw new Error(parsed.error.message);
+          }
+
+          const delta = parsed?.choices?.[0]?.delta;
+          if ((delta?.reasoning || delta?.reasoning_content) && onReasoningChunk) {
+            onReasoningChunk();
+          }
+
+          const content = delta?.content;
+          if (typeof content === 'string' && content.length > 0) {
+            onTextChunk(content);
+          } else if (Array.isArray(content)) {
+            for (const part of content) {
+              if (typeof part?.text === 'string' && part.text.length > 0) {
+                onTextChunk(part.text);
+              }
+            }
           }
         }
       }
+    }
+
+    if (buffer.trim().startsWith('data:')) {
+      const tailFrames = buffer.trim().split(/(?=data:\s*)/);
+      for (const frame of tailFrames) {
+        const data = frame.trim().slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(data) as {
+            choices?: Array<{
+              delta?: { content?: string | Array<{ type?: string; text?: string }> };
+            }>;
+          };
+          const content = parsed?.choices?.[0]?.delta?.content;
+          if (typeof content === 'string' && content.length > 0) {
+            onTextChunk(content);
+          }
+        } catch {
+          // ignore partial tail
+        }
+      }
+    }
+
+    if (!receivedAnyStreamData) {
+      throw new Error(`${candidate.modelName} closed without returning data`);
+    }
+  } catch (err) {
+    if (timedOutReason) {
+      throw new GatewayApiError(timedOutReason, 504);
+    }
+    throw err;
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (signal) {
+      signal.removeEventListener('abort', forwardAbort);
     }
   }
 }
@@ -1195,6 +1286,8 @@ function extractSessionTitleFromRaw(raw: string): string {
 function stripTagMarkers(text: string): string {
   return text
     .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*MODE\s*:\s*(?:CHAT|GENERATE)\s*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*MEDIA_PROMPT\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*TITLE\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*LOGO\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
@@ -1343,7 +1436,7 @@ interface CraftJob {
   status: 'running' | 'paused' | 'complete' | 'error';
   startedAt: number;
   updatedAt: number;
-  kind: 'chat' | 'build';
+  kind: 'chat' | 'build' | 'media';
   title?: string;
   phase: 'understanding' | 'building' | 'paused' | 'complete' | 'error';
   phaseLabel: string;
@@ -1362,6 +1455,7 @@ interface CraftJob {
   pausedMessage?: string;
   aiText: string;
   previewHtml: string;
+  media?: GeneratedMediaResult;
   errorMessage?: string;
   subscribers: Set<express.Response>;
 }
@@ -1394,6 +1488,7 @@ function serializeJobSnapshot(job: CraftJob) {
     pausedMessage: job.pausedMessage,
     aiText: job.aiText,
     previewHtml: job.previewHtml,
+    media: job.media,
     errorMessage: job.errorMessage,
   };
 }
@@ -1428,12 +1523,16 @@ async function startServer() {
     if (type === 'title' && typeof payload.title === 'string' && payload.title.trim()) {
       job.title = payload.title.trim();
     } else if (type === 'meta') {
-      if (payload.kind === 'chat' || payload.kind === 'build') job.kind = payload.kind;
+      if (payload.kind === 'chat' || payload.kind === 'build' || payload.kind === 'media') {
+        job.kind = payload.kind;
+      }
       if (typeof payload.modelId === 'string') job.modelId = payload.modelId;
       if (typeof payload.modelName === 'string') job.modelName = payload.modelName;
       if (typeof payload.provider === 'string') job.provider = payload.provider;
     } else if (type === 'phase') {
-      if (payload.kind === 'chat' || payload.kind === 'build') job.kind = payload.kind;
+      if (payload.kind === 'chat' || payload.kind === 'build' || payload.kind === 'media') {
+        job.kind = payload.kind;
+      }
       if (payload.phase === 'understanding' || payload.phase === 'building') {
         job.phase = payload.phase;
       }
@@ -1446,6 +1545,9 @@ async function startServer() {
       if (Array.isArray(payload.tables)) {
         job.dbTables = payload.tables as ParsedDbTable[];
       }
+    } else if (type === 'media' && payload.media) {
+      job.kind = 'media';
+      job.media = payload.media as GeneratedMediaResult;
     } else if (type === 'file') {
       job.kind = 'build';
       if (job.phase === 'understanding') job.phase = 'building';
@@ -1470,13 +1572,17 @@ async function startServer() {
       job.activeFile = '';
       job.activeAction = 'Thinking';
       job.bytesBuilt = 0;
+      job.media = undefined;
     } else if (type === 'delta' && typeof payload.text === 'string') {
       job.aiText += payload.text;
     } else if (type === 'paused') {
       job.status = 'paused';
       job.phase = 'paused';
-      job.kind = 'build';
-      job.phaseLabel = 'Paused · 0 tokens left';
+      job.kind = payload.kind === 'chat' ? 'chat' : 'build';
+      job.phaseLabel =
+        typeof payload.phaseLabel === 'string' && payload.phaseLabel
+          ? payload.phaseLabel
+          : 'Paused · 0 tokens left';
       if (typeof payload.title === 'string' && payload.title.trim()) {
         job.title = payload.title.trim();
       }
@@ -1502,13 +1608,21 @@ async function startServer() {
     } else if (type === 'done') {
       job.status = 'complete';
       job.phase = 'complete';
-      if (payload.kind === 'chat' || payload.kind === 'build') job.kind = payload.kind;
+      if (payload.kind === 'chat' || payload.kind === 'build' || payload.kind === 'media') {
+        job.kind = payload.kind;
+      }
       if (typeof payload.title === 'string' && payload.title.trim()) {
         job.title = payload.title.trim();
       }
-      job.phaseLabel = job.kind === 'chat' ? 'Answered' : 'Build complete';
+      job.phaseLabel =
+        job.kind === 'media'
+          ? 'Media ready'
+          : job.kind === 'chat'
+            ? 'Answered'
+            : 'Build complete';
       if (typeof payload.fullText === 'string') job.aiText = payload.fullText;
       if (typeof payload.previewHtml === 'string') job.previewHtml = payload.previewHtml;
+      if (payload.media) job.media = payload.media as GeneratedMediaResult;
       if (Array.isArray(payload.allFiles)) {
         job.files = payload.allFiles.filter((f): f is string => typeof f === 'string');
       }
@@ -1555,6 +1669,7 @@ async function startServer() {
       openRouterConfigured: Boolean(getOpenRouterApiKey()),
       huggingFaceConfigured: Boolean(getHuggingFaceApiKey()),
       ngrokConfigured: Boolean(getNgrokApiKey()),
+      pollinationsConfigured: true,
       geminiConfigured: Boolean(getGeminiApiKey()),
       gatewayOrder: getGatewayOrder(),
       supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
@@ -2803,6 +2918,7 @@ async function startServer() {
       cachedModels = result.models.filter((m) => m.gateway === 'openrouter');
       cachedHfModels = result.models.filter((m) => m.gateway === 'huggingface');
       cachedNgrokModels = result.models.filter((m) => m.gateway === 'ngrok');
+      cachedPollinationsModels = result.models.filter((m) => m.gateway === 'pollinations');
       modelsCachedAt = Date.now();
       modelsCachedKey = getOpenRouterApiKey();
 
@@ -2812,6 +2928,7 @@ async function startServer() {
         openRouterConfigured: result.openRouterConfigured,
         huggingFaceConfigured: result.huggingFaceConfigured,
         ngrokConfigured: result.ngrokConfigured,
+        pollinationsConfigured: result.pollinationsConfigured,
         geminiConfigured: result.geminiConfigured,
         freeOnly: !result.huggingFaceConfigured && !result.ngrokConfigured,
         keyStatus: result.keyStatus,
@@ -2840,6 +2957,7 @@ async function startServer() {
         openRouterConfigured: Boolean(getOpenRouterApiKey()),
         huggingFaceConfigured: Boolean(getHuggingFaceApiKey()),
         ngrokConfigured: Boolean(getNgrokApiKey()),
+        pollinationsConfigured: true,
         geminiConfigured: Boolean(getGeminiApiKey()),
         freeOnly: true,
         error: fallbackModels.length > 0 ? undefined : message,
@@ -2855,7 +2973,12 @@ async function startServer() {
         prompt?: string;
         model?: string;
       };
-      const kind = body?.kind === 'music' ? 'music' : 'image';
+      const kind =
+        body?.kind === 'video'
+          ? 'video'
+          : body?.kind === 'music'
+            ? 'music'
+            : 'image';
       const prompt = typeof body?.prompt === 'string' ? body.prompt.trim() : '';
       const requestedModel =
         typeof body?.model === 'string' ? body.model.trim() : undefined;
@@ -3076,25 +3199,6 @@ async function startServer() {
     const ngrokKey = getNgrokApiKey();
     const geminiClient = createGeminiClient();
 
-    if (!openRouterKey && !huggingFaceKey && !ngrokKey && !geminiClient) {
-      clearInterval(keepAlive);
-      sendEvent({
-        type: 'error',
-        message:
-          'No AI API key configured in Settings > Secrets. Add OPENROUTER_API_KEY, HUGGING_FACE_API_KEY, NGROK_API_KEY, or GEMINI_API_KEY.',
-      });
-      return;
-    }
-
-    const initialRoute: InitialRoute = options.forceChat
-      ? 'chat'
-      : classifyInitialRoute(
-          message,
-          previousHtml,
-          options.attachmentName,
-          Boolean(attachmentDataUrl || attachmentText)
-        );
-
     try {
       const now = new Date();
       const timeContext = [
@@ -3113,8 +3217,65 @@ async function startServer() {
         label: 'Thinking...',
       });
 
+      await Promise.all([
+        openRouterKey && (cachedModels.length === 0 || modelsCachedKey !== openRouterKey)
+          ? fetchOpenRouterModels(true).catch(() => [])
+          : Promise.resolve(cachedModels),
+        huggingFaceKey && cachedHfModels.length === 0
+          ? fetchHuggingFaceCatalog(huggingFaceKey)
+              .then((list) => {
+                cachedHfModels = list;
+                return list;
+              })
+              .catch(() => [])
+          : Promise.resolve(cachedHfModels),
+        ngrokKey && cachedNgrokModels.length === 0
+          ? fetchNgrokCatalog(ngrokKey)
+              .then((list) => {
+                cachedNgrokModels = list;
+                return list;
+              })
+              .catch(() => [])
+          : Promise.resolve(cachedNgrokModels),
+        cachedPollinationsModels.length === 0
+          ? fetchPollinationsCatalog()
+              .then((list) => {
+                cachedPollinationsModels = list;
+                return list;
+              })
+              .catch(() => [...POLLINATIONS_FALLBACK_MODELS])
+          : Promise.resolve(cachedPollinationsModels),
+      ]);
+
+      const executionPlan = buildGatewayExecutionPlan({
+        requestedModel,
+        requestedGateway,
+        openRouterCatalog: cachedModels,
+        huggingFaceCatalog: cachedHfModels,
+        ngrokCatalog: cachedNgrokModels,
+        pollinationsCatalog:
+          cachedPollinationsModels.length > 0
+            ? cachedPollinationsModels
+            : POLLINATIONS_FALLBACK_MODELS,
+      });
+
+      const mediaKind = executionPlan.requestedMediaKind;
+
+      const initialRoute: InitialRoute =
+        mediaKind !== null
+          ? 'chat'
+          : options.forceChat
+            ? 'chat'
+            : classifyInitialRoute(
+                message,
+                previousHtml,
+                options.attachmentName,
+                Boolean(attachmentDataUrl || attachmentText)
+              );
+
       let webSearchContext = '';
       if (
+        mediaKind === null &&
         webSearchEnabled &&
         (initialRoute !== 'chat' ||
           shouldRunChatSearch(message, previousHtml.trim().length > 0))
@@ -3159,7 +3320,7 @@ async function startServer() {
         '- REAL SUPABASE + GOOGLE LOGIN + REAL DATABASE WIRING: When Supabase secrets (`supabase-project-url` and `supabase-anon-key`/`jwt-token`/`supabase-credential`) are configured in Secrets OR requested by the user (e.g. WhatsApp/chat app with Google Login & real DB): load `@supabase/supabase-js@2` via `<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>`, initialize `window.supabase.createClient(sbUrl, sbKey)` using the exact key names found in Secrets (`getSecret` + `findSecret` fallback), wire real `supabaseClient.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } })` + `onAuthStateChange` + real `supabaseClient.from(table).select/insert/update/delete`, AND sync records into `window.AICraft.db` (`list`, `insert`, `update`, `remove`) while emitting `[[DB_SCHEMA: ...]]` lines so BOTH real cloud Postgres AND AI Craft Database explorer reflect real live data.',
         '- BUILT-IN REAL-TIME DATABASE API: For every app with data persistence, persist records via `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, `await window.AICraft.db.remove("table", id)`.',
         '- FULL STANDALONE PWA, CUSTOM BRAND LOGO & BROWSER ACCESS: Every app you build gets its own standalone hosted browser link (`/app/...`), its own Web App Manifest, its own scoped Service Worker, and its own generated PNG/SVG Home Screen icons — it NEVER inherits AI Craft\'s logo! Inside generated apps, you have FULL browser & PWA access via `window.AICraft.pwa` (`isStandalone()`, `isIOS()`, `canInstall()`, `promptInstall()`, `onInstallReady(cb)`, `logoUrl`, `themeColor`) and `window.AICraft.browser` (`setThemeColor(hex)`, `setTitle(str)`, `share(data)`, `copy(text)`, `vibrate(ms)`, `requestFullscreen()`, `getGeolocation()`, `notify(title, opts)`), plus standard Web APIs (`navigator.mediaDevices`, `localStorage`, `fetch`, Canvas, Audio, etc.).',
-        '- REAL FREE-TIER IMAGE & MUSIC GENERATION (NO TTS): When building apps that generate images or music, call `await window.AICraft.generateImage(prompt)` or `await window.AICraft.generateMusic(prompt)` (each returns `{ dataUrl, mimeType, modelId, gateway }`), routed automatically across configured free/low-cost gateways with automatic failover.',
+        '- REAL FREE-TIER IMAGE, MUSIC & VIDEO GENERATION (NO TTS): When building apps that generate media, call `await window.AICraft.generateImage(prompt)`, `await window.AICraft.generateMusic(prompt)`, or `await window.AICraft.generateVideo(prompt)` (each returns `{ dataUrl, mimeType, modelId, gateway }`), routed automatically across configured gateways & free public engines with automatic failover.',
       ].join('\n');
 
       const previewSummary = extractPreviewStructureSummary(previousHtml);
@@ -3209,7 +3370,32 @@ async function startServer() {
 
       let systemInstruction = '';
 
-      if (initialRoute === 'chat') {
+      if (mediaKind !== null) {
+        const mediaLabel =
+          mediaKind === 'video'
+            ? 'Video Generator'
+            : mediaKind === 'music'
+              ? 'Music Generator'
+              : 'Image Generator';
+        const selectedLabel = executionPlan.requestedModelLabel || requestedModel || mediaLabel;
+
+        systemInstruction = [
+          `You are AI Craft acting specifically in ${mediaLabel} mode (selected model: "${selectedLabel}").`,
+          `Real-time clock context: ${timeContext}.`,
+          shouldGenerateTitle
+            ? 'First output `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline.'
+            : '',
+          'YOUR ROLE & CAPABILITY RULES (STRICT):',
+          `- Right now the user has selected a dedicated ${mediaLabel}. You CANNOT build apps, websites, HTML, or code in this mode — app building belongs to **Code & Build** mode.`,
+          "- Decide dynamically and naturally from the user's message:",
+          '  (1) CHAT / APP-BUILD REQUEST / QUESTION: If the user asks to build an app or website (for example "build an app like TikTok"), greets you, or asks a general question:',
+          `      Start with exactly \`[[MODE:CHAT]]\` followed by a newline, then reply naturally in your own words (warm, concise, never robotic). Naturally explain that you are currently in ${mediaLabel} mode (${selectedLabel}) so you can't build apps right now, suggest switching the model selector to **Code & Build** to build an app, OR invite them to describe the ${mediaKind === 'music' ? 'music track' : mediaKind} they'd like you to generate!`,
+          `  (2) CREATE / GENERATE ${mediaKind.toUpperCase()}: If the user asks you to generate, create, make, draw, compose, or render a/an ${mediaKind} (or directly describes a visual scene, song, beat, or video clip):`,
+          `      Start with exactly \`[[MODE:GENERATE]]\` followed by a newline, write ONE short, natural sentence confirming what ${mediaKind} you are creating right now, and finish with \`[[MEDIA_PROMPT: <clean, descriptive prompt tailored for ${selectedLabel}>]]\`. Never output HTML, code blocks, or web links.`,
+        ]
+          .filter(Boolean)
+          .join('\n');
+      } else if (initialRoute === 'chat') {
         systemInstruction = [
           'You are AI Craft, a helpful, natural, real-time AI assistant with live browser search access.',
           `Real-time clock context: ${timeContext}.`,
@@ -3642,39 +3828,9 @@ async function startServer() {
       let lastError: Error | null = null;
       let usedCandidate: GatewayExecutionCandidate | null = null;
 
-      await Promise.all([
-        openRouterKey && (cachedModels.length === 0 || modelsCachedKey !== openRouterKey)
-          ? fetchOpenRouterModels(true).catch(() => [])
-          : Promise.resolve(cachedModels),
-        huggingFaceKey && cachedHfModels.length === 0
-          ? fetchHuggingFaceCatalog(huggingFaceKey)
-              .then((list) => {
-                cachedHfModels = list;
-                return list;
-              })
-              .catch(() => [])
-          : Promise.resolve(cachedHfModels),
-        ngrokKey && cachedNgrokModels.length === 0
-          ? fetchNgrokCatalog(ngrokKey)
-              .then((list) => {
-                cachedNgrokModels = list;
-                return list;
-              })
-              .catch(() => [])
-          : Promise.resolve(cachedNgrokModels),
-      ]);
-
-      const executionPlan = buildGatewayExecutionPlan({
-        requestedModel,
-        requestedGateway,
-        openRouterCatalog: cachedModels,
-        huggingFaceCatalog: cachedHfModels,
-        ngrokCatalog: cachedNgrokModels,
-      });
-
       const failedAuthGateways = new Set<AiGatewayId>();
 
-      // 1. Multi-Gateway Routing: OpenRouter (:free) -> Hugging Face Router -> ngrok AI Gateway
+      // 1. Multi-Gateway Routing: OpenRouter (:free) -> Hugging Face Router -> ngrok -> Pollinations public
       if (
         !executionPlan.preferGeminiDirectly &&
         executionPlan.openaiCandidates.length > 0
@@ -3689,17 +3845,19 @@ async function startServer() {
               resetStreamParser();
             }
 
-            sendEvent({
-              type: 'meta',
-              kind: 'chat',
-              modelId: candidate.publicModelId,
-              modelName: candidate.modelName,
-              provider: candidate.provider,
-              gateway: candidate.gateway,
-              isFallback: i > 0,
-            });
+            if (mediaKind === null) {
+              sendEvent({
+                type: 'meta',
+                kind: 'chat',
+                modelId: candidate.publicModelId,
+                modelName: candidate.modelName,
+                provider: candidate.provider,
+                gateway: candidate.gateway,
+                isFallback: i > 0,
+              });
+            }
 
-            if (i > 0) {
+            if (i > 0 && mediaKind === null) {
               sendEvent({
                 type: 'phase',
                 phase: 'understanding',
@@ -3741,7 +3899,7 @@ async function startServer() {
               );
             }
 
-            if (resolvedKind === 'build') {
+            if (resolvedKind === 'build' && mediaKind === null) {
               const extractedHtml = extractPreviewHtmlFromRaw(fullRaw);
               if (
                 !extractedHtml ||
@@ -3794,7 +3952,11 @@ async function startServer() {
 
             if (
               err instanceof GatewayApiError &&
-              (err.status === 429 || err.status === 402 || err.status === 503 || err.status === 502)
+              (err.status === 429 ||
+                err.status === 402 ||
+                err.status === 503 ||
+                err.status === 502 ||
+                err.status === 504)
             ) {
               markGatewayCandidateCooldown(candidate.cooldownKey, 75_000);
             }
@@ -3817,17 +3979,19 @@ async function startServer() {
             resetStreamParser();
           }
 
-          sendEvent({
-            type: 'meta',
-            kind: 'chat',
-            modelId: 'google/gemini-4-hydrogen',
-            modelName: 'Gemini 4 Hydrogen',
-            provider: 'google',
-            gateway: 'gemini',
-            isFallback:
-              executionPlan.hasAnyOpenAiGatewayKey &&
-              !executionPlan.preferGeminiDirectly,
-          });
+          if (mediaKind === null) {
+            sendEvent({
+              type: 'meta',
+              kind: 'chat',
+              modelId: 'google/gemini-4-hydrogen',
+              modelName: 'Gemini 4 Hydrogen',
+              provider: 'google',
+              gateway: 'gemini',
+              isFallback:
+                executionPlan.hasAnyOpenAiGatewayKey &&
+                !executionPlan.preferGeminiDirectly,
+            });
+          }
 
           const conversationContext = history
             .slice(-6)
@@ -4046,6 +4210,102 @@ async function startServer() {
 
       if (!succeeded) {
         throw lastError ?? new Error('Unable to reach AI Craft engine right now.');
+      }
+
+      // Dynamic role-aware Image / Music / Video generation (NO web link, NO HTML preview)
+      if (mediaKind !== null) {
+        const isGenerateMode =
+          /\[\[\s*MODE\s*:\s*GENERATE\s*\]\]/i.test(fullRaw) ||
+          /\[\[\s*MEDIA_PROMPT\s*:/i.test(fullRaw);
+        const mediaPromptMatch = /\[\[\s*MEDIA_PROMPT\s*:\s*([^\]]+?)\s*\]\]/i.exec(
+          fullRaw
+        );
+        const finalTitle =
+          emittedTitle ||
+          (shouldGenerateTitle
+            ? deriveServerSessionTitle(message, mode, '')
+            : undefined);
+        if (finalTitle && finalTitle !== emittedTitle) {
+          emittedTitle = finalTitle;
+          sendEvent({ type: 'title', title: finalTitle });
+        }
+
+        const cleanReplyText = stripTagMarkers(fullRaw).trim();
+
+        if (isGenerateMode) {
+          const generationPrompt = (mediaPromptMatch?.[1] || message).trim();
+          sendEvent({
+            type: 'phase',
+            phase: 'building',
+            kind: 'media',
+            label:
+              mediaKind === 'video'
+                ? 'Generating video...'
+                : mediaKind === 'music'
+                  ? 'Composing music...'
+                  : 'Generating image...',
+          });
+
+          const mediaResult: GeneratedMediaResult = await generateMediaAsset({
+            kind: mediaKind,
+            prompt: generationPrompt,
+            requestedModel,
+          });
+
+          sendEvent({
+            type: 'media',
+            media: mediaResult,
+          });
+
+          sendEvent({
+            type: 'done',
+            kind: 'media',
+            title: finalTitle,
+            fullText:
+              cleanReplyText ||
+              `Generated your ${mediaKind}: "${generationPrompt.slice(0, 120)}"`,
+            previewHtml: '',
+            allFiles: [],
+            suggestions: [],
+            dbTables: [],
+            bytesBuilt: 0,
+            creditsUsed: 0,
+            billing: initialBillingSummary,
+            media: mediaResult,
+            modelUsed: requestedModel || mediaResult.modelId,
+            modelName: executionPlan.requestedModelLabel || mediaResult.modelId,
+            provider: mediaResult.gateway,
+            startedAt: job.startedAt,
+          });
+          return;
+        }
+
+        const finalInfo = usedCandidate
+          ? {
+              id: usedCandidate.publicModelId,
+              name: usedCandidate.modelName,
+              provider: usedCandidate.provider,
+            }
+          : resolveModelInfo(modelUsed);
+
+        sendEvent({
+          type: 'done',
+          kind: 'chat',
+          title: finalTitle,
+          fullText: cleanReplyText,
+          previewHtml: '',
+          allFiles: [],
+          suggestions: [],
+          dbTables: [],
+          bytesBuilt: 0,
+          creditsUsed: 0,
+          billing: initialBillingSummary,
+          modelUsed: requestedModel || finalInfo.id,
+          modelName: executionPlan.requestedModelLabel || finalInfo.name,
+          provider: finalInfo.provider,
+          startedAt: job.startedAt,
+        });
+        return;
       }
 
       let finalProse = '';

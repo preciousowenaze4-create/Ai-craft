@@ -16,6 +16,7 @@ export async function GET(request: Request): Promise<Response> {
         openRouterConfigured: result.openRouterConfigured,
         huggingFaceConfigured: result.huggingFaceConfigured,
         ngrokConfigured: result.ngrokConfigured,
+        pollinationsConfigured: result.pollinationsConfigured,
         geminiConfigured: result.geminiConfigured,
         freeOnly: !result.huggingFaceConfigured && !result.ngrokConfigured,
         keyStatus: result.keyStatus,

@@ -1,6 +1,6 @@
 export const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
-export type FreeModelCategory = 'router' | 'code' | 'image' | 'music' | 'chat';
+export type FreeModelCategory = 'router' | 'code' | 'image' | 'music' | 'video' | 'chat';
 
 export interface NormalizedOpenRouterModel {
   id: string;

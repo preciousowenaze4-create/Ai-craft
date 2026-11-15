@@ -35,6 +35,7 @@ import {
   BuildMode,
   BuilderTurn,
   ComposerOptions,
+  GeneratedMediaPayload,
   MODE_THEMES,
   NavTab,
   OpenRouterModel,
@@ -1223,17 +1224,17 @@ export default function App() {
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
-          const events = buffer.split('\n\n');
+          const events = buffer.split(/\r?\n\r?\n/);
           buffer = events.pop() ?? '';
 
           for (const rawEvent of events) {
             const line = rawEvent
-              .split('\n')
-              .find((l) => l.startsWith('data: '));
+              .split(/\r?\n/)
+              .find((l) => l.trim().startsWith('data:'));
             if (!line) continue;
 
             try {
-              const evt = JSON.parse(line.slice(6)) as {
+              const evt = JSON.parse(line.trim().slice(5).trim()) as {
                 type: string;
                 jobId?: string;
                 startedAt?: number;
@@ -1266,6 +1267,7 @@ export default function App() {
                 aiText?: string;
                 fullText?: string;
                 previewHtml?: string;
+                media?: GeneratedMediaPayload;
                 message?: string;
                 errorMessage?: string;
                 reason?: BuilderTurn['pausedReason'];
@@ -1327,6 +1329,7 @@ export default function App() {
                       : t.thoughtSeconds,
                   aiText: typeof evt.aiText === 'string' ? evt.aiText : t.aiText,
                   previewHtml: evt.previewHtml || t.previewHtml,
+                  media: evt.media ?? t.media,
                   files: Array.isArray(evt.files) ? evt.files : t.files,
                   planSteps: Array.isArray(evt.planSteps) ? evt.planSteps : t.planSteps,
                   suggestions: Array.isArray(evt.suggestions)
@@ -1470,6 +1473,15 @@ export default function App() {
                   activeAction: 'Thinking',
                   bytesBuilt: 0,
                 }));
+              } else if (evt.type === 'media' && evt.media) {
+                flushBuffered();
+                currentTurnKind = 'media';
+                const incomingMedia = evt.media;
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  kind: 'media',
+                  media: incomingMedia,
+                }));
               } else if (evt.type === 'delta' && evt.text) {
                 pendingDelta += evt.text;
                 scheduleBufferedFlush();
@@ -1477,7 +1489,8 @@ export default function App() {
                 sawTerminalEvent = true;
                 stopCreditTicker();
                 flushBuffered();
-                const finalKind = evt.kind ?? currentTurnKind;
+                const finalKind: TurnKind =
+                  evt.kind ?? (evt.media ? 'media' : currentTurnKind);
                 if (evt.title) {
                   updateProjectTitle(projectId, evt.title);
                 }
@@ -1492,24 +1505,34 @@ export default function App() {
                   const resolvedFiles = evt.allFiles ?? t.files;
                   return {
                     ...t,
-                    kind: evt.kind ?? t.kind,
+                    kind: finalKind,
                     phase: 'complete',
                     phaseLabel:
-                      (evt.kind ?? t.kind) === 'chat'
-                        ? 'Answered'
-                        : 'Build complete',
+                      finalKind === 'media'
+                        ? 'Media ready'
+                        : finalKind === 'chat'
+                          ? 'Answered'
+                          : 'Build complete',
                     thoughtSeconds: finalSeconds,
                     aiText:
                       typeof evt.fullText === 'string' && evt.fullText.trim()
                         ? evt.fullText
                         : t.aiText,
-                    previewHtml: evt.previewHtml || t.previewHtml,
+                    previewHtml:
+                      finalKind === 'media'
+                        ? ''
+                        : evt.previewHtml || t.previewHtml,
+                    media: evt.media ?? t.media,
                     files: resolvedFiles,
                     suggestions: Array.isArray(evt.suggestions)
                       ? evt.suggestions
                       : t.suggestions,
                     activeAction:
-                      resolvedFiles.length > 0 ? 'Built' : t.activeAction,
+                      finalKind === 'media'
+                        ? 'Created'
+                        : resolvedFiles.length > 0
+                          ? 'Built'
+                          : t.activeAction,
                     activeFile: resolvedFiles[0] ?? t.activeFile,
                     bytesBuilt:
                       typeof evt.bytesBuilt === 'number'
@@ -1525,12 +1548,14 @@ export default function App() {
                   };
                 });
                 const builtHtmlForLink =
-                  evt.previewHtml ||
-                  projectsRef.current
-                    .find((p) => p.id === projectId)
-                    ?.turns.find((t) => t.id === turnId)?.previewHtml ||
-                  '';
-                if (builtHtmlForLink) {
+                  finalKind === 'media'
+                    ? ''
+                    : evt.previewHtml ||
+                      projectsRef.current
+                        .find((p) => p.id === projectId)
+                        ?.turns.find((t) => t.id === turnId)?.previewHtml ||
+                      '';
+                if (builtHtmlForLink && finalKind !== 'media') {
                   void publishProjectLive(projectId, builtHtmlForLink, {
                     title: evt.title,
                     logo: evt.logo,
@@ -1562,7 +1587,7 @@ export default function App() {
                     Boolean(evt.previewHtml) ||
                     (Array.isArray(evt.allFiles) && evt.allFiles.length > 0);
                   const expectedFinalCost =
-                    finalKind === 'chat' || !hasBuiltCode
+                    finalKind === 'chat' || finalKind === 'media' || !hasBuiltCode
                       ? 0
                       : Math.min(
                           CLIENT_MAX_CREDITS_PER_BUILD,
@@ -1595,9 +1620,11 @@ export default function App() {
                     );
                     new Notification(matchedProj?.title || 'AI Craft', {
                       body:
-                        (evt.kind ?? 'chat') === 'build'
+                        finalKind === 'build'
                           ? 'Your app build is finished and ready to preview.'
-                          : 'AI Craft finished replying to your message.',
+                          : finalKind === 'media'
+                            ? 'Your generated media is ready.'
+                            : 'AI Craft finished replying to your message.',
                     });
                   } catch {
                     // ignore notification error in unsupported contexts
@@ -1681,7 +1708,7 @@ export default function App() {
                 }
                 if (evt.billing) {
                   applyBillingSummary(evt.billing);
-                } else {
+                } else if (resolvedReason !== 'STREAM_INTERRUPTED') {
                   if (resolvedReason === 'DAILY_LIMIT_REACHED') {
                     setBilling((prev) => {
                       if (!prev || prev.dailyLimit === null) return prev;
@@ -1721,7 +1748,9 @@ export default function App() {
                   }
                   void syncBillingFromServer();
                 }
-                setInlineNotice(resolvedPauseMessage);
+                if (resolvedReason !== 'STREAM_INTERRUPTED') {
+                  setInlineNotice(resolvedPauseMessage);
+                }
               } else if (evt.type === 'error') {
                 sawTerminalEvent = true;
                 stopCreditTicker();
@@ -1779,6 +1808,7 @@ export default function App() {
       activeConnectionsRef.current.set(turnId, controller);
 
       let knownJobId: string | undefined;
+      let streamStarted = false;
 
       try {
         const clientTimeZone =
@@ -1827,6 +1857,7 @@ export default function App() {
           throw new Error(errorText);
         }
 
+        streamStarted = true;
         const result = await consumeSseStream(
           projectId,
           turnId,
@@ -1841,9 +1872,12 @@ export default function App() {
 
         if (!result.sawTerminalEvent) {
           const reconnectJobId = result.latestJobId || knownJobId;
-          if (reconnectJobId && document.visibilityState === 'visible') {
+          if (
+            document.visibilityState === 'visible' &&
+            (reconnectJobId || !retriedTurnsRef.current.has(turnId))
+          ) {
             void resumeJobStreamRef.current?.(projectId, turnId, reconnectJobId);
-          } else if (!reconnectJobId) {
+          } else {
             updateTurn(projectId, turnId, (t) =>
               t.phase === 'complete' || t.phase === 'paused' || t.phase === 'error'
                 ? t
@@ -1851,7 +1885,7 @@ export default function App() {
                     ...t,
                     phase: 'error',
                     phaseLabel: 'Paused',
-                    errorMessage: 'Stream connection ended early. Send a message to continue.',
+                    errorMessage: 'Stream connection ended early. Tap Continue / Retry below.',
                   }
             );
           }
@@ -1859,13 +1893,14 @@ export default function App() {
       } catch (err) {
         activeConnectionsRef.current.delete(turnId);
         if ((err as Error).name !== 'AbortError') {
-          // If the user left the app on mobile Safari and the socket dropped, reconnect to the backend job instead of failing
-          if (knownJobId) {
-            if (document.visibilityState === 'visible') {
-              window.setTimeout(() => {
-                void resumeJobStreamRef.current?.(projectId, turnId, knownJobId!);
-              }, 600);
-            }
+          if (
+            (knownJobId || streamStarted) &&
+            document.visibilityState === 'visible' &&
+            !retriedTurnsRef.current.has(turnId)
+          ) {
+            window.setTimeout(() => {
+              void resumeJobStreamRef.current?.(projectId, turnId, knownJobId);
+            }, 600);
             return;
           }
 
@@ -1882,7 +1917,7 @@ export default function App() {
         }
       }
     },
-    [applyBillingSummary, consumeSseStream, updateTurn]
+    [applyBillingSummary, consumeSseStream, models, updateTurn]
   );
 
   const resumeJobStream = useCallback(
@@ -1894,42 +1929,59 @@ export default function App() {
       if (!project || !turn) return;
       if (turn.phase === 'complete' || turn.phase === 'paused' || turn.phase === 'error') return;
 
+      const rerunTurnFromSavedProgress = () => {
+        retriedTurnsRef.current.add(turnId);
+        const idx = project.turns.findIndex((t) => t.id === turnId);
+        const priorTurns = idx > 0 ? project.turns.slice(0, idx) : [];
+        const history = priorTurns.flatMap((t) => [
+          { role: 'user', text: t.userMessage },
+          ...(t.aiText ? [{ role: 'model', text: t.aiText }] : []),
+        ]);
+        const hasPartialTurnHtml = Boolean(turn.previewHtml && turn.previewHtml.trim());
+        const previousHtml =
+          turn.previewHtml ||
+          [...priorTurns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ||
+          '';
+        const messageToSend = hasPartialTurnHtml
+          ? `[[CONTINUE_BUILD]] Resume and finish building the app seamlessly from the existing saved preview HTML for: "${turn.userMessage}". Preserve every completed section and finish any incomplete parts cleanly.`
+          : turn.userMessage;
+        const projectSecrets = project.secrets ?? [];
+        void runBuilderStream(
+          project.id,
+          turn.id,
+          messageToSend,
+          project.mode,
+          turn.modelId,
+          history,
+          {
+            reactEnabled: project.mode === 'web',
+            backendEnabled: false,
+            webSearchEnabled: true,
+            attachmentName: turn.attachmentName,
+            attachmentDataUrl: turn.attachmentDataUrl ?? null,
+            secretKeys: projectSecrets.map((s) => s.key),
+            secretHints: buildProjectSecretHints(projectSecrets),
+            databaseTables: (project.databaseConfig?.tables ?? []).map(
+              (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
+            ),
+            clientCreditsRemaining: creditsRef.current,
+          },
+          previousHtml,
+          turn.startedAt ?? Date.now()
+        );
+      };
+
       const targetJobId = jobId || turn.jobId;
       if (!targetJobId) {
         if (!retriedTurnsRef.current.has(turnId)) {
-          retriedTurnsRef.current.add(turnId);
-          const idx = project.turns.findIndex((t) => t.id === turnId);
-          const priorTurns = idx > 0 ? project.turns.slice(0, idx) : [];
-          const history = priorTurns.flatMap((t) => [
-            { role: 'user', text: t.userMessage },
-            ...(t.aiText ? [{ role: 'model', text: t.aiText }] : []),
-          ]);
-          const previousHtml =
-            [...priorTurns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
-          const projectSecrets = project.secrets ?? [];
-          void runBuilderStream(
-            project.id,
-            turn.id,
-            turn.userMessage,
-            project.mode,
-            turn.modelId,
-            history,
-            {
-              reactEnabled: project.mode === 'web',
-              backendEnabled: false,
-              webSearchEnabled: true,
-              attachmentName: turn.attachmentName,
-              attachmentDataUrl: turn.attachmentDataUrl ?? null,
-              secretKeys: projectSecrets.map((s) => s.key),
-              secretHints: buildProjectSecretHints(projectSecrets),
-              databaseTables: (project.databaseConfig?.tables ?? []).map(
-                (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
-              ),
-              clientCreditsRemaining: creditsRef.current,
-            },
-            previousHtml,
-            turn.startedAt ?? Date.now()
-          );
+          rerunTurnFromSavedProgress();
+        } else {
+          updateTurn(projectId, turnId, (t) => ({
+            ...t,
+            phase: 'error',
+            phaseLabel: 'Paused',
+            errorMessage: 'Stream connection ended early. Tap Continue / Retry below.',
+          }));
         }
         return;
       }
@@ -1947,39 +1999,7 @@ export default function App() {
           activeConnectionsRef.current.delete(turnId);
           // Serverless cold start or expired job: automatically re-run once seamlessly
           if (!retriedTurnsRef.current.has(turnId)) {
-            retriedTurnsRef.current.add(turnId);
-            const idx = project.turns.findIndex((t) => t.id === turnId);
-            const priorTurns = idx > 0 ? project.turns.slice(0, idx) : [];
-            const history = priorTurns.flatMap((t) => [
-              { role: 'user', text: t.userMessage },
-              ...(t.aiText ? [{ role: 'model', text: t.aiText }] : []),
-            ]);
-            const previousHtml =
-              [...priorTurns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
-            const projectSecrets = project.secrets ?? [];
-            void runBuilderStream(
-              project.id,
-              turn.id,
-              turn.userMessage,
-              project.mode,
-              turn.modelId,
-              history,
-              {
-                reactEnabled: project.mode === 'web',
-                backendEnabled: false,
-                webSearchEnabled: true,
-                attachmentName: turn.attachmentName,
-                attachmentDataUrl: turn.attachmentDataUrl ?? null,
-                secretKeys: projectSecrets.map((s) => s.key),
-                secretHints: buildProjectSecretHints(projectSecrets),
-                databaseTables: (project.databaseConfig?.tables ?? []).map(
-                  (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
-                ),
-                clientCreditsRemaining: creditsRef.current,
-              },
-              previousHtml,
-              turn.startedAt ?? Date.now()
-            );
+            rerunTurnFromSavedProgress();
             return;
           }
 
@@ -1987,7 +2007,7 @@ export default function App() {
             ...t,
             phase: 'error',
             phaseLabel: 'Paused',
-            errorMessage: 'Build paused while away. Send a message below to continue.',
+            errorMessage: 'Build paused while away. Tap Continue / Retry below.',
           }));
           return;
         }
@@ -2042,6 +2062,7 @@ export default function App() {
                   kind?: TurnKind;
                   aiText?: string;
                   previewHtml?: string;
+                  media?: GeneratedMediaPayload;
                   files?: string[];
                   planSteps?: string[];
                   suggestions?: string[];
@@ -2082,6 +2103,7 @@ export default function App() {
                         ? snap.aiText
                         : t.aiText,
                     previewHtml: snap.previewHtml || t.previewHtml,
+                    media: snap.media ?? t.media,
                     files: Array.isArray(snap.files) ? snap.files : t.files,
                     planSteps: Array.isArray(snap.planSteps)
                       ? snap.planSteps
@@ -2110,12 +2132,16 @@ export default function App() {
                         ? t.pausedAt ?? new Date().toISOString()
                         : t.pausedAt,
                   }));
-                  if (snap.status === 'complete' && snap.previewHtml) {
+                  if (
+                    snap.status === 'complete' &&
+                    snap.kind !== 'media' &&
+                    snap.previewHtml
+                  ) {
                     void publishProjectLive(proj.id, snap.previewHtml, {
                       title: snap.title,
                     });
                   }
-                  if (snap.status === 'paused') {
+                  if (snap.status === 'paused' && snap.pausedReason !== 'STREAM_INTERRUPTED') {
                     void syncBillingFromServer();
                   }
                 }
@@ -2389,18 +2415,21 @@ export default function App() {
         .reverse()
         .find((t) => Boolean(t.previewHtml))?.previewHtml ||
       '';
+    const hasSavedHtmlToResume = Boolean(previousHtml.trim());
 
     const newTurn: BuilderTurn = {
       id: turnId,
       startedAt: now,
-      kind: 'build',
-      userMessage: 'Continue building from saved progress',
-      attachmentName: null,
-      attachmentDataUrl: null,
+      kind: hasSavedHtmlToResume ? 'build' : 'chat',
+      userMessage: hasSavedHtmlToResume
+        ? 'Continue building from saved progress'
+        : pausedTurn.userMessage,
+      attachmentName: pausedTurn.attachmentName ?? null,
+      attachmentDataUrl: pausedTurn.attachmentDataUrl ?? null,
       phase: 'understanding',
-      phaseLabel: 'Resuming build...',
+      phaseLabel: hasSavedHtmlToResume ? 'Resuming build...' : 'Thinking...',
       thoughtSeconds: 1,
-      activeAction: 'Resuming',
+      activeAction: hasSavedHtmlToResume ? 'Resuming' : 'Thinking',
       activeFile: '',
       files: [],
       bytesBuilt: 0,
@@ -2410,18 +2439,20 @@ export default function App() {
       modelProvider: currentModel?.provider ?? pausedTurn.modelProvider,
     };
 
-    const history = activeProject.turns.flatMap((t) => [
-      { role: 'user', text: t.userMessage },
-      ...(t.aiText ? [{ role: 'model', text: t.aiText }] : []),
-    ]);
+    const history = activeProject.turns
+      .filter((t) => t.id !== pausedTurn.id || hasSavedHtmlToResume)
+      .flatMap((t) => [
+        { role: 'user', text: t.userMessage },
+        ...(t.aiText ? [{ role: 'model', text: t.aiText }] : []),
+      ]);
 
     const projectSecrets = activeProject.secrets ?? [];
     const continuationOptions: ComposerOptions = {
       reactEnabled: activeProject.mode === 'web',
       backendEnabled: false,
       webSearchEnabled: true,
-      attachmentName: null,
-      attachmentDataUrl: null,
+      attachmentName: pausedTurn.attachmentName ?? null,
+      attachmentDataUrl: pausedTurn.attachmentDataUrl ?? null,
       secretKeys: projectSecrets.map((s) => s.key),
       secretHints: buildProjectSecretHints(projectSecrets),
       databaseTables: (activeProject.databaseConfig?.tables ?? []).map(
@@ -2430,7 +2461,9 @@ export default function App() {
       clientCreditsRemaining: credits,
     };
 
-    const continuePrompt = `[[CONTINUE_BUILD]] Resume and finish building the app seamlessly from the existing saved preview HTML for: "${pausedTurn.userMessage}". Preserve every completed section, feature, database call, and secret integration already in the saved HTML, and finish any incomplete or missing sections so the complete app is polished and production-ready.`;
+    const continuePrompt = hasSavedHtmlToResume
+      ? `[[CONTINUE_BUILD]] Resume and finish building the app seamlessly from the existing saved preview HTML for: "${pausedTurn.userMessage}". Preserve every completed section, feature, database call, and secret integration already in the saved HTML, and finish any incomplete or missing sections so the complete app is polished and production-ready.`
+      : pausedTurn.userMessage;
 
     setProjects((prev) =>
       prev.map((p) =>

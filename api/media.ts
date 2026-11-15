@@ -8,7 +8,12 @@ export async function POST(request: Request): Promise<Response> {
       model?: string;
     };
 
-    const kind = body?.kind === 'music' ? 'music' : 'image';
+    const kind =
+      body?.kind === 'music'
+        ? 'music'
+        : body?.kind === 'video'
+          ? 'video'
+          : 'image';
     const prompt = typeof body?.prompt === 'string' ? body.prompt.trim() : '';
     const requestedModel =
       typeof body?.model === 'string' ? body.model.trim() : undefined;
