@@ -422,6 +422,19 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
     } catch (e) {}
     return rows;
   }
+  var dbSubscribers = {};
+  function notifyDbSubscribers(table) {
+    var t = cleanTable(table);
+    var list = dbSubscribers[t] || [];
+    var rows = readTable(t);
+    for (var i = 0; i < list.length; i += 1) {
+      try { list[i](rows.slice()); } catch (e) {}
+    }
+  }
+  window.addEventListener('storage', function(ev) {
+    if (!ev.key || ev.key.indexOf(dbPrefix) !== 0) return;
+    notifyDbSubscribers(ev.key.slice(dbPrefix.length));
+  });
   var dbApi = {
     meta: dbMeta,
     list: function(table) { return Promise.resolve(readTable(table)); },
@@ -430,6 +443,7 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
       var item = Object.assign({ id: 'rec_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), created_at: new Date().toISOString() }, row || {});
       rows.unshift(item);
       writeTable(table, rows);
+      notifyDbSubscribers(table);
       return Promise.resolve(item);
     },
     update: function(table, id, patch) {
@@ -439,16 +453,29 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
         return r;
       });
       writeTable(table, rows);
+      notifyDbSubscribers(table);
       return Promise.resolve(updated);
     },
     remove: function(table, id) {
       var rows = readTable(table).filter(function(r) { return !r || r.id !== id; });
       writeTable(table, rows);
+      notifyDbSubscribers(table);
       return Promise.resolve(true);
     },
     clear: function(table) {
       writeTable(table, []);
+      notifyDbSubscribers(table);
       return Promise.resolve(true);
+    },
+    subscribe: function(table, listener) {
+      var t = cleanTable(table);
+      if (typeof listener !== 'function') return function() {};
+      if (!dbSubscribers[t]) dbSubscribers[t] = [];
+      dbSubscribers[t].push(listener);
+      try { listener(readTable(t)); } catch (e) {}
+      return function unsubscribe() {
+        dbSubscribers[t] = (dbSubscribers[t] || []).filter(function(fn) { return fn !== listener; });
+      };
     }
   };
 

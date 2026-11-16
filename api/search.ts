@@ -16,15 +16,20 @@ interface SearchImageItem {
   source: string;
 }
 
-async function fetchWithTimeout(url: string, timeoutMs = 3000): Promise<Response> {
+async function fetchWithTimeout(
+  url: string,
+  timeoutMs = 3000,
+  acceptHeader = 'application/json'
+): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'AICraft-WebSearch/1.0',
-        Accept: 'application/json',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        Accept: acceptHeader,
       },
     });
   } finally {
@@ -57,7 +62,7 @@ export async function runLiveBrowserSearch(query: string): Promise<{
 
   const addImage = (title: string, imageUrl: string | undefined, source: string) => {
     if (!imageUrl || !/^https:\/\//i.test(imageUrl)) return;
-    if (!/\.(?:jpg|jpeg|png|webp)(?:\?|$)/i.test(imageUrl)) return;
+    if (/\.(?:svg|ico|gif)(?:\?|$)/i.test(imageUrl)) return;
     if (seenImages.has(imageUrl)) return;
     seenImages.add(imageUrl);
     images.push({ title: title || cleanQuery, imageUrl, source });
@@ -216,11 +221,39 @@ export async function runLiveBrowserSearch(query: string): Promise<{
     }
   })();
 
-  await Promise.allSettled([ddgTask, wikiTask, commonsTask]);
+  const bingImagesTask = (async () => {
+    try {
+      const bingUrl = `https://www.bing.com/images/search?q=${encodeURIComponent(
+        cleanQuery
+      )}&form=HDRSC2&first=1`;
+      const res = await fetchWithTimeout(
+        bingUrl,
+        3200,
+        'text/html,application/xhtml+xml'
+      );
+      if (!res.ok) return;
+      const html = await res.text();
+      const matches = html.matchAll(/murl&quot;:&quot;(https:\/\/[^&]+?)&quot;/gi);
+      let count = 0;
+      for (const m of matches) {
+        const imgUrl = m[1]
+          ?.replace(/\\u002f/gi, '/')
+          .replace(/\\u003a/gi, ':');
+        if (!imgUrl) continue;
+        addImage(cleanQuery, imgUrl, 'Bing Web Images');
+        count += 1;
+        if (count >= 6) break;
+      }
+    } catch {
+      // ignore timeout or network failure
+    }
+  })();
+
+  await Promise.allSettled([ddgTask, bingImagesTask, wikiTask, commonsTask]);
   return {
     query: cleanQuery,
     results: results.slice(0, 8),
-    images: images.slice(0, 6),
+    images: images.slice(0, 8),
   };
 }
 

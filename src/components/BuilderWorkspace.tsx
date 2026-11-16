@@ -443,6 +443,21 @@ export function BuilderWorkspace({
     } catch (e) {}
     return dbCache[t];
   }
+  var dbSubscribers = {};
+  function notifyDbSubscribers(table) {
+    var t = cleanTable(table);
+    var list = dbSubscribers[t] || [];
+    var rows = readTable(t);
+    for (var i = 0; i < list.length; i += 1) {
+      try { list[i](rows.slice()); } catch (e) {}
+    }
+  }
+  window.addEventListener('storage', function(ev) {
+    if (!ev.key || ev.key.indexOf(dbPrefix) !== 0) return;
+    var t = ev.key.slice(dbPrefix.length);
+    delete dbCache[t];
+    notifyDbSubscribers(t);
+  });
   var pending = {};
   window.addEventListener('message', function(e) {
     var d = e.data;
@@ -494,6 +509,7 @@ export function BuilderWorkspace({
       var item = Object.assign({ id: 'rec_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), created_at: new Date().toISOString() }, row || {});
       rows.unshift(item);
       writeTable(t, rows);
+      notifyDbSubscribers(t);
       return sendDbOp('insert', { table: t, row: item }, item);
     },
     update: function(table, id, patch) {
@@ -504,20 +520,56 @@ export function BuilderWorkspace({
         return r;
       });
       writeTable(t, rows);
+      notifyDbSubscribers(t);
       return sendDbOp('update', { table: t, rowId: id, patch: patch || {} }, updated);
     },
     remove: function(table, id) {
       var t = cleanTable(table);
       var rows = readTable(t).filter(function(r) { return !r || r.id !== id; });
       writeTable(t, rows);
+      notifyDbSubscribers(t);
       return sendDbOp('remove', { table: t, rowId: id }, true);
     },
     clear: function(table) {
       var t = cleanTable(table);
       writeTable(t, []);
+      notifyDbSubscribers(t);
       return sendDbOp('clear', { table: t }, true);
+    },
+    subscribe: function(table, listener) {
+      var t = cleanTable(table);
+      if (typeof listener !== 'function') return function() {};
+      if (!dbSubscribers[t]) dbSubscribers[t] = [];
+      dbSubscribers[t].push(listener);
+      try { listener(readTable(t)); } catch (e) {}
+      return function unsubscribe() {
+        dbSubscribers[t] = (dbSubscribers[t] || []).filter(function(fn) { return fn !== listener; });
+      };
     }
   };
+  var runtimeErrorShown = false;
+  window.addEventListener('error', function(errEvent) {
+    if (runtimeErrorShown) return;
+    setTimeout(function() {
+      if (runtimeErrorShown || !document.body) return;
+      var visibleText = (document.body.innerText || '').trim();
+      if (visibleText.length >= 24) return;
+      runtimeErrorShown = true;
+      var bar = document.createElement('div');
+      bar.style.cssText = 'position:fixed;bottom:16px;left:16px;right:16px;z-index:99999;background:#111827;color:#F9FAFB;border:1px solid rgba(255,255,255,0.16);border-radius:14px;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:system-ui,sans-serif;font-size:13px;box-shadow:0 12px 32px rgba(0,0,0,0.45);';
+      var msg = document.createElement('span');
+      msg.textContent = 'App script hit an error: ' + String((errEvent && errEvent.message) || 'Unknown runtime error').slice(0, 90);
+      var btn = document.createElement('button');
+      btn.textContent = 'Auto-Fix';
+      btn.style.cssText = 'background:#4F46E5;color:#fff;border:0;border-radius:8px;padding:6px 12px;font-weight:600;cursor:pointer;flex-shrink:0;';
+      btn.onclick = function() {
+        window.parent.postMessage({ type: 'aicraft:edit', instruction: 'Fix this runtime error cleanly while preserving all app screens: ' + String((errEvent && errEvent.message) || 'script error') }, '*');
+      };
+      bar.appendChild(msg);
+      bar.appendChild(btn);
+      document.body.appendChild(bar);
+    }, 650);
+  });
   function ask(prompt) {
     return new Promise(function(resolve, reject) {
       var id = 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2);
@@ -1150,7 +1202,7 @@ export function BuilderWorkspace({
   // plus the draggable right-side round blue AI Craft logo button
   if (activeView === 'preview') {
     return (
-      <div className="fixed inset-0 w-full h-full min-h-[100lvh] overflow-hidden">
+      <div className="fixed inset-0 w-full h-dvh max-h-dvh overflow-hidden">
         {hasBuiltApp ? (
           <iframe
             ref={previewIframeRef}
