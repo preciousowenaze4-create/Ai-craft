@@ -564,6 +564,7 @@ export default function App() {
     } catch {
       // ignore storage error
     }
+    void fetch('/api/auth/logout', { method: 'POST' }).catch(() => undefined);
     cloudHydratedUserRef.current = null;
     setShowProUpgrade(false);
     setViewMode('home');
@@ -667,6 +668,7 @@ export default function App() {
       inFlight = true;
       try {
         const res = await fetch('/api/auth/me', {
+          cache: 'no-store',
           headers: getStoredAuthHeaders(),
         });
         const data = (await res.json().catch(() => ({}))) as {
@@ -704,7 +706,7 @@ export default function App() {
 
     const interval = window.setInterval(() => {
       void pollModerationStatus();
-    }, 4000);
+    }, 2500);
     const onFocusOrVisible = () => {
       if (document.visibilityState === 'visible') {
         void pollModerationStatus();
@@ -1511,6 +1513,8 @@ export default function App() {
                   phase: nextPhase,
                   phaseLabel: evt.label!,
                 }));
+              } else if (evt.type === 'title' && evt.title) {
+                updateProjectTitle(projectId, evt.title);
               } else if (evt.type === 'plan' && Array.isArray(evt.allSteps)) {
                 flushBuffered();
                 updateTurn(projectId, turnId, (t) => ({
@@ -2525,6 +2529,13 @@ export default function App() {
       [...activeProject.turns]
         .reverse()
         .find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
+    const isFirstAppBuild = !activeProject.turns.some((t) => Boolean(t.previewHtml));
+    const shouldRefreshTitle =
+      isFirstAppBuild ||
+      !activeProject.title ||
+      /^(?:friendly\s+greet|quick\s+chat|new\s+project|hello|hi)/i.test(
+        activeProject.title.trim()
+      );
 
     const projectSecrets = activeProject.secrets ?? [];
     const enrichedOptions: ComposerOptions = {
@@ -2532,6 +2543,7 @@ export default function App() {
       secretKeys: options.secretKeys ?? projectSecrets.map((s) => s.key),
       secretHints: options.secretHints ?? buildProjectSecretHints(projectSecrets),
       clientCreditsRemaining: options.clientCreditsRemaining ?? credits,
+      needsTitle: options.needsTitle ?? shouldRefreshTitle,
     };
 
     setProjects((prev) =>
@@ -3144,6 +3156,8 @@ export default function App() {
             }}
             onOpenUpgrade={() => setShowProUpgrade(true)}
             autoReadEnabled={autoReadEnabled}
+            isVerified={Boolean(authUser?.verified)}
+            isRestricted={Boolean(authUser?.restricted)}
           />
         </>
       ) : (
@@ -3170,6 +3184,7 @@ export default function App() {
         credits={credits}
         avatarDataUrl={userProfile.avatarDataUrl}
         isOwner={Boolean(authUser?.isOwner)}
+        isVerified={Boolean(authUser?.verified)}
         onScanClick={handleScanClick}
         onCreditsClick={handleCreditsClick}
         onAvatarClick={() => {
@@ -3187,9 +3202,9 @@ export default function App() {
       />
 
       {authUser?.restricted && (
-        <div className="relative z-20 shrink-0 w-full max-w-[460px] mx-auto px-4 mb-1">
+        <div className="relative z-20 shrink-0 w-full max-w-[460px] md:max-w-[680px] lg:max-w-[840px] 2xl:max-w-[1000px] mx-auto px-4 mb-1">
           <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-1.5 text-[11.5px] font-medium text-amber-800 text-center">
-            Account Restricted — Building, generating media, and publishing are paused by the admin.
+            Account Restricted — Messages cannot enter chat and building is paused by the admin.
           </div>
         </div>
       )}
@@ -3204,7 +3219,7 @@ export default function App() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -6 }}
               transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-              className="flex-1 min-h-0 w-full max-w-[460px] mx-auto px-4 sm:px-6 pt-0 pb-1 flex flex-col justify-between items-center overflow-hidden"
+              className="flex-1 min-h-0 w-full max-w-[460px] md:max-w-[680px] lg:max-w-[840px] 2xl:max-w-[1000px] mx-auto px-4 sm:px-6 pt-0 pb-1 flex flex-col justify-between items-center overflow-hidden"
             >
               {/* Hero Artwork + Copy */}
               <HeroStage mode={mode} energyLevel={energyLevel} />
@@ -3234,6 +3249,7 @@ export default function App() {
                   selectedModel={selectedModel}
                   modelsLoading={modelsLoading}
                   modelsError={modelsError}
+                  isRestricted={Boolean(authUser?.restricted)}
                   onSelectModel={setSelectedModel}
                   onRetryModels={() => void loadModels(true)}
                   onSubmit={handlePromptSubmit}
@@ -3249,7 +3265,7 @@ export default function App() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -6 }}
               transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-              className="flex-1 min-h-0 w-full max-w-[460px] mx-auto px-5 py-4 flex flex-col overflow-hidden"
+              className="flex-1 min-h-0 w-full max-w-[460px] md:max-w-[680px] lg:max-w-[840px] 2xl:max-w-[1000px] mx-auto px-5 py-4 flex flex-col overflow-hidden"
             >
               <div className="flex-1 min-h-0 flex flex-col gap-4 overflow-hidden">
                 <div className="flex items-center justify-between gap-3">

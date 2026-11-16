@@ -59,7 +59,6 @@ interface PersistedRegistryFile {
 }
 
 const memoryRegistry = new Map<string, ManagedUserRecord>();
-let cacheLoadedFromDisk = false;
 
 export function normalizeAuthEmail(email: string | null | undefined): string {
   return typeof email === 'string' ? email.trim().toLowerCase() : '';
@@ -95,8 +94,6 @@ function makeRegistryKey(userId?: string | null, email?: string | null): string 
 }
 
 function loadDiskCacheOnce() {
-  if (cacheLoadedFromDisk) return;
-  cacheLoadedFromDisk = true;
   try {
     const filePath = getLocalCachePath();
     if (!fs.existsSync(filePath)) return;
@@ -106,13 +103,18 @@ function loadDiskCacheOnce() {
     if (parsed && parsed.users && typeof parsed.users === 'object') {
       for (const [k, rec] of Object.entries(parsed.users)) {
         if (rec && typeof rec === 'object' && rec.email) {
-          memoryRegistry.set(k, {
-            ...rec,
-            isOwner: isOwnerEmail(rec.email),
-            banned: isOwnerEmail(rec.email) ? false : Boolean(rec.banned),
-            restricted: isOwnerEmail(rec.email) ? false : Boolean(rec.restricted),
-            verified: Boolean(rec.verified || isOwnerEmail(rec.email)),
-          });
+          const existing = memoryRegistry.get(k);
+          const recTime = Date.parse(rec.updatedAt || '') || 0;
+          const memTime = existing ? Date.parse(existing.updatedAt || '') || 0 : -1;
+          if (!existing || recTime >= memTime) {
+            memoryRegistry.set(k, {
+              ...rec,
+              isOwner: isOwnerEmail(rec.email),
+              banned: isOwnerEmail(rec.email) ? false : Boolean(rec.banned),
+              restricted: isOwnerEmail(rec.email) ? false : Boolean(rec.restricted),
+              verified: Boolean(rec.verified || isOwnerEmail(rec.email)),
+            });
+          }
         }
       }
     }
@@ -319,7 +321,13 @@ export async function resolveUserWithModeration(user: SupabaseUser | null | unde
   if (!user) return null;
   const registry = await loadCloudRegistry();
   const key = makeRegistryKey(user.id, user.email);
-  const existing = key ? registry[key] : undefined;
+  const existing =
+    (key ? registry[key] : undefined) ||
+    Object.values(registry).find(
+      (r) =>
+        (user.id && r.id === user.id) ||
+        (user.email && normalizeAuthEmail(r.email) === normalizeAuthEmail(user.email))
+    );
   const existingFlags: UserModerationFlags | undefined = existing
     ? {
         banned: existing.banned,

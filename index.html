@@ -6,6 +6,16 @@
     <title>AI Craft — Build Apps & Websites Instantly</title>
     <meta name="description" content="AI Craft — Build iOS, Android, and Full-Stack Web Apps instantly with no code." />
     <meta name="theme-color" content="#FFFBEB" />
+    <script>
+      (function () {
+        var ua = navigator.userAgent || '';
+        document.documentElement.dataset.platform = /Android/i.test(ua)
+          ? 'android'
+          : /iPhone|iPad|iPod/i.test(ua)
+            ? 'ios'
+            : 'desktop';
+      })();
+    </script>
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />

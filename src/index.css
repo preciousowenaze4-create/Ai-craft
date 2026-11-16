@@ -119,3 +119,22 @@
 .pt-safe {
   padding-top: max(0.75rem, env(safe-area-inset-top));
 }
+
+/* Android WebView / Chrome bottom navigation clearance (never touches iOS) */
+html[data-platform="android"] .pb-safe {
+  padding-bottom: max(1rem, calc(env(safe-area-inset-bottom, 0px) + 0.75rem));
+}
+
+/* Crisp adaptive sizing on large Laptop / PC / Television screens */
+@media (min-width: 1280px) {
+  html[data-platform="desktop"] {
+    font-size: 16.5px;
+  }
+}
+
+@media (min-width: 1920px) {
+  html {
+    font-size: 18px;
+  }
+}
+

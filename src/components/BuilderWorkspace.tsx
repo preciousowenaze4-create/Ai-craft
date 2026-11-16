@@ -4,6 +4,7 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowUpRight,
+  BadgeCheck,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -26,6 +27,7 @@ import {
   Music,
   Paperclip,
   Rocket,
+  ShieldAlert,
   Volume2,
   X,
 } from 'lucide-react';
@@ -58,9 +60,11 @@ import { ProviderLogo } from './ProviderLogo';
 import { VoiceInputButton } from './VoiceInputButton';
 
 function formatBuildStepLabel(filePath: string): string {
-  if (filePath === 'index.html') return 'App layout';
-  if (filePath === 'styles.css') return 'Design & styling';
-  if (filePath === 'app.js') return 'Real-time data & logic';
+  if (filePath === 'index.html') return 'Core app structure';
+  if (filePath === 'styles.css') return 'Design & layout styling';
+  if (filePath === 'app.js') return 'Real-time app logic';
+  if (filePath === 'database/schema.js') return 'Real-time database';
+  if (filePath === 'modules/monetization.js') return 'Monetization & billing';
   if (filePath === 'components/header.html') return 'Header bar';
   if (filePath === 'components/navigation.html') return 'Navigation';
   if (filePath === 'components/canvas.html') return 'Interactive canvas';
@@ -70,12 +74,13 @@ function formatBuildStepLabel(filePath: string): string {
   const slug = filePath
     .replace(/^screens\//, '')
     .replace(/^components\//, '')
-    .replace(/\.html$/i, '')
+    .replace(/^modules\//, '')
+    .replace(/\.(?:html|js)$/i, '')
     .replace(/[-_]+/g, ' ')
     .trim();
   if (!slug) return filePath;
   const titled = slug.charAt(0).toUpperCase() + slug.slice(1);
-  return filePath.startsWith('screens/') ? `${titled} screen` : titled;
+  return filePath.startsWith('screens/') ? `${titled} module` : titled;
 }
 
 function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
@@ -135,6 +140,8 @@ interface BuilderWorkspaceProps {
   modelsError: string | null;
   authHeaders?: Record<string, string>;
   inlineNotice?: string | null;
+  isVerified?: boolean;
+  isRestricted?: boolean;
   onSelectModel: (modelId: string) => void;
   onRetryModels: () => void;
   onSetView: (view: WorkspaceView) => void;
@@ -172,6 +179,8 @@ export function BuilderWorkspace({
   modelsError,
   authHeaders,
   inlineNotice,
+  isVerified = false,
+  isRestricted = false,
   onSelectModel,
   onRetryModels,
   onSetView,
@@ -1103,7 +1112,7 @@ export function BuilderWorkspace({
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
-    if (!file) return;
+    if (!file || isRestricted) return;
     const processed = await readAttachmentFile(file);
     setAttachment(processed);
   };
@@ -1127,7 +1136,7 @@ export function BuilderWorkspace({
   });
 
   const handleSubmit = () => {
-    if (!hasContent || isStreaming) return;
+    if (isRestricted || !hasContent || isStreaming) return;
     stopVoice();
     const text =
       followUp.trim() ||
@@ -1148,6 +1157,10 @@ export function BuilderWorkspace({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (isRestricted) {
+      e.preventDefault();
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSubmit();
@@ -1239,7 +1252,7 @@ export function BuilderWorkspace({
     return (
       <div className="relative h-dvh w-full flex flex-col bg-white overflow-hidden">
         <header className="shrink-0 w-full bg-white border-b border-black/[0.06] pt-safe">
-          <div className="w-full max-w-[680px] mx-auto px-3 py-2 flex items-center justify-between gap-2">
+          <div className="w-full max-w-[680px] lg:max-w-[880px] 2xl:max-w-[1060px] mx-auto px-3 py-2 flex items-center justify-between gap-2">
             <div className="flex items-center gap-1.5 min-w-0">
               <button
                 type="button"
@@ -1284,7 +1297,7 @@ export function BuilderWorkspace({
           </div>
 
           {codeParts.length > 1 && (
-            <div className="w-full max-w-[680px] mx-auto px-3 pb-2 flex items-center gap-1.5 overflow-x-auto">
+            <div className="w-full max-w-[680px] lg:max-w-[880px] 2xl:max-w-[1060px] mx-auto px-3 pb-2 flex items-center gap-1.5 overflow-x-auto">
               {codeParts.map((part) => {
                 const isSelected = selectedCodePart.id === part.id;
                 return (
@@ -1307,7 +1320,7 @@ export function BuilderWorkspace({
         </header>
 
         <div className="flex-1 min-h-0 overflow-auto bg-[#0F1117] text-[#E4E4E7] p-4">
-          <pre className="w-full max-w-[680px] mx-auto text-[12.5px] leading-relaxed font-mono whitespace-pre-wrap break-words">
+          <pre className="w-full max-w-[680px] lg:max-w-[880px] 2xl:max-w-[1060px] mx-auto text-[12.5px] leading-relaxed font-mono whitespace-pre-wrap break-words">
             <code>{selectedCodePart?.content || 'No generated code yet.'}</code>
           </pre>
         </div>
@@ -1319,7 +1332,7 @@ export function BuilderWorkspace({
     <div className="relative h-dvh w-full flex flex-col justify-between bg-white overflow-hidden">
       {/* Top Workspace Header Bar */}
       <header className="shrink-0 w-full bg-white border-b border-black/[0.06] pt-safe">
-        <div className="w-full max-w-[540px] mx-auto px-3 py-2 flex items-center justify-between gap-2">
+        <div className="w-full max-w-[540px] md:max-w-[720px] lg:max-w-[880px] 2xl:max-w-[1060px] mx-auto px-3 py-2 flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5 min-w-0">
             <button
               type="button"
@@ -1335,6 +1348,13 @@ export function BuilderWorkspace({
             <h1 className="font-display font-bold text-[17px] tracking-[-0.02em] text-[#0B0B0F] truncate">
               {projectTitle}
             </h1>
+
+            {isVerified && (
+              <BadgeCheck
+                aria-label="Verified creator"
+                className="w-4 h-4 text-[#0D5BFF] shrink-0"
+              />
+            )}
           </div>
 
           <div className="flex items-center gap-1.5 shrink-0">
@@ -1365,7 +1385,7 @@ export function BuilderWorkspace({
 
         {/* Inline non-overlapping action strip when menu toggled */}
         {showHeaderActions && (
-          <div className="w-full max-w-[540px] mx-auto px-4 pb-2.5 flex items-center justify-between gap-2 border-t border-black/[0.04] pt-2 text-xs">
+          <div className="w-full max-w-[540px] md:max-w-[720px] lg:max-w-[880px] 2xl:max-w-[1060px] mx-auto px-4 pb-2.5 flex items-center justify-between gap-2 border-t border-black/[0.04] pt-2 text-xs">
             <span className="text-[#52525B] font-medium">
               Target: {theme.label}
             </span>
@@ -1402,7 +1422,7 @@ export function BuilderWorkspace({
           onScroll={handleScroll}
           className="h-full w-full overflow-y-auto px-5 py-4"
         >
-          <div className="w-full max-w-[500px] mx-auto flex flex-col gap-6 pb-4">
+          <div className="w-full max-w-[500px] md:max-w-[680px] lg:max-w-[840px] 2xl:max-w-[1000px] mx-auto flex flex-col gap-6 pb-4">
             {turns.map((turn) => {
               const isExpanded = !collapsedTurnIds[turn.id];
               const isMediaTurn = turn.kind === 'media' || Boolean(turn.media);
@@ -1510,16 +1530,16 @@ export function BuilderWorkspace({
                     </span>
                   </div>
 
-                  {/* Calm Step-by-Step Architectural & Monetization Plan */}
+                  {/* Calm Replit-Style Step-by-Step Thinking & Blue-Checkmark Plan */}
                   {turn.planSteps && turn.planSteps.length > 0 && (
                     <div className="rounded-2xl border border-black/[0.07] bg-[#FAFAFC] px-3.5 py-2.5 flex flex-col gap-2">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[12px] font-semibold uppercase tracking-[0.04em] text-[#52525B]">
                           Architecture & Monetization Plan
                         </span>
-                        <span className="text-[11.5px] font-medium text-[#71717A] tabular-nums">
+                        <span className="text-[11.5px] font-medium text-[#0D5BFF] tabular-nums">
                           {turn.phase === 'understanding'
-                            ? `Step ${turn.planSteps.length}`
+                            ? `Thinking · Step ${turn.planSteps.length}`
                             : `${turn.planSteps.length} steps`}
                         </span>
                       </div>
@@ -1534,12 +1554,9 @@ export function BuilderWorkspace({
                               className="flex items-start gap-2"
                             >
                               {isActivePlanStep ? (
-                                <Loader2
-                                  className="w-3.5 h-3.5 mt-0.5 animate-spin shrink-0"
-                                  style={{ color: theme.accentColor }}
-                                />
+                                <Loader2 className="w-3.5 h-3.5 mt-0.5 animate-spin text-[#0D5BFF] shrink-0" />
                               ) : (
-                                <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 text-emerald-600 shrink-0" />
+                                <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 text-[#0D5BFF] shrink-0" />
                               )}
                               <span
                                 className={
@@ -1548,7 +1565,7 @@ export function BuilderWorkspace({
                                     : 'text-[#3F3F46]'
                                 }
                               >
-                                {step}
+                                {isActivePlanStep ? `Thinking · ${step}` : step}
                               </span>
                             </li>
                           );
@@ -1557,7 +1574,7 @@ export function BuilderWorkspace({
                     </div>
                   )}
 
-                  {/* Real-Time Build Checklist & Progress Bar (Shown once building starts) */}
+                  {/* Real-Time Replit-Style Module Checklist (Thinking -> Blue Checkmark -> Next Module) */}
                   {isBuildTurn &&
                     (turn.phase === 'building' ||
                       turn.phase === 'paused' ||
@@ -1582,21 +1599,18 @@ export function BuilderWorkspace({
                         <div className="flex items-center justify-between gap-2">
                           <div className="flex items-center gap-2 min-w-0 flex-1">
                             {isTurnWorking ? (
-                              <Loader2
-                                className="w-4 h-4 animate-spin shrink-0"
-                                style={{ color: theme.accentColor }}
-                              />
+                              <Loader2 className="w-4 h-4 animate-spin text-[#0D5BFF] shrink-0" />
                             ) : isPausedTurn ? (
                               <AlertCircle className="w-4 h-4 text-[#6D4AFF] shrink-0" />
                             ) : (
-                              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                              <CheckCircle2 className="w-4 h-4 text-[#0D5BFF] shrink-0" />
                             )}
                             <span className="text-[14px] font-medium text-[#111118] truncate">
                               {turn.files.length > 0
                                 ? turn.phase === 'complete'
-                                  ? `Built ${turn.files.length} ${turn.files.length === 1 ? 'part' : 'parts'}`
+                                  ? `Built ${turn.files.length} ${turn.files.length === 1 ? 'module' : 'modules'}`
                                   : isPausedTurn
-                                    ? `Saved ${turn.files.length} ${turn.files.length === 1 ? 'part' : 'parts'} (paused)`
+                                    ? `Saved ${turn.files.length} ${turn.files.length === 1 ? 'module' : 'modules'} (paused)`
                                     : `${turn.activeAction} ${formatBuildStepLabel(turn.activeFile)}`
                                 : turn.phaseLabel}
                             </span>
@@ -1638,15 +1652,12 @@ export function BuilderWorkspace({
                             className="h-full rounded-full transition-all duration-300 ease-out"
                             style={{
                               width: `${progressPct}%`,
-                              backgroundColor:
-                                turn.phase === 'complete'
-                                  ? '#16A34A'
-                                  : theme.accentColor,
+                              backgroundColor: '#0D5BFF',
                             }}
                           />
                         </div>
 
-                        {/* Live Green-Checkmark Checklist + Active Coding Step */}
+                        {/* Live Blue-Checkmark Checklist + Alternating Thinking State */}
                         {isExpanded && (turn.files.length > 0 || isTurnWorking) && (
                           <ul className="pt-1.5 border-t border-black/[0.06] space-y-1.5 text-[13px]">
                             {turn.files.map((filePath) => {
@@ -1660,12 +1671,9 @@ export function BuilderWorkspace({
                                 >
                                   <div className="flex items-center gap-2 min-w-0">
                                     {isCurrentlyCoding ? (
-                                      <Loader2
-                                        className="w-4 h-4 animate-spin shrink-0"
-                                        style={{ color: theme.accentColor }}
-                                      />
+                                      <Loader2 className="w-4 h-4 animate-spin text-[#0D5BFF] shrink-0" />
                                     ) : (
-                                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                                      <CheckCircle2 className="w-4 h-4 text-[#0D5BFF] shrink-0" />
                                     )}
                                     <span
                                       className={`truncate font-medium ${
@@ -1675,11 +1683,11 @@ export function BuilderWorkspace({
                                       }`}
                                     >
                                       {isCurrentlyCoding
-                                        ? `Coding ${label}...`
+                                        ? `Thinking & coding ${label}...`
                                         : `Built ${label}`}
                                     </span>
                                   </div>
-                                  <span className="text-[11.5px] font-mono text-[#71717A] shrink-0 truncate max-w-[130px]">
+                                  <span className="text-[11.5px] font-mono text-[#71717A] shrink-0 truncate max-w-[140px]">
                                     {filePath}
                                   </span>
                                 </li>
@@ -1688,14 +1696,11 @@ export function BuilderWorkspace({
 
                             {isTurnWorking && (
                               <li className="flex items-center gap-2 py-0.5 text-[#52525B]">
-                                <Loader2
-                                  className="w-3.5 h-3.5 animate-spin shrink-0"
-                                  style={{ color: theme.accentColor }}
-                                />
+                                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#0D5BFF] shrink-0" />
                                 <span className="text-[12.5px] truncate">
                                   {turn.files.length === 0
-                                    ? 'Thinking & planning real-time app...'
-                                    : 'Thinking & building next feature...'}
+                                    ? 'Thinking & planning real-time architecture...'
+                                    : 'Thinking next module...'}
                                 </span>
                               </li>
                             )}
@@ -2149,10 +2154,12 @@ export function BuilderWorkspace({
                             <button
                               key={`${turn.id}-sug-${idx}`}
                               type="button"
-                              disabled={isStreaming}
-                              onClick={() =>
-                                onSendFollowUp(suggestion, buildFollowUpOptions())
-                              }
+                              disabled={isStreaming || isRestricted}
+                              onClick={() => {
+                                if (!isRestricted) {
+                                  onSendFollowUp(suggestion, buildFollowUpOptions());
+                                }
+                              }}
                               className="w-full text-left rounded-xl border border-black/[0.08] bg-white hover:bg-[#F7F7FA] hover:border-black/15 px-3.5 py-2.5 flex items-center justify-between gap-2.5 text-[13.5px] font-medium text-[#111118] transition-all active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                               <span className="leading-snug">{suggestion}</span>
@@ -2185,8 +2192,8 @@ export function BuilderWorkspace({
       </div>
 
       {/* Bottom Follow-Up Chat Composer */}
-      <div className="shrink-0 w-full bg-white border-t border-black/[0.05] pb-safe">
-        <div className="w-full max-w-[520px] mx-auto px-4 pt-2 pb-2.5">
+      <div className="shrink-0 w-full bg-white border-t border-black/[0.05] pb-safe [[data-platform=android]_&]:pb-5">
+        <div className="w-full max-w-[520px] md:max-w-[700px] lg:max-w-[860px] 2xl:max-w-[1020px] mx-auto px-4 pt-2 pb-2.5">
           {inlineNotice ? (
             <p
               role="status"
@@ -2264,7 +2271,11 @@ export function BuilderWorkspace({
           </div>
 
           {/* Rounded Input Card */}
-          <div className="relative w-full rounded-[22px] bg-white border border-black/[0.09] shadow-[0_4px_20px_rgba(15,15,30,0.04)] px-4 pt-2.5 pb-2.5 flex flex-col gap-1.5">
+          <div
+            className={`relative w-full rounded-[22px] bg-white border shadow-[0_4px_20px_rgba(15,15,30,0.04)] px-4 pt-2.5 pb-2.5 flex flex-col gap-1.5 ${
+              isRestricted ? 'border-amber-400/70' : 'border-black/[0.09]'
+            }`}
+          >
             {/* Selected AI Header Bar at the top of the chat box */}
             <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-black/[0.05]">
               <div className="flex items-center gap-2 min-w-0">
@@ -2285,7 +2296,13 @@ export function BuilderWorkspace({
                 </span>
               </div>
 
-              <div className="-mr-1 shrink-0">
+              <div className="flex items-center gap-1.5 -mr-1 shrink-0">
+                {isRestricted && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 border border-amber-200 text-amber-800 text-[10.5px] font-semibold">
+                    <ShieldAlert className="w-3 h-3" />
+                    <span>Restricted</span>
+                  </span>
+                )}
                 <ModelSelectorPopover
                   mode={mode}
                   models={models}
@@ -2299,29 +2316,46 @@ export function BuilderWorkspace({
               </div>
             </div>
 
+            {isRestricted && (
+              <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-1.5 flex items-center gap-2 text-[12px] font-medium text-amber-900">
+                <ShieldAlert className="w-4 h-4 text-amber-700 shrink-0" />
+                <span>Account restricted — messages cannot enter this chat box.</span>
+              </div>
+            )}
+
             <div className="flex items-start gap-2">
               <textarea
-                value={followUp}
-                onChange={(e) => setFollowUp(e.target.value)}
+                value={isRestricted ? '' : followUp}
+                disabled={isRestricted}
+                readOnly={isRestricted}
+                onChange={(e) => {
+                  if (!isRestricted) setFollowUp(e.target.value);
+                }}
                 onKeyDown={handleKeyDown}
                 placeholder={
-                  isVoiceListening
-                    ? 'Listening... speak now'
-                    : isVoiceTranscribing
-                      ? 'Transcribing speech...'
-                      : activeModel?.category === 'video'
-                        ? 'Describe the video scene to generate...'
-                        : activeModel?.category === 'music'
-                          ? 'Describe the song, beat, or vibe to compose...'
-                          : activeModel?.category === 'image'
-                            ? 'Describe the image you want to generate...'
-                            : mode === 'mobile'
-                              ? 'Ask or describe your mobile app...'
-                              : 'Ask or describe your web app...'
+                  isRestricted
+                    ? 'Restricted — messaging disabled on this account.'
+                    : isVoiceListening
+                      ? 'Listening... speak now'
+                      : isVoiceTranscribing
+                        ? 'Transcribing speech...'
+                        : activeModel?.category === 'video'
+                          ? 'Describe the video scene to generate...'
+                          : activeModel?.category === 'music'
+                            ? 'Describe the song, beat, or vibe to compose...'
+                            : activeModel?.category === 'image'
+                              ? 'Describe the image you want to generate...'
+                              : mode === 'mobile'
+                                ? 'Ask or describe your mobile app...'
+                                : 'Ask or describe your web app...'
                 }
                 rows={2}
-                aria-label="Send message or follow-up to AI Craft"
-                className="flex-1 min-w-0 resize-none bg-transparent text-[15px] leading-[1.45] text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none min-h-[44px]"
+                aria-label={
+                  isRestricted
+                    ? 'Chat box restricted'
+                    : 'Send message or follow-up to AI Craft'
+                }
+                className="flex-1 min-w-0 resize-none bg-transparent text-[15px] leading-[1.45] text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none min-h-[44px] disabled:cursor-not-allowed disabled:opacity-65"
               />
               <div className="pt-0.5 shrink-0">
                 <VoiceInputButton
@@ -2329,8 +2363,10 @@ export function BuilderWorkspace({
                   status={voiceStatus}
                   voiceLevel={voiceLevel}
                   accentColor={theme.accentColor}
-                  disabled={isStreaming}
-                  onClick={toggleVoice}
+                  disabled={isStreaming || isRestricted}
+                  onClick={() => {
+                    if (!isRestricted) toggleVoice();
+                  }}
                 />
               </div>
             </div>
@@ -2374,9 +2410,12 @@ export function BuilderWorkspace({
                 />
                 <button
                   type="button"
-                  onClick={() => fileInputRef.current?.click()}
+                  disabled={isRestricted}
+                  onClick={() => {
+                    if (!isRestricted) fileInputRef.current?.click();
+                  }}
                   aria-label="Attach screenshot or file"
-                  className="w-9 h-9 rounded-full border border-black/[0.09] flex items-center justify-center text-[#3F3F46] hover:bg-black/[0.03] active:scale-95 transition-all"
+                  className="w-9 h-9 rounded-full border border-black/[0.09] flex items-center justify-center text-[#3F3F46] hover:bg-black/[0.03] active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <Paperclip className="w-[17px] h-[17px] -rotate-45 stroke-[1.8]" />
                 </button>
@@ -2449,13 +2488,17 @@ export function BuilderWorkspace({
               <button
                 type="button"
                 onClick={handleSubmit}
-                disabled={!hasContent || isStreaming}
-                aria-label="Send message to AI Craft"
+                disabled={isRestricted || !hasContent || isStreaming}
+                aria-label={isRestricted ? 'Chat restricted' : 'Send message to AI Craft'}
                 style={{
                   backgroundColor:
-                    hasContent && !isStreaming ? theme.sendActiveBg : '#BEB5F9',
+                    !isRestricted && hasContent && !isStreaming
+                      ? theme.sendActiveBg
+                      : isRestricted
+                        ? '#D4D4D8'
+                        : '#BEB5F9',
                 }}
-                className="w-9 h-9 rounded-full shrink-0 flex items-center justify-center text-white transition-all duration-200 active:scale-95 disabled:cursor-default"
+                className="w-9 h-9 rounded-full shrink-0 flex items-center justify-center text-white transition-all duration-200 active:scale-95 disabled:cursor-not-allowed"
               >
                 {isStreaming ? (
                   <Loader2 className="w-[17px] h-[17px] animate-spin" />

@@ -1,4 +1,4 @@
-import { Plus, ShieldCheck } from 'lucide-react';
+import { BadgeCheck, Plus, ShieldCheck } from 'lucide-react';
 import { BuildMode, MODE_THEMES } from '../types/craft';
 import { PWAInstallButton } from './PWAInstallButton';
 
@@ -7,6 +7,7 @@ interface TopBarProps {
   credits: number;
   avatarDataUrl?: string | null;
   isOwner?: boolean;
+  isVerified?: boolean;
   onScanClick: () => void;
   onCreditsClick: () => void;
   onAvatarClick: () => void;
@@ -19,6 +20,7 @@ export function TopBar({
   credits,
   avatarDataUrl,
   isOwner,
+  isVerified,
   onScanClick,
   onCreditsClick,
   onAvatarClick,
@@ -29,7 +31,7 @@ export function TopBar({
 
   return (
     <header className="relative z-30 shrink-0 w-full pt-safe pointer-events-none">
-      <div className="w-full max-w-[540px] mx-auto px-5 py-2.5 flex items-center justify-between gap-2">
+      <div className="w-full max-w-[540px] md:max-w-[720px] lg:max-w-[880px] 2xl:max-w-[1060px] mx-auto px-5 py-2.5 flex items-center justify-between gap-2">
         {/* Left: QR / Preview Scan button + compact Install trigger (hidden once installed) */}
         <div className="flex items-center gap-1.5 pointer-events-auto">
           <button
@@ -129,44 +131,56 @@ export function TopBar({
             </span>
           </button>
 
-          {/* User Avatar */}
+          {/* User Avatar + Live Blue Verified Badge */}
           <button
             type="button"
             onClick={onAvatarClick}
-            aria-label="Open profile"
-            className="w-9 h-9 rounded-full overflow-hidden ring-1 ring-black/10 hover:ring-black/25 active:scale-95 transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6] shrink-0"
+            aria-label={isVerified ? 'Open verified profile' : 'Open profile'}
+            className="relative w-9 h-9 rounded-full ring-1 ring-black/10 hover:ring-black/25 active:scale-95 transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6] shrink-0"
           >
-            {avatarDataUrl ? (
-              <img
-                src={avatarDataUrl}
-                alt="Your profile"
-                className="w-full h-full object-cover"
-              />
-            ) : (
-              <svg viewBox="0 0 40 40" className="w-full h-full" aria-hidden="true">
-                <defs>
-                  <linearGradient id="avatarBg" x1="0" y1="0" x2="1" y2="1">
-                    <stop offset="0%" stopColor="#3B0764" />
-                    <stop offset="55%" stopColor="#1E1B4B" />
-                    <stop offset="100%" stopColor="#BE185D" />
-                  </linearGradient>
-                  <linearGradient id="hoodRim" x1="0" y1="0" x2="1" y2="1">
-                    <stop offset="0%" stopColor="#38BDF8" />
-                    <stop offset="100%" stopColor="#F43F5E" />
-                  </linearGradient>
-                </defs>
-                <rect width="40" height="40" fill="url(#avatarBg)" />
-                <circle cx="20" cy="18" r="13" fill="#0F172A" stroke="url(#hoodRim)" strokeWidth="1.8" />
-                <path
-                  d="M11 38 C11 29, 29 29, 29 38 Z"
-                  fill="#090D16"
-                  stroke="#6366F1"
-                  strokeWidth="1.2"
+            <span className="block w-full h-full rounded-full overflow-hidden">
+              {avatarDataUrl ? (
+                <img
+                  src={avatarDataUrl}
+                  alt="Your profile"
+                  className="w-full h-full object-cover"
                 />
-                <ellipse cx="16.2" cy="18.2" rx="1.6" ry="1.1" fill="#38BDF8" />
-                <ellipse cx="23.8" cy="18.2" rx="1.6" ry="1.1" fill="#FB7185" />
-                <path d="M13 13 Q20 7 27 13" stroke="#E0E7FF" strokeOpacity="0.45" strokeWidth="1.2" fill="none" />
-              </svg>
+              ) : (
+                <svg viewBox="0 0 40 40" className="w-full h-full" aria-hidden="true">
+                  <defs>
+                    <linearGradient id="avatarBg" x1="0" y1="0" x2="1" y2="1">
+                      <stop offset="0%" stopColor="#3B0764" />
+                      <stop offset="55%" stopColor="#1E1B4B" />
+                      <stop offset="100%" stopColor="#BE185D" />
+                    </linearGradient>
+                    <linearGradient id="hoodRim" x1="0" y1="0" x2="1" y2="1">
+                      <stop offset="0%" stopColor="#38BDF8" />
+                      <stop offset="100%" stopColor="#F43F5E" />
+                    </linearGradient>
+                  </defs>
+                  <rect width="40" height="40" fill="url(#avatarBg)" />
+                  <circle cx="20" cy="18" r="13" fill="#0F172A" stroke="url(#hoodRim)" strokeWidth="1.8" />
+                  <path
+                    d="M11 38 C11 29, 29 29, 29 38 Z"
+                    fill="#090D16"
+                    stroke="#6366F1"
+                    strokeWidth="1.2"
+                  />
+                  <ellipse cx="16.2" cy="18.2" rx="1.6" ry="1.1" fill="#38BDF8" />
+                  <ellipse cx="23.8" cy="18.2" rx="1.6" ry="1.1" fill="#FB7185" />
+                  <path d="M13 13 Q20 7 27 13" stroke="#E0E7FF" strokeOpacity="0.45" strokeWidth="1.2" fill="none" />
+                </svg>
+              )}
+            </span>
+
+            {isVerified && (
+              <span
+                title="Verified account"
+                aria-label="Verified account"
+                className="pointer-events-none absolute -bottom-0.5 -right-0.5 w-4 h-4 rounded-full bg-white flex items-center justify-center shadow-xs"
+              >
+                <BadgeCheck className="w-3.5 h-3.5 text-[#0D5BFF]" />
+              </span>
             )}
           </button>
         </div>

@@ -102,6 +102,7 @@ import {
   type InitialRoute,
   type ParsedDbTable,
   START_MARKER,
+  buildFocusedSearchQuery,
   buildCraftSystemPrompt,
   buildProjectInfraContext,
   buildSmartFollowUpSuggestions,
@@ -2733,7 +2734,9 @@ async function startServer() {
         (initialRoute !== 'chat' ||
           shouldRunChatSearch(message, previousHtml.trim().length > 0))
       ) {
-        const searchData = await runLiveBrowserSearch(message);
+        const searchData = await runLiveBrowserSearch(
+          buildFocusedSearchQuery(message)
+        );
         webSearchContext = formatWebSearchContext(searchData);
       }
 
@@ -3370,10 +3373,7 @@ async function startServer() {
                 config: {
                   systemInstruction,
                   thinkingConfig: {
-                    thinkingLevel:
-                      initialRoute === 'chat'
-                        ? ThinkingLevel.MEDIUM
-                        : ThinkingLevel.HIGH,
+                    thinkingLevel: ThinkingLevel.MEDIUM,
                   },
                   ...(withSearchTool ? { tools: [{ googleSearch: {} }] } : {}),
                 },

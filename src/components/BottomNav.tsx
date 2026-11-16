@@ -9,9 +9,9 @@ export function BottomNav({ activeTab, onChange }: BottomNavProps) {
   return (
     <nav
       aria-label="Primary navigation"
-      className="relative z-20 shrink-0 w-full bg-white pb-[max(0.25rem,calc(env(safe-area-inset-bottom,0px)*0.36))]"
+      className="relative z-20 shrink-0 w-full bg-white pb-[max(0.25rem,calc(env(safe-area-inset-bottom,0px)*0.36))] [[data-platform=android]_&]:pb-[max(1rem,calc(env(safe-area-inset-bottom,0px)+0.75rem))]"
     >
-      <div className="w-full max-w-[540px] mx-auto grid grid-cols-3 h-[46px] items-center">
+      <div className="w-full max-w-[540px] md:max-w-[720px] lg:max-w-[880px] 2xl:max-w-[1060px] mx-auto grid grid-cols-3 h-[46px] items-center">
         {/* Tab 1: Apps */}
         <button
           type="button"

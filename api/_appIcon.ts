@@ -678,7 +678,7 @@ export function renderAppIconPng(
   const fgRgb = hexToRgb(config.fgColor);
 
   const fullBleed = Boolean(options?.maskable || options?.opaqueFullBleed);
-  const glyphScale = options?.maskable ? 1.48 : 1.15; // extra safe zone for maskable
+  const glyphScale = options?.maskable ? 1.64 : 1.15; // extra Android Material safe-zone padding for adaptive masks
   const aaWidth = 2.0 / s;
 
   // 2x2 supersampling for crisp edges

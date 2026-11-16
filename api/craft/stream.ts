@@ -5,6 +5,7 @@ import {
   type InitialRoute,
   type ParsedDbTable,
   START_MARKER,
+  buildFocusedSearchQuery,
   buildCraftSystemPrompt,
   buildProjectInfraContext,
   buildSmartFollowUpSuggestions,
@@ -631,7 +632,9 @@ export async function POST(request: Request): Promise<Response> {
           (initialRoute !== 'chat' ||
             shouldRunChatSearch(message, previousHtml.trim().length > 0))
         ) {
-          const searchData = await runLiveBrowserSearch(message);
+          const searchData = await runLiveBrowserSearch(
+            buildFocusedSearchQuery(message)
+          );
           webSearchContext = formatWebSearchContext(searchData);
         }
 
@@ -747,14 +750,14 @@ export async function POST(request: Request): Promise<Response> {
           request.signal.addEventListener('abort', forwardRequestAbort, { once: true });
         }
 
-        // Graceful 48s Vercel timeout guard so partial builds flush cleanly instead of dropping socket mid-stream
+        // Graceful 54s Vercel timeout guard so partial builds flush cleanly inside 60s maxDuration
         const serverlessBudgetTimer = setTimeout(() => {
           if (pausedDueToCredits || pausedDueToStreamLimit) return;
           pausedDueToStreamLimit = true;
           if (!generationAbort.signal.aborted) {
             generationAbort.abort();
           }
-        }, 48_000);
+        }, 54_000);
 
         const triggerCreditPause = () => {
           if (pausedDueToCredits) return;
@@ -1293,10 +1296,7 @@ export async function POST(request: Request): Promise<Response> {
                   config: {
                     systemInstruction,
                     thinkingConfig: {
-                      thinkingLevel:
-                        initialRoute === 'chat'
-                          ? ThinkingLevel.MEDIUM
-                          : ThinkingLevel.HIGH,
+                      thinkingLevel: ThinkingLevel.MEDIUM,
                     },
                     ...(withSearchTool ? { tools: [{ googleSearch: {} }] } : {}),
                   },

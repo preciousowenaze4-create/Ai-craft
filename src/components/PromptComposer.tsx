@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUp, Globe, Paperclip, X } from 'lucide-react';
+import { ArrowUp, Globe, Paperclip, ShieldAlert, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useVoiceDictation } from '../hooks/useVoiceDictation';
 import {
@@ -21,6 +21,7 @@ interface PromptComposerProps {
   selectedModel: string;
   modelsLoading: boolean;
   modelsError: string | null;
+  isRestricted?: boolean;
   onSelectModel: (modelId: string) => void;
   onRetryModels: () => void;
   onSubmit: (options: ComposerOptions) => void;
@@ -34,6 +35,7 @@ export function PromptComposer({
   selectedModel,
   modelsLoading,
   modelsError,
+  isRestricted = false,
   onSelectModel,
   onRetryModels,
   onSubmit,
@@ -72,18 +74,18 @@ export function PromptComposer({
     return () => window.clearTimeout(t);
   }, [voiceError, clearVoiceError]);
 
-  const hasContent = prompt.trim().length > 0 || attachment !== null;
+  const hasContent = !isRestricted && (prompt.trim().length > 0 || attachment !== null);
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
-    if (!file) return;
+    if (!file || isRestricted) return;
     const processed = await readAttachmentFile(file);
     setAttachment(processed);
   };
 
   const handleSend = () => {
-    if (!hasContent) return;
+    if (isRestricted || !hasContent) return;
     stopVoice();
     onSubmit({
       reactEnabled,
@@ -98,6 +100,10 @@ export function PromptComposer({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (isRestricted) {
+      e.preventDefault();
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -108,12 +114,14 @@ export function PromptComposer({
     <div
       className="relative w-full rounded-[24px] bg-white border transition-all duration-300 px-4 pt-2.5 pb-3 flex flex-col justify-between"
       style={{
-        borderColor: isFocused
-          ? mode === 'mobile'
-            ? 'rgba(245, 158, 11, 0.45)'
-            : 'rgba(192, 38, 211, 0.40)'
-          : 'rgba(15, 15, 25, 0.08)',
-        boxShadow: isFocused
+        borderColor: isRestricted
+          ? 'rgba(217, 119, 6, 0.45)'
+          : isFocused
+            ? mode === 'mobile'
+              ? 'rgba(245, 158, 11, 0.45)'
+              : 'rgba(192, 38, 211, 0.40)'
+            : 'rgba(15, 15, 25, 0.08)',
+        boxShadow: isFocused && !isRestricted
           ? mode === 'mobile'
             ? '0 10px 30px rgba(245, 185, 55, 0.14)'
             : '0 10px 30px rgba(217, 70, 239, 0.14)'
@@ -139,7 +147,13 @@ export function PromptComposer({
           </span>
         </div>
 
-        <div className="-mr-1 shrink-0">
+        <div className="flex items-center gap-1.5 -mr-1 shrink-0">
+          {isRestricted && (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 border border-amber-200 text-amber-800 text-[10.5px] font-semibold">
+              <ShieldAlert className="w-3 h-3" />
+              <span>Restricted</span>
+            </span>
+          )}
           <ModelSelectorPopover
             mode={mode}
             models={models}
@@ -152,22 +166,35 @@ export function PromptComposer({
         </div>
       </div>
 
+      {isRestricted && (
+        <div className="mb-1.5 rounded-xl bg-amber-50 border border-amber-200 px-3 py-1.5 flex items-center gap-2 text-[12px] font-medium text-amber-900">
+          <ShieldAlert className="w-4 h-4 text-amber-700 shrink-0" />
+          <span>Account restricted — messages cannot enter this chat box.</span>
+        </div>
+      )}
+
       <textarea
-        value={prompt}
-        onChange={(e) => onPromptChange(e.target.value)}
+        value={isRestricted ? '' : prompt}
+        disabled={isRestricted}
+        readOnly={isRestricted}
+        onChange={(e) => {
+          if (!isRestricted) onPromptChange(e.target.value);
+        }}
         onFocus={() => setIsFocused(true)}
         onBlur={() => setIsFocused(false)}
         onKeyDown={handleKeyDown}
         placeholder={
-          isListening
-            ? 'Listening... speak now'
-            : isTranscribing
-              ? 'Transcribing speech...'
-              : theme.placeholder
+          isRestricted
+            ? 'Restricted — messaging disabled on this account.'
+            : isListening
+              ? 'Listening... speak now'
+              : isTranscribing
+                ? 'Transcribing speech...'
+                : theme.placeholder
         }
         rows={2}
-        aria-label={theme.placeholder}
-        className="w-full resize-none bg-transparent text-[15.5px] leading-[1.45] text-[#0B0B0F] placeholder:text-[#A1A1AA] placeholder:font-normal focus:outline-none min-h-[60px] sm:min-h-[68px]"
+        aria-label={isRestricted ? 'Chat box restricted' : theme.placeholder}
+        className="w-full resize-none bg-transparent text-[15.5px] leading-[1.45] text-[#0B0B0F] placeholder:text-[#A1A1AA] placeholder:font-normal focus:outline-none min-h-[60px] sm:min-h-[68px] disabled:cursor-not-allowed disabled:opacity-65"
       />
 
       {voiceError && (
@@ -211,9 +238,12 @@ export function PromptComposer({
           />
           <button
             type="button"
-            onClick={() => fileInputRef.current?.click()}
+            disabled={isRestricted}
+            onClick={() => {
+              if (!isRestricted) fileInputRef.current?.click();
+            }}
             aria-label="Attach reference file"
-            className="w-9 h-9 rounded-full border border-black/[0.09] flex items-center justify-center text-[#3F3F46] hover:bg-black/[0.03] active:scale-95 transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6]"
+            className="w-9 h-9 rounded-full border border-black/[0.09] flex items-center justify-center text-[#3F3F46] hover:bg-black/[0.03] active:scale-95 transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6]"
           >
             <Paperclip className="w-[17px] h-[17px] -rotate-45 stroke-[1.8]" />
           </button>
@@ -264,7 +294,10 @@ export function PromptComposer({
             status={voiceStatus}
             voiceLevel={voiceLevel}
             accentColor={theme.accentColor}
-            onClick={toggleVoice}
+            disabled={isRestricted}
+            onClick={() => {
+              if (!isRestricted) toggleVoice();
+            }}
           />
 
           {/* Backend / Database Stack Icon */}

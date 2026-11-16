@@ -62,6 +62,27 @@ export async function fetchWithTimeout(
   }
 }
 
+export function buildFocusedSearchQuery(rawPrompt: string): string {
+  const cleaned = String(rawPrompt || '')
+    .replace(/\[\[\s*CONTINUE_BUILD\s*\]\]/gi, '')
+    .replace(/["'`]/g, ' ')
+    .replace(
+      /\b(?:please|can you|could you|would you|i want you to|i need you to|help me|build me|build|create me|create|make me|make|design me|design|develop|code|craft|generate|put together|an?|the|my|app|mobile app|web app|website|webpage|webapp|clone|like|with|using|that has|for me|so that|real time|real-time|functioning|functional|database|please)\b/gi,
+      ' '
+    )
+    .replace(/[^\w\s&+-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (cleaned.length >= 3) {
+    return `${cleaned} ui design product features`.slice(0, 140).trim();
+  }
+  return String(rawPrompt || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140);
+}
+
 export async function runLiveBrowserSearch(query: string): Promise<{
   query: string;
   results: SearchResultItem[];
@@ -1165,7 +1186,7 @@ export function extractLiveBuildArtifacts(htmlSoFar: string): LiveBuildArtifact[
   }
 
   const tagRegex =
-    /<(header|nav|canvas|form|footer)\b[^>]*>|<(?:section|template|article|main)\b[^>]*\bid=["']([a-zA-Z0-9_-]{2,32})["'][^>]*>|<\w+\b[^>]*\b(?:data-screen|data-view|data-tab|data-page)=["']([a-zA-Z0-9_-]{2,32})["'][^>]*>|<div\b[^>]*\bid=["']([a-zA-Z0-9_-]*(?:screen|view|page|tab|feed|profile|home|explore|discover|upload|create|inbox|chat|message|comment|search|cart|checkout|pricing|paywall|upgrade|pro|premium|billing|revenue|dashboard|settings|player|modal|notification|reel|story|wallet|analytics)[a-zA-Z0-9_-]*)["'][^>]*>/gi;
+    /<(header|nav|canvas|form|footer)\b[^>]*>|<(?:section|template|article|main)\b[^>]*\bid=["']([a-zA-Z0-9_-]{2,36})["'][^>]*>|<\w+\b[^>]*\b(?:data-screen|data-view|data-tab|data-page|data-module)=["']([a-zA-Z0-9_-]{2,36})["'][^>]*>|<div\b[^>]*\bid=["']([a-zA-Z0-9_-]*(?:screen|view|page|tab|feed|post|upload|create|profile|account|home|explore|discover|inbox|chat|message|comment|search|cart|checkout|pricing|paywall|upgrade|pro|premium|billing|revenue|dashboard|settings|player|modal|notification|reel|story|wallet|analytics|monetize|auth|login)[a-zA-Z0-9_-]*)["'][^>]*>/gi;
   let match: RegExpExecArray | null;
   while ((match = tagRegex.exec(clean)) !== null) {
     const semanticTag = match[1]?.toLowerCase();
@@ -1184,11 +1205,18 @@ export function extractLiveBuildArtifacts(htmlSoFar: string): LiveBuildArtifact[
       }
     } else if (
       namedView &&
-      !/^(app|root|container|wrapper|main|body|content|page)$/i.test(namedView)
+      !/^(app|root|container|wrapper|main|body|content|page|shell)$/i.test(namedView)
     ) {
       add(`screens/${namedView}.html`, 'Building');
     }
     if (artifacts.length >= 12) break;
+  }
+
+  if (/\bAICraft\.db\./i.test(clean)) {
+    add('database/schema.js', 'Wiring');
+  }
+  if (/paywall|checkout|pricing|subscribe|stripe|wallet|pro-modal/i.test(clean)) {
+    add('modules/monetization.js', 'Building');
   }
 
   if (/<script(?![^>]*\bsrc=)[^>]*>/i.test(clean)) {
@@ -1315,28 +1343,29 @@ export function buildCraftSystemPrompt(params: {
 
   const buildRulesBlock = [
     'CALM REPLIT-STYLE STEP-BY-STEP ENGINEERING DISCIPLINE — NEVER RUSH, NEVER STUB, NEVER LIE:',
-    '- Slow down and build with precision like a senior Replit full-stack engineer. Take the space needed to write a COMPLETE, rich, visually unmistakable, genuinely functioning app.',
-    '- STRICT HONESTY CONTRACT: NEVER claim in your explanation that you built a feed, upload modal, player, checkout, search, or live database unless that exact screen, button, handler, and DOM content is genuinely implemented and working inside PART 2.',
+    '- Slow down and think structurally like a senior Replit full-stack engineer before writing code. Build cleanly section by section so every route, button, form, database table, and screen works together.',
+    '- SURGICAL EDIT & SCREENSHOT PRESERVATION RULE (CRITICAL WHEN EDITING AN EXISTING APP): When existing Preview HTML or an attached screenshot is provided, inspect what already works and ONLY remove, cut, restyle, or modify the exact element/screen the user pointed out! NEVER wipe out working tabs, databases, styles, or unrelated features unless explicitly asked to rebuild from scratch.',
+    '- STRICT HONESTY CONTRACT: NEVER claim in your explanation that you built a feed, upload modal, player, chat box, checkout, search, or live database unless that exact screen, button, handler, and DOM content is genuinely implemented and working inside PART 2.',
     '- ZERO HARDCODING UNRELATED EXAMPLES: Build ONLY what the user actually asked for — never insert random unrelated sample topics.',
     titleRuleForBuild,
-    'STEP 0 (Calm 5-Step Architecture & Monetization Plan): Output 5 short planning lines using exact format `[[PLAN: <step>]]`:',
-    '  1) `[[PLAN: Core UX, custom brand logo & visual palette — ...]]`',
-    '  2) `[[PLAN: Responsive layout, inline SVG iconography & mobile safe areas — ...]]`',
-    '  3) `[[PLAN: Real-time database schema & CRUD state engine — ...]]`',
-    '  4) `[[PLAN: Live interactive screens, creation flows & real-time updates — ...]]`',
-    '  5) `[[PLAN: Built-in monetization (Pro plans, checkout / tips) & revenue tracking — ...]]`',
-    'STEP 0B (Real-Time Database Schema Lines): Output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Every interactive app should have real tables (e.g., social feed -> `posts`, `comments`, `creator_profiles`, `transactions`; store -> `products`, `cart_items`, `orders`).',
+    'STEP 0 (Calm 5-Step Architecture & Monetization Plan): Output 5 short, crystal-clear module planning lines using exact format `[[PLAN: <step>]]` (tailored specifically to the app being built, e.g., Profile, Chat box, Feed, Database, Monetization):',
+    '  1) `[[PLAN: Core layout, custom brand icon & palette — ...]]`',
+    '  2) `[[PLAN: Responsive multi-device shell (Android, iOS, Laptop & TV) — ...]]`',
+    '  3) `[[PLAN: Real-time database schema (`window.AICraft.db`) — ...]]`',
+    '  4) `[[PLAN: Interactive screens & core user flows — ...]]`',
+    '  5) `[[PLAN: Built-in monetization & live transactions — ...]]`',
+    'STEP 0B (Real-Time Database Schema Lines): Output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Every interactive app must have real domain tables (e.g., business app -> `customers`, `orders`, `invoices`, `products`; chat app -> `conversations`, `messages`, `contacts`; social feed -> `posts`, `comments`, `creator_profiles`, `transactions`).',
     'STEP 0C (Custom Brand Logo Tag): Output one `[[LOGO: bg=#HEX, accent=#HEX, theme=#HEX, motif=play|chat|bag|music|camera|heart|bolt|star|wallet|map|flame|spark|letter, letters=XX]]` tailored specifically to the user\'s app & requested colors. NEVER output AI Craft\'s logo.',
     'PART 1 (Honest Architectural Summary): Write 2–3 calm, clear plain-text sentences summarizing ONLY the exact screens, real-time `window.AICraft.db` tables, interactive controls, and monetization you actually built below. PROHIBITED IN PART 1: raw HTML/CSS/JS, markdown code fences (```), backticks, or the words "PART 1"/"PART 2"/"PART 3".',
     'PART 2 (Complete Self-Contained Real-Time App): Immediately output <<<AICRAFT_APP_HTML>>> followed by a COMPLETE, self-contained, runnable <!DOCTYPE html> application ending with <<<END_AICRAFT_APP_HTML>>>.',
-    'MANDATORY ANTI-BLANK-SCREEN & FUNCTIONAL COMPLETENESS RULES FOR PART 2:',
+    'MANDATORY ANTI-BLANK-SCREEN & MULTI-DEVICE COMPLETENESS RULES FOR PART 2:',
     `1. TARGET EXPERIENCE: Design a complete, immediately populated ${targetLabel}. Every main viewport, tab, button, form, modal, and interactive card MUST be visibly rendered and interactive on first load — ZERO empty black/white voids, ZERO blank middle panes!`,
-    '2. ZERO FRAGILE EXTERNAL CDNs FOR STYLING OR ICONS: Write ALL layout, spacing, typography, cards, feeds, modals, and animations cleanly inside `<style>...</style>`. DO NOT depend on `cdn.tailwindcss.com`, `unpkg.com/lucide`, React/Babel `<script type="text/babel">`, or icon font CDNs — use PURE INLINE `<svg>` paths (`width="20" height="20" viewBox="0 0 24 24"`) on EVERY icon button (especially bottom nav icons like Home, Search, Create `+`, Inbox, Profile, Heart, Comment, Share) so no icon can EVER turn invisible!',
-    '3. SAFE-AREA & FULL-HEIGHT VIEWPORT MATH: Use `html, body { margin: 0; padding: 0; height: 100dvh; width: 100%; overflow: hidden; }` for app shells with sticky headers/bottom bars, OR `min-height: 100dvh`, with `padding-top: max(12px, env(safe-area-inset-top));` on header and `padding-bottom: max(14px, env(safe-area-inset-bottom));` on bottom nav so nav labels are NEVER clipped!',
+    '2. ZERO FRAGILE EXTERNAL CDNs FOR STYLING OR ICONS: Write ALL layout, spacing, typography, cards, feeds, modals, and animations cleanly inside `<style>...</style>`. DO NOT depend on `cdn.tailwindcss.com`, `unpkg.com/lucide`, React/Babel `<script type="text/babel">`, or icon font CDNs — use PURE INLINE `<svg>` paths (`width="20" height="20" viewBox="0 0 24 24"`) on EVERY icon button (Home, Search, Create `+`, Chat, Profile, Settings, Heart, Comment, Share) so no icon can EVER turn invisible!',
+    '3. ANDROID + IOS + LAPTOP/PC + TV VIEWPORT & BOTTOM CLEARANCE MATH: Use `html, body { margin: 0; padding: 0; height: 100dvh; width: 100%; overflow: hidden; }` for app shells with sticky headers/bottom bars, and center app content cleanly inside a responsive container (`width: 100%; max-width: 1120px; margin: 0 auto;` for desktop/laptop/TV views, keeping full width on phones). On Android (`html[data-platform="android"]`) give bottom navigation bars `padding-bottom: max(18px, calc(env(safe-area-inset-bottom, 0px) + 10px))` so Android system nav buttons NEVER overlap or sink into the bottom nav labels, while keeping iOS (`env(safe-area-inset-bottom)`) crisp and natural.',
     '4. CUSTOM BRAND HEAD TAGS & INLINE ICON: Inside `<head>`, include `<meta name="theme-color" content="#HEX" />`, `<meta name="background-color" content="#HEX" />`, `<meta name="aicraft-logo" data-bg="#HEX" data-accent="#HEX" data-theme="#HEX" data-motif="..." data-letters="XX" />`, and render `<svg id="aicraft-app-icon" viewBox="0 0 128 128" ...>` inside the header.',
     '5. REAL-TIME STRUCTURED DATABASE (`window.AICraft.db`): Wire ALL core app data cleanly to `await window.AICraft.db.list(table)`, `insert(table, row)`, `update(table, id, patch)`, `remove(table, id)`. On startup inside `DOMContentLoaded`: seed 4–6 rich realistic starter items into `window.AICraft.db` ONLY if `list(table)` returns empty, render immediately to the DOM, and also sync any Supabase secrets if configured via `window.AICraft.findSecret(...)`.',
-    '6. WORKING SOCIAL / MEDIA / INTERACTIVE FEATURES (NO FAKE DUMMIES): For social/video/feed apps (like TikTok/Reels/Instagram): render rich vertical full-bleed cards with animated SVG/Canvas/CSS kinetic visuals or real `<video>`/uploaded media + Creator Handle + Song/Audio Ticker + Interactive Like toggle (updates DB count live) + Working Comments bottom drawer (writes real comments to `window.AICraft.db`) + Working Share + Working Follow toggle + Working Search tab (filters live + queries `window.AICraft.search(q)` for real web results/images!) + Working Create/Upload tab/sheet (lets user pick/record video/photo, upload custom media or generate cover image with `window.AICraft.generateImage()`, add caption & sound, and publish straight into the live Home feed!) + Working Profile & Creator Wallet/Monetization tab! For every other app type (storefront, SaaS, tracker, chat, game, dashboard), build the same depth of domain-authentic interactive screens and real CRUD persistence.',
-    '7. BUILT-IN MONETIZATION FLOW: Include a real working monetization feature tailored naturally to the app (e.g., Pro Creator Plan / VIP Subscription modal with Monthly/Annual switch, interactive Tip/Coin wallet drawer, or Checkout cart) that persists purchases/transactions cleanly into `window.AICraft.db` and updates UI badges/balance live.',
+    '6. WORKING DOMAIN FEATURES & GOOGLE IMAGES (NO FAKE DUMMIES): Use verified HTTPS image URLs returned by search results (with clean CSS gradient fallbacks on `onerror`) or inline SVG artwork when building storefronts, business apps, portfolios, social feeds, or dashboards. For social/video/feed apps: build working Like toggles, real persistent Comments drawer (`window.AICraft.db`), Follow state, Search tab (`window.AICraft.search`), Upload/Create flow, Chat/Inbox tab, Settings tab, and Profile. For chat/business/SaaS apps: build working message threads, search/filtering, create/edit modals, live KPI totals, and persistent settings.',
+    '7. BUILT-IN MONETIZATION FLOW: Include a real working monetization feature tailored naturally to the app (e.g., Pro Plan / VIP Subscription modal with Monthly/Annual toggle, Tip/Coin wallet, or Checkout cart) that persists transactions cleanly into `window.AICraft.db` and updates badges/balance live.',
     '8. ERROR-FREE VANILLA JAVASCRIPT: Write clean, well-structured vanilla JS inside `<script>...</script>`, wrap initialization cleanly in `DOMContentLoaded` + `try/catch`, null-check DOM lookups, escape dynamic text safely, verify all braces/parentheses match cleanly, and ensure every single clickable button/tab works immediately on tap.',
     '9. FINAL SILENT SELF-AUDIT: Before outputting `<<<END_AICRAFT_APP_HTML>>>`, verify mentally that <style> is complete, every tab has real markup + rendering logic, JS has zero syntax errors, and the primary viewport opens directly onto rich, active, interactive content.',
     'PART 3 (Next Suggested Upgrades): Immediately AFTER <<<END_AICRAFT_APP_HTML>>>, output:',

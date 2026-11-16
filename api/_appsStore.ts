@@ -365,10 +365,39 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
     overscroll-behavior-y: contain;
     -webkit-tap-highlight-color: transparent;
   }
+  /* Android bottom navigation clearance so buttons never sink behind system nav bar */
+  html[data-platform="android"] nav[class*="fixed"][class*="bottom"],
+  html[data-platform="android"] nav[class*="sticky"][class*="bottom"],
+  html[data-platform="android"] [class*="bottom-nav"],
+  html[data-platform="android"] [data-bottom-nav],
+  html[data-platform="android"] footer[class*="fixed"] {
+    padding-bottom: max(18px, calc(env(safe-area-inset-bottom, 0px) + 14px)) !important;
+  }
+  /* Clean desktop, laptop, and TV viewport centering */
+  @media (min-width: 1024px) {
+    html[data-platform="desktop"] body {
+      max-width: 1120px;
+      margin-left: auto !important;
+      margin-right: auto !important;
+    }
+  }
+  @media (min-width: 1920px) {
+    html {
+      font-size: 18px;
+    }
+  }
 </style>`;
 
   const runtimeScript = `<script>
 (function(){
+  try {
+    var _ua = navigator.userAgent || '';
+    document.documentElement.dataset.platform = /Android/i.test(_ua)
+      ? 'android'
+      : /iPhone|iPad|iPod/i.test(_ua)
+        ? 'ios'
+        : 'desktop';
+  } catch (e) {}
   if (window.AICraft && window.AICraft.__standalone) return;
   var envMap = ${safeEnvJson};
   var dbPrefix = ${safeDbPrefix};

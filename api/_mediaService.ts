@@ -206,67 +206,105 @@ async function generateGeminiImage(
   return null;
 }
 
+function buildRichMusicPrompt(rawPrompt: string): string {
+  const clean = rawPrompt.trim();
+  const hasExplicitStructure = /\b(verse|chorus|bridge|intro|outro|bpm|key|tempo)\b/i.test(clean);
+  if (clean.length > 140 && hasExplicitStructure) {
+    return clean;
+  }
+  const wantsVocals =
+    /\b(sing|singing|voice|vocal|vocals|lyrics|lyric|song|shiver|ballad|melody|serenade|duet|choir|rap|verse|chorus|like\s+[a-z0-9]+)/i.test(
+      clean
+    );
+  const wantsLong = /\b(long|rich|full|extended|slow\s*build|emotional|soaring|deep)\b/i.test(clean);
+  const styleReferenceMatch = /\blike\s+([a-z0-9'’&\s-]{2,36})/i.exec(clean);
+  const styleRef = styleReferenceMatch ? styleReferenceMatch[1].trim() : '';
+
+  const directionParts = [
+    clean,
+    styleRef
+      ? `Capture the exact emotional atmosphere, tempo feel, harmonic progression, and intimate vocal timbre inspired by "${styleRef}" without copying copyrighted lyrics.`
+      : '',
+    wantsVocals
+      ? 'Include rich, expressive human singing vocals with heartfelt phrasing, natural breath control, warm vibrato, layered chorus harmonies, and cohesive original lyrics that fit the theme.'
+      : '',
+    wantsLong
+      ? 'Structure with an evolving Intro, Verse, Pre-Chorus tension build, full soaring Chorus, and warm Outro with varied dynamics and studio-quality stereo mixing.'
+      : 'Compose a distinct, high-fidelity studio arrangement tailored specifically to this description with dynamic variation across bars.',
+  ].filter(Boolean);
+
+  return directionParts.join(' ').slice(0, 950);
+}
+
 async function generateGeminiMusic(
   prompt: string
 ): Promise<GeneratedMediaResult | null> {
   const geminiKeys = getGeminiApiKeyPool();
   if (geminiKeys.length === 0) return null;
 
-  for (const apiKey of geminiKeys.slice(0, 2)) {
-    const cooldownKey = buildCandidateCooldownKey(
-      'gemini',
-      apiKey,
-      'lyria-3-clip-preview'
+  const lower = prompt.toLowerCase();
+  const preferPro =
+    /\b(sing|voice|vocal|lyrics|song|shiver|long|rich|full|extended|verse|chorus|ballad|like\s+[a-z])/i.test(
+      lower
     );
-    if (isGatewayCandidateCoolingDown(cooldownKey)) continue;
-    try {
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          headers: { 'User-Agent': 'aistudio-build' },
-        },
-      });
-      const response = await ai.models.generateContentStream({
-        model: 'lyria-3-clip-preview',
-        contents: prompt,
-      });
+  const modelChain = preferPro
+    ? (['lyria-3-pro-preview', 'lyria-3-clip-preview'] as const)
+    : (['lyria-3-clip-preview', 'lyria-3-pro-preview'] as const);
+  const directedPrompt = buildRichMusicPrompt(prompt);
 
-      const audioChunks: Buffer[] = [];
-      let lyrics = '';
-      let mimeType = 'audio/mpeg';
+  for (const targetLyria of modelChain) {
+    for (const apiKey of geminiKeys.slice(0, 2)) {
+      const cooldownKey = buildCandidateCooldownKey('gemini', apiKey, targetLyria);
+      if (isGatewayCandidateCoolingDown(cooldownKey)) continue;
+      try {
+        const ai = new GoogleGenAI({
+          apiKey,
+          httpOptions: {
+            headers: { 'User-Agent': 'aistudio-build' },
+          },
+        });
+        const response = await ai.models.generateContentStream({
+          model: targetLyria,
+          contents: directedPrompt,
+        });
 
-      for await (const chunk of response) {
-        const parts = chunk.candidates?.[0]?.content?.parts;
-        if (!parts) continue;
-        for (const part of parts) {
-          if (part.inlineData?.data) {
-            if (audioChunks.length === 0 && part.inlineData.mimeType) {
-              mimeType = part.inlineData.mimeType;
+        const audioChunks: Buffer[] = [];
+        let lyrics = '';
+        let mimeType = 'audio/mpeg';
+
+        for await (const chunk of response) {
+          const parts = chunk.candidates?.[0]?.content?.parts;
+          if (!parts) continue;
+          for (const part of parts) {
+            if (part.inlineData?.data) {
+              if (audioChunks.length === 0 && part.inlineData.mimeType) {
+                mimeType = part.inlineData.mimeType;
+              }
+              audioChunks.push(Buffer.from(part.inlineData.data, 'base64'));
             }
-            audioChunks.push(Buffer.from(part.inlineData.data, 'base64'));
-          }
-          if (part.text) {
-            lyrics += part.text;
+            if (part.text) {
+              lyrics += part.text;
+            }
           }
         }
-      }
 
-      if (audioChunks.length > 0) {
-        const fullAudio = Buffer.concat(audioChunks);
-        return {
-          kind: 'music',
-          prompt,
-          dataUrl: bufferToDataUrl(fullAudio, mimeType),
-          mimeType,
-          modelId: 'gemini::lyria-3-clip-preview',
-          gateway: 'google',
-          ...(lyrics.trim() ? { lyrics: lyrics.trim() } : {}),
-        };
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/429|401|403|quota|resource_exhausted|paid|api key/i.test(msg)) {
-        markGatewayCandidateCooldown(cooldownKey, 90_000);
+        if (audioChunks.length > 0) {
+          const fullAudio = Buffer.concat(audioChunks);
+          return {
+            kind: 'music',
+            prompt,
+            dataUrl: bufferToDataUrl(fullAudio, mimeType),
+            mimeType,
+            modelId: `gemini::${targetLyria}`,
+            gateway: 'google',
+            ...(lyrics.trim() ? { lyrics: lyrics.trim() } : {}),
+          };
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/429|401|403|quota|resource_exhausted|paid|api key/i.test(msg)) {
+          markGatewayCandidateCooldown(cooldownKey, 90_000);
+        }
       }
     }
   }
@@ -321,6 +359,9 @@ interface MusicArrangementPlan {
   bassStyle: BassStyle;
   swing: number; // 0..0.38
   seed: number;
+  hasVocalLead: boolean;
+  richExtended: boolean;
+  vocalRegisterOffset: number; // 0 for baritone/tenor, +5/+7 for bright alto/soprano
 }
 
 function fnv1aHash(str: string): number {
@@ -509,10 +550,35 @@ function inferPromptArrangement(prompt: string): MusicArrangementPlan {
             ? 'rolling_synth'
             : 'funk_slap';
 
+  // Detect emotional guitar/vocal ballads ("shiver", "sing", "voice", "rich", "long")
+  const hasVocalLead =
+    /\b(sing|singing|voice|vocal|vocals|lyrics|song|shiver|ballad|serenade|choir|hum|chorus|verse|falsetto|tenor|soprano|alto|warm\s*voice)\b/i.test(
+      lower
+    );
+  const richExtended =
+    hasVocalLead ||
+    /\b(long|rich|full|extended|journey|story|slow\s*build|cinematic|symphon)\b/i.test(lower);
+  const vocalRegisterOffset =
+    /\b(female|woman|soprano|alto|bright|high\s*voice|angelic|falsetto)\b/i.test(lower)
+      ? 5
+      : /\b(deep|male|baritone|bass\s*voice)\b/i.test(lower)
+        ? -2
+        : (seed % 3 === 0 ? 3 : 0);
+
+  let effectiveGroove = groove;
+  if (effectiveGroove === 'pop' && /\bshiver\b/.test(lower)) {
+    effectiveGroove = 'acoustic';
+  }
+
+  let effectiveLead = leadInstrument;
+  if (/acoustic|shiver|guitar|unplugged|ed\s*sheeran/.test(lower)) {
+    effectiveLead = 'plucked_guitar';
+  }
+
   const swing =
-    groove === 'jazz' || groove === 'lofi'
+    effectiveGroove === 'jazz' || effectiveGroove === 'lofi'
       ? 0.24
-      : groove === 'afrobeat' || groove === 'amapiano' || groove === 'rnb'
+      : effectiveGroove === 'afrobeat' || effectiveGroove === 'amapiano' || effectiveGroove === 'rnb'
         ? 0.14
         : 0;
 
@@ -524,11 +590,14 @@ function inferPromptArrangement(prompt: string): MusicArrangementPlan {
     melodyA,
     melodyB,
     arpeggio,
-    groove,
-    leadInstrument,
+    groove: effectiveGroove,
+    leadInstrument: effectiveLead,
     bassStyle,
     swing,
     seed,
+    hasVocalLead,
+    richExtended,
+    vocalRegisterOffset,
   };
 }
 
@@ -758,8 +827,10 @@ function renderArrangementToStereoWav(plan: MusicArrangementPlan): Buffer {
   const sampleRate = 22050;
   const beatSeconds = 60 / plan.bpm;
   const barSeconds = beatSeconds * 4;
-  // Render full 8-bar arrangement (Verse A -> Chorus B lift), clamped comfortably 12..19s
-  const totalSeconds = Math.max(12, Math.min(19, barSeconds * 8));
+  // Multi-section song structure: Intro -> Verse -> Pre-Chorus -> Chorus Lift -> Outro
+  const targetBars = plan.richExtended ? 14 : 10;
+  const maxSeconds = plan.richExtended ? 26 : 19;
+  const totalSeconds = Math.max(14, Math.min(maxSeconds, barSeconds * targetBars));
   const totalSamples = Math.floor(sampleRate * totalSeconds);
   const left = new Float32Array(totalSamples);
   const right = new Float32Array(totalSamples);
@@ -776,14 +847,91 @@ function renderArrangementToStereoWav(plan: MusicArrangementPlan): Buffer {
     return ((rng >>> 0) / 0xffffffff) * 2 - 1;
   };
 
+  // Expressive musical vowel-formant profiles (ah, eh, oh, oo, ih) for vocal lead synthesis (zero TTS)
+  const vowelFormants: Array<[number, number, number]> = [
+    [730, 1090, 2440], // ah
+    [530, 1840, 2480], // eh
+    [570, 840, 2410],  // oh
+    [340, 920, 2240],  // oo
+    [400, 1990, 2550], // ih
+  ];
+
+  const renderFormantNote = (
+    freq: number,
+    durSamples: number,
+    startIdx: number,
+    vowelIdx: number,
+    gainScale: number,
+    panL: number,
+    panR: number
+  ) => {
+    const [f1, f2, f3] = vowelFormants[vowelIdx % vowelFormants.length];
+    let p1 = 0;
+    let p2 = 0;
+    const w1 = (2 * Math.PI * f1) / sampleRate;
+    const w2 = (2 * Math.PI * f2) / sampleRate;
+    const r1 = Math.exp((-Math.PI * 85) / sampleRate);
+    const r2 = Math.exp((-Math.PI * 115) / sampleRate);
+    const c1_1 = 2 * r1 * Math.cos(w1);
+    const c1_2 = r1 * r1;
+    const c2_1 = 2 * r2 * Math.cos(w2);
+    const c2_2 = r2 * r2;
+    let y1a = 0;
+    let y1b = 0;
+    let y2a = 0;
+    let y2b = 0;
+    let glottalPhase = 0;
+    let airPhase = 0;
+
+    for (let i = 0; i < durSamples; i += 1) {
+      const t = i / sampleRate;
+      const env =
+        Math.min(1, t / 0.045) *
+        (i > durSamples - 1600 ? Math.max(0, (durSamples - i) / 1600) : 1) *
+        Math.exp(-t * 1.15);
+      // Natural singer vibrato blooming after initial 140ms onset + gentle pitch scoop on start
+      const vibratoDepth = Math.min(1, Math.max(0, (t - 0.12) / 0.25)) * 0.0085;
+      const vib = Math.sin(2 * Math.PI * 5.2 * t) * vibratoDepth;
+      const pitchScoop = 1 - 0.035 * Math.exp(-t * 28);
+      const instFreq = freq * pitchScoop * (1 + vib);
+      glottalPhase += (2 * Math.PI * instFreq) / sampleRate;
+      airPhase += (2 * Math.PI * f3) / sampleRate;
+
+      // Soft glottal pulse train (rich odd+even harmonics without harsh buzz)
+      const pulse =
+        Math.sin(glottalPhase) * 0.56 +
+        Math.sin(glottalPhase * 2) * 0.28 +
+        Math.sin(glottalPhase * 3) * 0.14 +
+        Math.sin(glottalPhase * 4) * 0.07;
+      const breath = nextNoise() * 0.032 * Math.exp(-t * 4.5);
+      const exc = pulse + breath;
+
+      const out1 = exc + c1_1 * y1a - c1_2 * y1b;
+      y1b = y1a;
+      y1a = out1;
+      const out2 = exc * 0.55 + c2_1 * y2a - c2_2 * y2b;
+      y2b = y2a;
+      y2a = out2;
+
+      p1 = (out1 * 0.28 + out2 * 0.22 + Math.sin(airPhase) * 0.025) * env;
+      p2 = Math.tanh(p1 * 1.35) * gainScale;
+      left[startIdx + i] += p2 * panL;
+      right[startIdx + i] += p2 * panR;
+    }
+  };
+
   for (let s = 0; s < totalSteps; s += 1) {
     const swingOffsetSec = s % 2 === 1 ? stepSeconds * plan.swing : 0;
     const startSample = Math.min(
       totalSamples - 1,
       Math.floor((s * stepSeconds + swingOffsetSec) * sampleRate)
     );
-    const barIdx = Math.floor(s / 8) % plan.chords.length;
-    const isChorus = barIdx >= 4;
+    const absoluteBar = Math.floor(s / 8);
+    const barIdx = absoluteBar % plan.chords.length;
+    const isIntro = absoluteBar < 2;
+    const isPreChorus = absoluteBar >= 4 && absoluteBar < 6;
+    const isChorus = absoluteBar >= 6 && absoluteBar < targetBars - 2;
+    const isOutro = absoluteBar >= targetBars - 2;
     const stepInBar = s % 8;
     const chord = plan.chords[barIdx];
 
@@ -901,17 +1049,50 @@ function renderArrangementToStereoWav(plan: MusicArrangementPlan): Buffer {
       }
     }
 
-    // 3. Multi-Timbral Expressive Lead Melody (Karplus-Strong Guitar / FM Rhodes / Supersaw / Marimba / Brass)
-    const melArr = isChorus ? plan.melodyB : plan.melodyA;
+    // 3. Multi-Timbral Expressive Lead Melody + Expressive Vocal-Formant Lead & Harmony
+    const melArr = isChorus || isPreChorus ? plan.melodyB : plan.melodyA;
     const melOffset = melArr[s % melArr.length];
-    if (melOffset >= 0) {
+    if (melOffset >= 0 && (!isIntro || stepInBar % 2 === 0)) {
       const melFreq = midiToHz(plan.rootMidi + 12 + melOffset);
       const melDur = Math.min(
         totalSamples - startSample,
-        Math.floor(stepSeconds * 1.45 * sampleRate)
+        Math.floor(stepSeconds * (isOutro ? 2.1 : 1.55) * sampleRate)
       );
       const panL = s % 2 === 0 ? 0.86 : 1.12;
       const panR = s % 2 === 0 ? 1.12 : 0.86;
+
+      if (plan.hasVocalLead && !isIntro && !isOutro) {
+        const vocalFreq = midiToHz(plan.rootMidi + 12 + plan.vocalRegisterOffset + melOffset);
+        const vocalDur = Math.min(
+          totalSamples - startSample,
+          Math.floor(stepSeconds * (isChorus ? 2.15 : 1.75) * sampleRate)
+        );
+        const vowelIdx = (plan.seed + s * 3 + barIdx) % 5;
+        renderFormantNote(
+          vocalFreq,
+          vocalDur,
+          startSample,
+          vowelIdx,
+          isChorus ? 0.24 : 0.19,
+          0.95,
+          1.05
+        );
+        // Add stereo harmonic vocal third in Chorus
+        if (isChorus && stepInBar % 2 === 0) {
+          const harmFreq = midiToHz(
+            plan.rootMidi + 12 + plan.vocalRegisterOffset + melOffset + 4
+          );
+          renderFormantNote(
+            harmFreq,
+            vocalDur,
+            startSample,
+            (vowelIdx + 2) % 5,
+            0.12,
+            1.15,
+            0.85
+          );
+        }
+      }
 
       if (plan.leadInstrument === 'plucked_guitar') {
         // Real Karplus-Strong physical string pluck synthesis
@@ -929,11 +1110,11 @@ function renderArrangementToStereoWav(plan: MusicArrangementPlan): Buffer {
           ring[ptr] = next;
           ptr = (ptr + 1) % periodSamples;
           const fade = Math.min(1, i / 120) * Math.exp(-i / (sampleRate * 0.95));
-          const val = cur * fade * 0.24;
+          const val = cur * fade * (plan.hasVocalLead ? 0.17 : 0.24);
           left[startSample + i] += val * panL;
           right[startSample + i] += val * panR;
         }
-      } else {
+      } else if (!plan.hasVocalLead || isIntro || isOutro) {
         for (let i = 0; i < melDur; i += 1) {
           const t = i / sampleRate;
           let sample = 0;
@@ -960,7 +1141,6 @@ function renderArrangementToStereoWav(plan: MusicArrangementPlan): Buffer {
             const mod = Math.sin(2 * Math.PI * melFreq * t) * (1.2 + Math.exp(-t * 6));
             sample = Math.sin(2 * Math.PI * melFreq * t + 0.5 * mod) * env;
           } else {
-            // electric_piano / warm_lead: FM bell-tine + warm body
             const env = Math.min(1, t / 0.008) * Math.exp(-t * 3.8);
             const tine = Math.sin(2 * Math.PI * melFreq * 3.5 * t) * Math.exp(-t * 16) * 0.55;
             sample =
@@ -975,8 +1155,8 @@ function renderArrangementToStereoWav(plan: MusicArrangementPlan): Buffer {
       }
     }
 
-    // 4. Bar Turnaround Crash / Riser at start of Chorus (bar 4, step 0)
-    if (barIdx === 4 && stepInBar === 0) {
+    // 4. Bar Turnaround Crash / Riser entering Chorus
+    if (absoluteBar === 6 && stepInBar === 0) {
       const crashLen = Math.min(totalSamples - startSample, Math.floor(0.95 * sampleRate));
       let prevC = 0;
       for (let i = 0; i < crashLen; i += 1) {
@@ -990,8 +1170,8 @@ function renderArrangementToStereoWav(plan: MusicArrangementPlan): Buffer {
       }
     }
 
-    // 5. Genre-Specific Drum & Percussion Kit
-    if (plan.groove !== 'acoustic' || stepInBar % 4 === 0) {
+    // 5. Genre-Specific Drum & Percussion Kit (drops cleanly in Intro/Outro)
+    if (!isIntro && !isOutro && (plan.groove !== 'acoustic' || stepInBar % 4 === 0)) {
       const hasKick =
         stepInBar === 0 ||
         ((plan.groove === 'edm' || plan.groove === 'synthwave') && stepInBar % 2 === 0) ||
