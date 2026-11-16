@@ -120,6 +120,7 @@ interface ProUpgradeModalProps {
   credits: number;
   activePlanId: string | null;
   billing: BillingSummary | null;
+  isOwner?: boolean;
   userEmail: string;
   userId?: string;
   authHeaders?: Record<string, string>;
@@ -137,6 +138,7 @@ export function ProUpgradeModal({
   credits,
   activePlanId,
   billing,
+  isOwner = false,
   userEmail,
   userId,
   authHeaders,
@@ -503,24 +505,32 @@ export function ProUpgradeModal({
                 </div>
 
                 <span className="text-[11px] font-medium text-[#71717A] tabular-nums">
-                  {billing?.dailyLimit
-                    ? `${credits.toLocaleString()} left · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today`
-                    : `${credits.toLocaleString()} credits · Free 300/30d`}
+                  {isOwner
+                    ? 'Owner · Free unlimited builds'
+                    : billing?.dailyLimit
+                      ? `${credits.toLocaleString()} left · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today`
+                      : `${credits.toLocaleString()} credits · Free 300/30d`}
                 </span>
               </div>
 
-              {(statusNotice || credits <= 30) && (
+              {(statusNotice || (!isOwner && credits <= 30) || isOwner) && (
                 <div
-                  role={statusNotice?.type === 'error' || credits <= 30 ? 'alert' : 'status'}
+                  role={
+                    statusNotice?.type === 'error' || (!isOwner && credits <= 30)
+                      ? 'alert'
+                      : 'status'
+                  }
                   className={`mb-1.5 rounded-xl px-3 py-1.5 text-[11px] font-medium ${
-                    statusNotice?.type === 'error' || (!statusNotice && credits <= 30)
+                    statusNotice?.type === 'error' || (!statusNotice && !isOwner && credits <= 30)
                       ? 'bg-red-50 border border-red-200 text-red-700'
                       : 'bg-[#EEF4FF] border border-[#0D5BFF]/20 text-[#0B3AC7]'
                   }`}
                 >
                   {statusNotice
                     ? statusNotice.text
-                    : `Minimum 31 tokens required to chat or build (${credits.toLocaleString()} remaining). Pay to top up or choose a plan below.`}
+                    : isOwner
+                      ? 'Owner account active — you can build and deploy apps for free with no credit limits.'
+                      : `Minimum 31 tokens required to chat or build (${credits.toLocaleString()} remaining). Pay to top up or choose a plan below.`}
                 </div>
               )}
 

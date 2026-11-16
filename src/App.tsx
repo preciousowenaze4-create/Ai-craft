@@ -457,11 +457,17 @@ export default function App() {
   const cloudSyncTimerRef = useRef<number | null>(null);
   const cloudHydratedUserRef = useRef<string | null>(null);
 
+  const isOwnerUser = Boolean(authUser?.isOwner || billing?.isOwner);
+
   const applyBillingSummary = useCallback((summary: BillingSummary | null | undefined) => {
     if (!summary) return;
     setBilling(summary);
     setCredits(summary.monthlyCreditsRemaining);
-    const nextPlan = summary.tier === 'free' ? null : summary.tier;
+    const nextPlan = summary.isOwner
+      ? 'studio'
+      : summary.tier === 'free'
+        ? null
+        : summary.tier;
     setProPlanId(nextPlan);
     try {
       window.localStorage.setItem(STORAGE_BILLING_KEY, JSON.stringify(summary));
@@ -1280,26 +1286,29 @@ export default function App() {
     [triggerBannedLockout]
   );
 
-  const adjustLocalCredits = useCallback((delta: number) => {
-    if (delta === 0) return;
-    setCredits((prev) => Math.max(0, prev + delta));
-    setBilling((prev) => {
-      if (!prev) return prev;
-      const nextMonthly = Math.max(0, prev.monthlyCreditsRemaining + delta);
-      const nextDaily = Math.max(0, prev.dailyCreditsUsed - delta);
-      const updated: BillingSummary = {
-        ...prev,
-        dailyCreditsUsed: nextDaily,
-        monthlyCreditsRemaining: nextMonthly,
-      };
-      try {
-        window.localStorage.setItem(STORAGE_BILLING_KEY, JSON.stringify(updated));
-      } catch {
-        // ignore storage error
-      }
-      return updated;
-    });
-  }, []);
+  const adjustLocalCredits = useCallback(
+    (delta: number) => {
+      if (delta === 0 || isOwnerUser) return;
+      setCredits((prev) => Math.max(0, prev + delta));
+      setBilling((prev) => {
+        if (!prev || prev.isOwner) return prev;
+        const nextMonthly = Math.max(0, prev.monthlyCreditsRemaining + delta);
+        const nextDaily = Math.max(0, prev.dailyCreditsUsed - delta);
+        const updated: BillingSummary = {
+          ...prev,
+          dailyCreditsUsed: nextDaily,
+          monthlyCreditsRemaining: nextMonthly,
+        };
+        try {
+          window.localStorage.setItem(STORAGE_BILLING_KEY, JSON.stringify(updated));
+        } catch {
+          // ignore storage error
+        }
+        return updated;
+      });
+    },
+    [isOwnerUser]
+  );
 
   const consumeSseStream = useCallback(
     async (
@@ -1877,7 +1886,7 @@ export default function App() {
                 }
                 if (evt.billing) {
                   applyBillingSummary(evt.billing);
-                } else if (resolvedReason !== 'STREAM_INTERRUPTED') {
+                } else if (resolvedReason !== 'STREAM_INTERRUPTED' && !isOwnerUser) {
                   if (resolvedReason === 'DAILY_LIMIT_REACHED') {
                     setBilling((prev) => {
                       if (!prev || prev.dailyLimit === null) return prev;
@@ -1946,6 +1955,7 @@ export default function App() {
     [
       adjustLocalCredits,
       applyBillingSummary,
+      isOwnerUser,
       notificationsEnabled,
       publishProjectLive,
       syncBillingFromServer,
@@ -2402,6 +2412,9 @@ export default function App() {
   };
 
   const checkCanConsumeCredit = useCallback((): boolean => {
+    if (isOwnerUser) {
+      return true;
+    }
     const nowMs = Date.now();
     const monthlyResetMs = billing?.monthlyResetAt ? Date.parse(billing.monthlyResetAt) : NaN;
     const dailyResetMs = billing?.dailyResetAt ? Date.parse(billing.dailyResetAt) : NaN;
@@ -2443,7 +2456,7 @@ export default function App() {
     }
 
     return true;
-  }, [billing, credits, proPlanId, syncBillingFromServer]);
+  }, [billing, credits, isOwnerUser, proPlanId, syncBillingFromServer]);
 
   // Immediately transforms to BuilderWorkspace when a message is sent from the first screen
   // without ever interrupting or stopping any other project currently building
@@ -2906,6 +2919,7 @@ export default function App() {
       credits={credits}
       activePlanId={proPlanId}
       billing={billing}
+      isOwner={isOwnerUser}
       userEmail={authUser?.email || userProfile.email}
       userId={authUser?.id}
       authHeaders={getStoredAuthHeaders()}
@@ -3184,6 +3198,7 @@ export default function App() {
             }}
             onOpenUpgrade={() => setShowProUpgrade(true)}
             autoReadEnabled={autoReadEnabled}
+            isOwner={isOwnerUser}
             isVerified={Boolean(authUser?.verified)}
             isRestricted={Boolean(authUser?.restricted)}
           />

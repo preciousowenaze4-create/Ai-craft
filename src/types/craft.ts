@@ -46,6 +46,7 @@ export type SubscriptionTier = 'free' | 'starter' | 'plus' | 'studio' | 'annual'
 export interface BillingSummary {
   tier: SubscriptionTier;
   planName: string;
+  isOwner?: boolean;
   dailyCreditsUsed: number;
   dailyLimit: number | null;
   dailyResetAt: string;

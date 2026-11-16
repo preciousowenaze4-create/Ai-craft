@@ -238,7 +238,8 @@ export function ProfileSection({
           </div>
 
           <span className="text-[11px] font-medium text-[#71717A] tabular-nums">
-            {projectCount} {projectCount === 1 ? 'app' : 'apps'} · {credits.toLocaleString()} credits
+            {projectCount} {projectCount === 1 ? 'app' : 'apps'} ·{' '}
+            {isOwner ? 'Free unlimited builds' : `${credits.toLocaleString()} credits`}
           </span>
         </div>
 
@@ -574,11 +575,13 @@ export function ProfileSection({
                     AI Craft Pro
                   </p>
                   <p className="text-[10px] text-[#71717A] tabular-nums truncate">
-                    {proPlanId
-                      ? billing?.dailyLimit
-                        ? `${activePlanName} · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today · ${credits.toLocaleString()} left`
-                        : `${activePlanName} plan · ${credits.toLocaleString()} credits`
-                      : `Free (300/30d) · ${credits.toLocaleString()} left${cycleResetLabel ? ` · resets ${cycleResetLabel}` : ''}`}
+                    {isOwner
+                      ? 'Owner · Free unlimited app builds'
+                      : proPlanId
+                        ? billing?.dailyLimit
+                          ? `${activePlanName} · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today · ${credits.toLocaleString()} left`
+                          : `${activePlanName} plan · ${credits.toLocaleString()} credits`
+                        : `Free (300/30d) · ${credits.toLocaleString()} left${cycleResetLabel ? ` · resets ${cycleResetLabel}` : ''}`}
                   </p>
                 </div>
               </div>
@@ -587,7 +590,7 @@ export function ProfileSection({
                 onClick={onOpenProPlans}
                 className="px-3 min-h-[26px] rounded-full bg-[#0D5BFF] text-white text-[10.5px] font-semibold hover:bg-[#094EE0] active:scale-95 transition-all shrink-0"
               >
-                {proPlanId ? 'Plans' : 'Upgrade'}
+                {isOwner || proPlanId ? 'Plans' : 'Upgrade'}
               </button>
             </div>
 
@@ -655,12 +658,18 @@ export function ProfileSection({
               </span>
               <div className="min-w-0">
                 <p className="font-display font-bold text-[13px] text-[#0B0B0F] leading-tight">
-                  {proPlanId ? `AI Craft ${activePlanName}` : 'Free Plan (300 / 30 days)'}
+                  {isOwner
+                    ? 'Owner · Free Unlimited'
+                    : proPlanId
+                      ? `AI Craft ${activePlanName}`
+                      : 'Free Plan (300 / 30 days)'}
                 </p>
                 <p className="text-[10.5px] text-[#71717A] tabular-nums mt-0.5 truncate">
-                  {billing?.dailyLimit
-                    ? `${credits.toLocaleString()}/${billing.monthlyLimit.toLocaleString()} cycle · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today`
-                    : `${credits.toLocaleString()} credits available${cycleResetLabel ? ` · resets ${cycleResetLabel}` : ''}`}
+                  {isOwner
+                    ? 'Unlimited app builds unlocked for app owner'
+                    : billing?.dailyLimit
+                      ? `${credits.toLocaleString()}/${billing.monthlyLimit.toLocaleString()} cycle · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today`
+                      : `${credits.toLocaleString()} credits available${cycleResetLabel ? ` · resets ${cycleResetLabel}` : ''}`}
                 </p>
               </div>
             </div>

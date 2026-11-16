@@ -17,6 +17,7 @@ import {
   verifyWebhookSignature,
 } from './_paystack.js';
 import { getRequestBaseUrl } from './_supabaseAuth.js';
+import { isOwnerEmail } from './_moderation.js';
 
 function getPaymentSubroute(request: Request): string {
   const reqUrl = new URL(request.url);
@@ -73,7 +74,7 @@ export async function GET(request: Request): Promise<Response> {
 
     return Response.json(
       {
-        billing: serializeBillingSummary(state),
+        billing: serializeBillingSummary(state, isOwnerEmail(auth.user.email)),
       },
       { headers: { 'Cache-Control': 'no-store' } }
     );

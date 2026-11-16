@@ -82,12 +82,17 @@ export function TopBar({
           <button
             type="button"
             onClick={onCreditsClick}
-            aria-label={`AI Craft credits: ${credits.toLocaleString()}. Tap to open AI Craft Pro plans`}
+            aria-label={
+              isOwner
+                ? 'Owner account: Free unlimited app builds'
+                : `AI Craft credits: ${credits.toLocaleString()}. Tap to open AI Craft Pro plans`
+            }
             style={{
-              backgroundColor: credits <= 30 ? '#FEF2F2' : theme.accentSoft,
+              backgroundColor:
+                !isOwner && credits <= 30 ? '#FEF2F2' : theme.accentSoft,
             }}
             className={`h-9 min-h-[40px] pl-2 pr-1.5 rounded-full flex items-center gap-2 transition-colors duration-500 hover:brightness-[0.97] active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6] ${
-              credits <= 30 ? 'ring-1 ring-red-200' : ''
+              !isOwner && credits <= 30 ? 'ring-1 ring-red-200' : ''
             }`}
           >
             {/* Iridescent compass orb */}
@@ -95,7 +100,7 @@ export function TopBar({
               className="w-5 h-5 rounded-full flex items-center justify-center shadow-xs shrink-0"
               style={{
                 background:
-                  credits <= 30
+                  !isOwner && credits <= 30
                     ? 'linear-gradient(135deg, #FCA5A5 0%, #EF4444 65%, #B91C1C 100%)'
                     : mode === 'mobile'
                       ? 'linear-gradient(135deg, #C4B5FD 0%, #7A68F6 60%, #5B21B6 100%)'
@@ -115,16 +120,17 @@ export function TopBar({
 
             <span
               className={`font-display font-semibold text-[15px] leading-none tabular-nums ${
-                credits <= 30 ? 'text-red-700' : 'text-[#111118]'
+                !isOwner && credits <= 30 ? 'text-red-700' : 'text-[#111118]'
               }`}
             >
-              {credits.toLocaleString()}
+              {isOwner ? 'Free' : credits.toLocaleString()}
             </span>
 
             <span
               className="w-[22px] h-[22px] rounded-full flex items-center justify-center text-white transition-colors duration-500 shrink-0"
               style={{
-                backgroundColor: credits <= 30 ? '#EF4444' : theme.accentColor,
+                backgroundColor:
+                  !isOwner && credits <= 30 ? '#EF4444' : theme.accentColor,
               }}
             >
               <Plus className="w-3.5 h-3.5 stroke-[2.75]" />

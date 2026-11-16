@@ -130,9 +130,14 @@ export async function POST(request: Request): Promise<Response> {
       { status: creditCheck.status }
     );
   }
-  const effectiveCreditBudget =
-    creditCheck.creditBudget !== null ? creditCheck.creditBudget : clientCreditsHint;
+  const isOwnerRequest = Boolean(modCheck.isOwner || creditCheck.context?.isOwner);
+  const effectiveCreditBudget = isOwnerRequest
+    ? null
+    : creditCheck.creditBudget !== null
+      ? creditCheck.creditBudget
+      : clientCreditsHint;
   if (
+    !isOwnerRequest &&
     creditCheck.creditBudget === null &&
     clientCreditsHint !== null &&
     clientCreditsHint <= MIN_CHAT_CREDITS_THRESHOLD
@@ -396,15 +401,18 @@ export async function POST(request: Request): Promise<Response> {
           await waitMs(55);
         }
 
-        const rawCreditsUsed = Math.max(
-          1,
-          calculateBuildCreditsForBytes(assembled.html.length, {
-            filesCount: builtPaths.length,
-            dbTablesCount: assembled.dbTables.length,
-          })
-        );
-        const finalCreditsUsed =
-          effectiveCreditBudget !== null
+        const rawCreditsUsed = isOwnerRequest
+          ? 0
+          : Math.max(
+              1,
+              calculateBuildCreditsForBytes(assembled.html.length, {
+                filesCount: builtPaths.length,
+                dbTablesCount: assembled.dbTables.length,
+              })
+            );
+        const finalCreditsUsed = isOwnerRequest
+          ? 0
+          : effectiveCreditBudget !== null
             ? Math.min(rawCreditsUsed, effectiveCreditBudget)
             : rawCreditsUsed;
         let updatedBilling = creditCheck.billing;

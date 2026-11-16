@@ -13,6 +13,7 @@ import {
   getSupabaseConfig,
   parseCookies,
 } from './_supabaseAuth.js';
+import { isOwnerEmail } from './_moderation.js';
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
 export const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
@@ -34,6 +35,7 @@ export interface BillingAccountState {
 export interface BillingSummaryPayload {
   tier: SubscriptionTier;
   planName: string;
+  isOwner?: boolean;
   dailyCreditsUsed: number;
   dailyLimit: number | null;
   dailyResetAt: string;
@@ -319,9 +321,25 @@ export function consumeBillingCredit(
 }
 
 export function serializeBillingSummary(
-  state: BillingAccountState
+  state: BillingAccountState,
+  isOwner = false
 ): BillingSummaryPayload {
   const plan = getPlanConfig(state.tier);
+  if (isOwner) {
+    return {
+      tier: state.tier,
+      planName: 'Owner · Free Unlimited',
+      isOwner: true,
+      dailyCreditsUsed: 0,
+      dailyLimit: null,
+      dailyResetAt: state.dailyResetAt,
+      monthlyCreditsRemaining: Math.max(999_999, state.monthlyCreditsRemaining),
+      monthlyLimit: 999_999,
+      monthlyResetAt: state.monthlyResetAt,
+      annualCyclesRemaining: state.annualCyclesRemaining,
+      subscriptionExpiresAt: state.subscriptionExpiresAt,
+    };
+  }
   return {
     tier: state.tier,
     planName: plan.name,
@@ -637,6 +655,7 @@ export interface VerifiedGenerationContext {
   accessToken: string;
   refreshToken?: string;
   state: BillingAccountState;
+  isOwner?: boolean;
 }
 
 export async function verifyUserCanGenerate(
@@ -666,12 +685,28 @@ export async function verifyUserCanGenerate(
     return { allowed: true, context: null, billing: null, creditBudget: null };
   }
 
+  const owner = isOwnerEmail(auth.user.email);
   const current = await reconcileAndLoadBillingState({
     user: auth.user,
     accessToken: auth.accessToken,
     refreshToken: auth.refreshToken,
     checkPaystack: false,
   });
+
+  if (owner) {
+    return {
+      allowed: true,
+      context: {
+        user: auth.user,
+        accessToken: auth.accessToken,
+        refreshToken: auth.refreshToken,
+        state: current,
+        isOwner: true,
+      },
+      billing: serializeBillingSummary(current, true),
+      creditBudget: null,
+    };
+  }
 
   const availableBudget = getAvailableCreditsBudget(current, Date.now());
   if (availableBudget <= MIN_CHAT_CREDITS_THRESHOLD) {
@@ -707,6 +742,9 @@ export async function commitGenerationCredits(
   rawAmount: number
 ): Promise<BillingSummaryPayload | null> {
   if (!context) return null;
+  if (context.isOwner || isOwnerEmail(context.user.email)) {
+    return serializeBillingSummary(context.state, true);
+  }
   const amount = Math.max(0, Math.floor(rawAmount));
   if (amount <= 0) {
     return serializeBillingSummary(context.state);
@@ -787,6 +825,13 @@ export async function enforceAndConsumeGenerationCredit(
     refreshToken: auth.refreshToken,
     checkPaystack: false,
   });
+
+  if (isOwnerEmail(auth.user.email)) {
+    return {
+      allowed: true,
+      billing: serializeBillingSummary(current, true),
+    };
+  }
 
   const consumed = consumeBillingCredit(current, amount, Date.now());
   if (!consumed.allowed) {

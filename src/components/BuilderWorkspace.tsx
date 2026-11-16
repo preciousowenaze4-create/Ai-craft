@@ -158,6 +158,7 @@ interface BuilderWorkspaceProps {
   onOpenSettings: () => void;
   onOpenUpgrade: () => void;
   autoReadEnabled?: boolean;
+  isOwner?: boolean;
 }
 
 export function BuilderWorkspace({
@@ -197,6 +198,7 @@ export function BuilderWorkspace({
   onOpenSettings,
   onOpenUpgrade,
   autoReadEnabled = true,
+  isOwner = false,
 }: BuilderWorkspaceProps) {
   const theme = MODE_THEMES[mode];
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -236,8 +238,10 @@ export function BuilderWorkspace({
   }, [hasWorkingTurn, hasPausedTurn]);
 
   const monthlyExhausted =
-    credits <= 0 || (billing !== null && billing.monthlyCreditsRemaining <= 0);
+    !isOwner &&
+    (credits <= 0 || (billing !== null && billing.monthlyCreditsRemaining <= 0));
   const dailyExhausted =
+    !isOwner &&
     billing?.dailyLimit !== null &&
     billing?.dailyLimit !== undefined &&
     billing.dailyCreditsUsed >= billing.dailyLimit;
@@ -249,7 +253,7 @@ export function BuilderWorkspace({
       Boolean(billing?.dailyResetAt) &&
       Date.parse(billing!.dailyResetAt) <= nowMs);
   const canResumeCreditsNow =
-    (!monthlyExhausted && !dailyExhausted) || resetTimePassed;
+    isOwner || (!monthlyExhausted && !dailyExhausted) || resetTimePassed;
 
   const {
     status: voiceStatus,
@@ -2249,14 +2253,18 @@ export function BuilderWorkspace({
               <button
                 type="button"
                 onClick={onOpenUpgrade}
-                aria-label={`AI Craft credits: ${credits.toLocaleString()}. Tap to upgrade or add credits`}
+                aria-label={
+                  isOwner
+                    ? 'Owner account: Free unlimited app builds'
+                    : `AI Craft credits: ${credits.toLocaleString()}. Tap to upgrade or add credits`
+                }
                 className="flex items-center gap-1.5 rounded-full px-1.5 py-1 -ml-1.5 hover:bg-black/[0.04] active:scale-95 transition-all"
               >
                 <span
                   className="w-[18px] h-[18px] rounded-full flex items-center justify-center shrink-0"
                   style={{
                     background:
-                      credits <= 0
+                      !isOwner && credits <= 0
                         ? 'linear-gradient(135deg, #FCA5A5 0%, #EF4444 65%, #B91C1C 100%)'
                         : mode === 'mobile'
                           ? 'linear-gradient(135deg, #C4B5FD 0%, #7A68F6 60%, #5B21B6 100%)'
@@ -2274,10 +2282,10 @@ export function BuilderWorkspace({
                 </span>
                 <span
                   className={`font-display font-semibold tabular-nums ${
-                    credits <= 0 ? 'text-red-600' : 'text-[#111118]'
+                    !isOwner && credits <= 0 ? 'text-red-600' : 'text-[#111118]'
                   }`}
                 >
-                  {credits.toLocaleString()}
+                  {isOwner ? 'Owner · Free' : credits.toLocaleString()}
                 </span>
               </button>
 

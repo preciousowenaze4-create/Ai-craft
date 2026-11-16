@@ -92,6 +92,7 @@ import {
   ModerationActionType,
   applyOwnerModerationAction,
   checkExpressUserModeration,
+  isOwnerEmail,
   listAllRealSignedInUsers,
   recordSignedInUser,
   resolveUserWithModeration,
@@ -1777,7 +1778,7 @@ async function startServer() {
     });
 
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ billing: serializeBillingSummary(state) });
+    res.json({ billing: serializeBillingSummary(state, isOwnerEmail(auth.user.email)) });
   });
 
   app.post('/api/payments/webhook', async (req, res) => {
@@ -2654,6 +2655,7 @@ async function startServer() {
     let generationCreditContext: VerifiedGenerationContext | null = null;
     let initialBillingSummary = null;
     let serverCreditBudget: number | null = null;
+    let isOwnerRequest = false;
     {
       const cookies = parseCookies(req.headers.cookie);
       const authHeader = req.headers.authorization || '';
@@ -2689,40 +2691,59 @@ async function startServer() {
             });
             return;
           }
+          isOwnerRequest = Boolean(
+            resolvedMod?.serialized.isOwner || isOwnerEmail(auth.user.email)
+          );
           const currentBilling = await reconcileAndLoadBillingState({
             user: auth.user,
             accessToken: auth.accessToken,
             refreshToken: auth.refreshToken,
             checkPaystack: false,
           });
-          const availableBudget = getAvailableCreditsBudget(currentBilling, Date.now());
-          if (availableBudget <= MIN_CHAT_CREDITS_THRESHOLD) {
-            const plan = getPlanConfig(currentBilling.tier);
-            const hitDaily =
-              plan.dailyLimit !== null && currentBilling.dailyCreditsUsed >= plan.dailyLimit;
-            res.status(402).json({
-              error: hitDaily
-                ? `Daily limit reached (${(plan.dailyLimit ?? 0).toLocaleString()} credits/day on ${plan.name}). Resets in 24 hours or upgrade your plan.`
-                : `You have ${availableBudget.toLocaleString()} tokens remaining (minimum ${MIN_CHAT_CREDITS_THRESHOLD + 1} tokens required to chat or build). Top up or upgrade a plan to continue.`,
-              code: hitDaily ? 'DAILY_LIMIT_REACHED' : 'LOW_CREDITS_THRESHOLD',
-              billing: serializeBillingSummary(currentBilling),
-            });
-            return;
+          if (isOwnerRequest) {
+            generationCreditContext = {
+              user: auth.user,
+              accessToken: auth.accessToken,
+              refreshToken: auth.refreshToken,
+              state: currentBilling,
+              isOwner: true,
+            };
+            initialBillingSummary = serializeBillingSummary(currentBilling, true);
+            serverCreditBudget = null;
+          } else {
+            const availableBudget = getAvailableCreditsBudget(currentBilling, Date.now());
+            if (availableBudget <= MIN_CHAT_CREDITS_THRESHOLD) {
+              const plan = getPlanConfig(currentBilling.tier);
+              const hitDaily =
+                plan.dailyLimit !== null && currentBilling.dailyCreditsUsed >= plan.dailyLimit;
+              res.status(402).json({
+                error: hitDaily
+                  ? `Daily limit reached (${(plan.dailyLimit ?? 0).toLocaleString()} credits/day on ${plan.name}). Resets in 24 hours or upgrade your plan.`
+                  : `You have ${availableBudget.toLocaleString()} tokens remaining (minimum ${MIN_CHAT_CREDITS_THRESHOLD + 1} tokens required to chat or build). Top up or upgrade a plan to continue.`,
+                code: hitDaily ? 'DAILY_LIMIT_REACHED' : 'LOW_CREDITS_THRESHOLD',
+                billing: serializeBillingSummary(currentBilling),
+              });
+              return;
+            }
+            generationCreditContext = {
+              user: auth.user,
+              accessToken: auth.accessToken,
+              refreshToken: auth.refreshToken,
+              state: currentBilling,
+            };
+            initialBillingSummary = serializeBillingSummary(currentBilling);
+            serverCreditBudget = availableBudget;
           }
-          generationCreditContext = {
-            user: auth.user,
-            accessToken: auth.accessToken,
-            refreshToken: auth.refreshToken,
-            state: currentBilling,
-          };
-          initialBillingSummary = serializeBillingSummary(currentBilling);
-          serverCreditBudget = availableBudget;
         }
       }
     }
-    const effectiveCreditBudget =
-      serverCreditBudget !== null ? serverCreditBudget : clientCreditsHint;
+    const effectiveCreditBudget = isOwnerRequest
+      ? null
+      : serverCreditBudget !== null
+        ? serverCreditBudget
+        : clientCreditsHint;
     if (
+      !isOwnerRequest &&
       serverCreditBudget === null &&
       clientCreditsHint !== null &&
       clientCreditsHint <= MIN_CHAT_CREDITS_THRESHOLD
@@ -3014,15 +3035,18 @@ async function startServer() {
         await new Promise((r) => setTimeout(r, 55));
       }
 
-      const rawCreditsUsed = Math.max(
-        1,
-        calculateBuildCreditsForBytes(assembled.html.length, {
-          filesCount: builtPaths.length,
-          dbTablesCount: assembled.dbTables.length,
-        })
-      );
-      const finalCreditsUsed =
-        effectiveCreditBudget !== null
+      const rawCreditsUsed = isOwnerRequest
+        ? 0
+        : Math.max(
+            1,
+            calculateBuildCreditsForBytes(assembled.html.length, {
+              filesCount: builtPaths.length,
+              dbTablesCount: assembled.dbTables.length,
+            })
+          );
+      const finalCreditsUsed = isOwnerRequest
+        ? 0
+        : effectiveCreditBudget !== null
           ? Math.min(rawCreditsUsed, effectiveCreditBudget)
           : rawCreditsUsed;
 
