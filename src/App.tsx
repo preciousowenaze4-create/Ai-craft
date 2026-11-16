@@ -1398,6 +1398,12 @@ export default function App() {
                 files?: string[];
                 allSteps?: string[];
                 planSteps?: string[];
+                intent?: string;
+                componentIds?: string[];
+                featureIds?: string[];
+                classifiedIntent?: string;
+                classifiedModules?: string[];
+                classifiedFeatures?: string[];
                 suggestions?: string[];
                 tables?: IncomingSchemaTable[];
                 dbTables?: IncomingSchemaTable[];
@@ -1515,6 +1521,17 @@ export default function App() {
                 }));
               } else if (evt.type === 'title' && evt.title) {
                 updateProjectTitle(projectId, evt.title);
+              } else if (evt.type === 'route') {
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  classifiedIntent: evt.intent ?? t.classifiedIntent,
+                  classifiedModules: Array.isArray(evt.componentIds)
+                    ? evt.componentIds
+                    : t.classifiedModules,
+                  classifiedFeatures: Array.isArray(evt.featureIds)
+                    ? evt.featureIds
+                    : t.classifiedFeatures,
+                }));
               } else if (evt.type === 'plan' && Array.isArray(evt.allSteps)) {
                 flushBuffered();
                 updateTurn(projectId, turnId, (t) => ({
@@ -1659,6 +1676,17 @@ export default function App() {
                         : evt.previewHtml || t.previewHtml,
                     media: evt.media ?? t.media,
                     files: resolvedFiles,
+                    classifiedIntent: evt.classifiedIntent ?? evt.intent ?? t.classifiedIntent,
+                    classifiedModules: Array.isArray(evt.classifiedModules)
+                      ? evt.classifiedModules
+                      : Array.isArray(evt.componentIds)
+                        ? evt.componentIds
+                        : t.classifiedModules,
+                    classifiedFeatures: Array.isArray(evt.classifiedFeatures)
+                      ? evt.classifiedFeatures
+                      : Array.isArray(evt.featureIds)
+                        ? evt.featureIds
+                        : t.classifiedFeatures,
                     suggestions: Array.isArray(evt.suggestions)
                       ? evt.suggestions
                       : t.suggestions,

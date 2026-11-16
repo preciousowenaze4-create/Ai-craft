@@ -1710,6 +1710,47 @@ export function BuilderWorkspace({
                     );
                   })()}
 
+                  {/* Structured Gemini Intent Router & Module Classifier Identifiers */}
+                  {((turn.classifiedModules && turn.classifiedModules.length > 0) ||
+                    (turn.classifiedFeatures && turn.classifiedFeatures.length > 0)) && (
+                    <div className="rounded-2xl border border-[#0D5BFF]/20 bg-[#F5F8FF] px-3.5 py-2.5 flex flex-col gap-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-semibold uppercase tracking-[0.04em] text-[#0D5BFF]">
+                          Gemini Intent Router · Classified Modules
+                        </span>
+                        {turn.classifiedIntent && (
+                          <span className="text-[11px] font-mono font-semibold text-[#1E3A8A] bg-white px-2 py-0.5 rounded-full border border-[#0D5BFF]/20">
+                            {turn.classifiedIntent}
+                          </span>
+                        )}
+                      </div>
+                      {turn.classifiedModules && turn.classifiedModules.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {turn.classifiedModules.map((modId) => (
+                            <span
+                              key={`${turn.id}-mod-${modId}`}
+                              className="px-2 py-0.5 rounded-lg bg-white border border-black/[0.08] text-[11px] font-mono text-[#18181B]"
+                            >
+                              {modId}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {turn.classifiedFeatures && turn.classifiedFeatures.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {turn.classifiedFeatures.map((featId) => (
+                            <span
+                              key={`${turn.id}-feat-${featId}`}
+                              className="px-2 py-0.5 rounded-lg bg-[#EEF4FF] border border-[#0D5BFF]/20 text-[10.5px] font-mono text-[#0D5BFF]"
+                            >
+                              +{featId}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   {/* Live Streaming AI Response Prose (Raw code strictly excluded) */}
                   {turn.errorMessage ? (
                     <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-[14px] text-red-700 leading-relaxed flex flex-col gap-2.5">

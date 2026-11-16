@@ -127,6 +127,11 @@ import {
   stripTagMarkers,
   validateBuiltAppHtml,
 } from './api/_builderCore.js';
+import {
+  GeminiRouterError,
+  routeMessageWithGemini,
+} from './api/_geminiRouter.js';
+import { assembleModularInterface } from './api/_moduleAssembler.js';
 
 const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -2409,6 +2414,150 @@ async function startServer() {
     }
   });
 
+  app.post('/api/route', async (req, res) => {
+    try {
+      const cookies = parseCookies(req.headers.cookie);
+      const authHeader = req.headers.authorization || '';
+      const bearerToken = /^bearer\s+/i.test(authHeader)
+        ? authHeader.replace(/^bearer\s+/i, '').trim()
+        : '';
+      const accessToken = bearerToken || cookies[SB_ACCESS_COOKIE] || '';
+      const refreshToken =
+        (typeof req.headers['x-refresh-token'] === 'string'
+          ? req.headers['x-refresh-token'].trim()
+          : '') ||
+        cookies[SB_REFRESH_COOKIE] ||
+        '';
+
+      if (accessToken || refreshToken) {
+        const auth = await getAuthenticatedSupabaseUser(accessToken, refreshToken);
+        if (auth.user) {
+          const resolvedMod = await resolveUserWithModeration(auth.user);
+          if (resolvedMod?.flags.banned) {
+            clearAuthCookies(res);
+            res.status(403).json({
+              error: 'This account has been suspended by the app owner.',
+              code: 'ACCOUNT_BANNED',
+              banned: true,
+            });
+            return;
+          }
+          if (resolvedMod?.flags.restricted) {
+            res.status(403).json({
+              error: 'Your account is currently restricted from sending messages.',
+              code: 'ACCOUNT_RESTRICTED',
+              restricted: true,
+            });
+            return;
+          }
+        }
+      }
+
+      const body = (req.body || {}) as {
+        message?: string;
+        mode?: string;
+        previousHtml?: string;
+        history?: Array<{ role: string; text: string }>;
+        webSearchEnabled?: boolean;
+        assemble?: boolean;
+        attachmentName?: string | null;
+        attachmentDataUrl?: string | null;
+        attachmentMimeType?: string | null;
+        attachmentText?: string | null;
+        clientTime?: string;
+        clientTimeZone?: string;
+      };
+
+      const message = typeof body.message === 'string' ? body.message.trim() : '';
+      if (!message) {
+        res.status(400).json({ error: 'Prompt message is required.' });
+        return;
+      }
+
+      const mode = body.mode === 'web' ? 'web' : 'mobile';
+      const webSearchEnabled = body.webSearchEnabled !== false;
+      const shouldAssemble = body.assemble !== false;
+
+      const searchData = webSearchEnabled
+        ? await runLiveBrowserSearch(buildFocusedSearchQuery(message))
+        : { query: '', results: [], images: [] };
+      const webSearchContext = formatWebSearchContext(searchData);
+
+      const timeContext = [
+        body.clientTime ? `User local date/time: ${body.clientTime}` : '',
+        body.clientTimeZone ? `User timezone: ${body.clientTimeZone}` : '',
+        `Server UTC date/time: ${new Date().toUTCString()}`,
+      ]
+        .filter(Boolean)
+        .join(' | ');
+
+      const classification = await routeMessageWithGemini({
+        message,
+        mode,
+        history: Array.isArray(body.history) ? body.history : [],
+        previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
+        attachmentName: body.attachmentName ?? null,
+        attachmentDataUrl: body.attachmentDataUrl ?? null,
+        attachmentMimeType: body.attachmentMimeType ?? null,
+        attachmentText: body.attachmentText ?? null,
+        webSearchContext,
+        timeContext,
+      });
+
+      const isBuildIntent =
+        classification.intent === 'build_app' || classification.intent === 'edit_app';
+      const assembled =
+        shouldAssemble && isBuildIntent
+          ? assembleModularInterface({
+              route: classification,
+              previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
+              mode,
+              searchData,
+            })
+          : null;
+
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        ok: true,
+        router: classification.modelUsed,
+        intent: classification.intent,
+        appTitle: classification.appTitle,
+        brandTagline: classification.brandTagline,
+        summary: classification.replyMessage,
+        primaryColor: classification.primaryColor,
+        surfaceTheme: classification.surfaceTheme,
+        componentIds: assembled?.manifest.componentIds ?? classification.componentIds,
+        featureIds: assembled?.manifest.featureIds ?? classification.featureIds,
+        addComponentIds: classification.addComponentIds,
+        removeComponentIds: classification.removeComponentIds,
+        customTabs: assembled?.manifest.customTabs ?? classification.customTabs,
+        dataTables: assembled?.dbTables ?? classification.dataTables,
+        planSteps: classification.planSteps,
+        followUpSuggestions: classification.followUpSuggestions,
+        mediaPrompt:
+          classification.intent === 'generate_image' ||
+          classification.intent === 'generate_music' ||
+          classification.intent === 'generate_video'
+            ? classification.mediaPrompt
+            : undefined,
+        ...(assembled
+          ? {
+              assembledModules: assembled.steps,
+              previewHtml: assembled.html,
+            }
+          : {}),
+      });
+    } catch (err) {
+      if (err instanceof GeminiRouterError) {
+        res.status(err.status).json({ error: err.message, code: err.code });
+        return;
+      }
+      const message =
+        err instanceof Error ? err.message : 'Unable to route message through Gemini.';
+      res.status(502).json({ error: message });
+    }
+  });
+
   app.post('/api/craft/stream', async (req, res) => {
     req.setTimeout?.(0);
     res.setTimeout?.(0);
@@ -2645,60 +2794,30 @@ async function startServer() {
     const geminiClients = createGeminiClientPool();
 
     try {
-      const now = new Date();
       const timeContext = [
         clientTime ? `User local date/time: ${clientTime}` : '',
         clientTimeZone ? `User timezone: ${clientTimeZone}` : '',
-        `Server UTC date/time: ${now.toUTCString()}`,
+        `Server UTC date/time: ${new Date().toUTCString()}`,
       ]
         .filter(Boolean)
         .join(' | ');
 
-      // Always begin in normal Thinking mode — never jump straight to Building
       sendEvent({
         type: 'phase',
         phase: 'understanding',
         kind: 'chat',
-        label: 'Thinking...',
+        label: 'Routing intent & classifying modules via Gemini...',
       });
 
-      await Promise.all([
-        openRouterKey && (cachedModels.length === 0 || modelsCachedKey !== openRouterKey)
-          ? fetchOpenRouterModels(true).catch(() => [])
-          : Promise.resolve(cachedModels),
-        groqKey && cachedGroqModels.length === 0
-          ? fetchGroqCatalog(groqKey)
-              .then((list) => {
-                cachedGroqModels = list;
-                return list;
-              })
-              .catch(() => [])
-          : Promise.resolve(cachedGroqModels),
-        huggingFaceKey && cachedHfModels.length === 0
-          ? fetchHuggingFaceCatalog(huggingFaceKey)
-              .then((list) => {
-                cachedHfModels = list;
-                return list;
-              })
-              .catch(() => [])
-          : Promise.resolve(cachedHfModels),
-        ngrokKey && cachedNgrokModels.length === 0
-          ? fetchNgrokCatalog(ngrokKey)
-              .then((list) => {
-                cachedNgrokModels = list;
-                return list;
-              })
-              .catch(() => [])
-          : Promise.resolve(cachedNgrokModels),
-        cachedPollinationsModels.length === 0
-          ? fetchPollinationsCatalog()
-              .then((list) => {
-                cachedPollinationsModels = list;
-                return list;
-              })
-              .catch(() => [...POLLINATIONS_FALLBACK_MODELS])
-          : Promise.resolve(cachedPollinationsModels),
-      ]);
+      sendEvent({
+        type: 'meta',
+        kind: 'chat',
+        modelId: 'google/gemini-4-hydrogen',
+        modelName: 'Gemini Intent Router',
+        provider: 'google',
+        gateway: 'gemini',
+        isFallback: false,
+      });
 
       const executionPlan = buildGatewayExecutionPlan({
         requestedModel,
@@ -2712,1042 +2831,196 @@ async function startServer() {
             ? cachedPollinationsModels
             : POLLINATIONS_FALLBACK_MODELS,
       });
+      const requestedMediaKind = executionPlan.requestedMediaKind;
 
-      const mediaKind = executionPlan.requestedMediaKind;
+      const searchData = webSearchEnabled
+        ? await runLiveBrowserSearch(buildFocusedSearchQuery(message))
+        : { query: '', results: [], images: [] };
+      const webSearchContext = formatWebSearchContext(searchData);
 
-      const initialRoute: InitialRoute =
-        mediaKind !== null
-          ? 'chat'
-          : options.forceChat
-            ? 'chat'
-            : classifyInitialRoute(
-                message,
-                previousHtml,
-                options.attachmentName,
-                Boolean(attachmentDataUrl || attachmentText)
-              );
-
-      let webSearchContext = '';
-      if (
-        mediaKind === null &&
-        webSearchEnabled &&
-        (initialRoute !== 'chat' ||
-          shouldRunChatSearch(message, previousHtml.trim().length > 0))
-      ) {
-        const searchData = await runLiveBrowserSearch(
-          buildFocusedSearchQuery(message)
-        );
-        webSearchContext = formatWebSearchContext(searchData);
-      }
-
-      const activeFlags: string[] = [];
-      if (mode === 'web' && options.reactEnabled) activeFlags.push('React UI');
-      if (options.backendEnabled) activeFlags.push('Backend database & API');
-      if (webSearchEnabled) activeFlags.push('Live browser web search');
-      if (options.attachmentName) {
-        activeFlags.push(`Attached reference: ${options.attachmentName}`);
-      }
-      if (secretKeys.length > 0) {
-        activeFlags.push(`Project secrets keys configured: ${secretKeys.join(', ')}`);
-      }
-      if (databaseTables.length > 0) {
-        activeFlags.push(`Existing project database tables: ${databaseTables.join('; ')}`);
-      }
-
-      const projectInfraContext = buildProjectInfraContext({
-        secretHints,
-        secretKeys,
-        databaseTables,
+      // Route all incoming user messages directly through Gemini API key as intent router & module classifier
+      const classification = await routeMessageWithGemini({
+        message,
+        mode,
+        requestedMediaKind,
+        history,
+        previousHtml,
+        attachmentName: options.attachmentName ?? null,
+        attachmentDataUrl,
+        attachmentMimeType,
+        attachmentText,
+        webSearchContext,
+        timeContext,
       });
-
-      const previewSummary = extractPreviewStructureSummary(previousHtml);
 
       const shouldGenerateTitle = history.length === 0 || Boolean(options.needsTitle);
+      if (shouldGenerateTitle && classification.appTitle) {
+        sendEvent({ type: 'title', title: classification.appTitle });
+      }
 
-      const systemInstruction = buildCraftSystemPrompt({
-        mediaKind,
-        requestedModel,
-        requestedModelLabel: executionPlan.requestedModelLabel,
-        initialRoute,
-        shouldGenerateTitle,
-        timeContext,
-        projectInfraContext,
-        webSearchContext,
-        previewSummary,
-        mode,
-        activeFlags,
+      sendEvent({
+        type: 'route',
+        intent: classification.intent,
+        componentIds: classification.componentIds,
+        featureIds: classification.featureIds,
+        addComponentIds: classification.addComponentIds,
+        removeComponentIds: classification.removeComponentIds,
       });
 
-      const conversationMessages: OpenRouterChatMessage[] = history
-        .slice(-8)
-        .filter((item) => typeof item?.text === 'string' && item.text.trim().length > 0)
-        .map((item) => ({
-          role: item.role === 'user' ? 'user' : 'assistant',
-          content: item.text,
-        }));
-
-      const userTextParts: string[] = [];
-      if (previousHtml && initialRoute !== 'chat') {
-        userTextParts.push(
-          `Existing Preview app HTML (for context or surgical updates if building/editing):\n${previousHtml.slice(0, 28000)}`
-        );
-      } else if (previousHtml && initialRoute === 'chat') {
-        userTextParts.push(
-          `Current Preview app summary (user is chatting/asking a question):\n${previewSummary}`
-        );
-      }
-      if (attachmentText) {
-        userTextParts.push(
-          `Attached reference text (${options.attachmentName || 'file'}):\n${attachmentText}`
-        );
-      } else if (attachmentDataUrl) {
-        userTextParts.push(
-          `The user attached a visual screenshot (${options.attachmentName || 'screenshot.jpg'}). Inspect what is shown carefully against the Live Preview app.`
-        );
-      }
-      userTextParts.push(`User request:\n${message}`);
-      const currentUserText = userTextParts.join('\n\n');
-
-      const currentUserContent: OpenRouterMessageContent = attachmentDataUrl
-        ? [
-            { type: 'text', text: currentUserText },
-            { type: 'image_url', image_url: { url: attachmentDataUrl } },
-          ]
-        : currentUserText;
-
-      conversationMessages.push({ role: 'user', content: currentUserContent });
-
-      let fullRaw = '';
-      let headerBuffer = '';
-      let headerResolved = initialRoute !== 'auto';
-      let resolvedKind: 'chat' | 'build' =
-        initialRoute === 'build' ? 'build' : 'chat';
-      let emittedBuildPhase = false;
-      let emittedProseLength = 0;
-      let reachedHtml = false;
-      let htmlStartIndex = -1;
-      let emittedFiles: string[] = [];
-      let emittedPlanSteps: string[] = [];
-      let emittedDbSignature = '';
-      let emittedDbTables: ParsedDbTable[] = [];
-      let emittedTitle = '';
-      let lastProgressSentAt = 0;
-      let buildCreditsEmitted = 0;
-      let lastCreditEmitAt = 0;
-      let modelUsed = '';
-      let noticedReasoning = false;
-      let pausedDueToCredits = false;
-
-      const triggerCreditPause = () => {
-        if (pausedDueToCredits) return;
-        pausedDueToCredits = true;
-        if (!clientAbort.signal.aborted) {
-          clientAbort.abort();
-        }
-      };
-
-      const resetStreamParser = () => {
-        if (
-          emittedProseLength > 0 ||
-          emittedFiles.length > 0 ||
-          emittedPlanSteps.length > 0 ||
-          emittedDbTables.length > 0 ||
-          emittedBuildPhase ||
-          buildCreditsEmitted > 0
-        ) {
-          sendEvent({ type: 'reset' });
-        }
-        fullRaw = '';
-        headerBuffer = '';
-        headerResolved = initialRoute !== 'auto';
-        resolvedKind = initialRoute === 'build' ? 'build' : 'chat';
-        emittedBuildPhase = false;
-        emittedProseLength = 0;
-        reachedHtml = false;
-        htmlStartIndex = -1;
-        emittedFiles = [];
-        emittedPlanSteps = [];
-        emittedDbSignature = '';
-        emittedDbTables = [];
-        emittedTitle = '';
-        lastProgressSentAt = 0;
-        buildCreditsEmitted = 0;
-        lastCreditEmitAt = 0;
-        noticedReasoning = false;
-      };
-
-      const syncLivePlanSteps = (rawSoFar: string) => {
-        if (shouldGenerateTitle && !emittedTitle) {
-          const parsedTitle = extractSessionTitleFromRaw(rawSoFar);
-          if (parsedTitle) {
-            emittedTitle = parsedTitle;
-            sendEvent({ type: 'title', title: parsedTitle });
-          }
-        }
-
-        const steps = extractPlanStepsFromRaw(rawSoFar);
-        for (const step of steps) {
-          if (!emittedPlanSteps.includes(step)) {
-            emittedPlanSteps.push(step);
-            if (!emittedBuildPhase) {
-              sendEvent({
-                type: 'phase',
-                phase: 'understanding',
-                kind: resolvedKind,
-                label: 'Planning architecture & design...',
-              });
-            }
-            sendEvent({
-              type: 'plan',
-              step,
-              allSteps: [...emittedPlanSteps],
-            });
-          }
-        }
-
-        const dbTables = extractDbSchemaFromRaw(rawSoFar);
-        if (dbTables.length > 0) {
-          const sig = JSON.stringify(dbTables);
-          if (sig !== emittedDbSignature) {
-            emittedDbSignature = sig;
-            emittedDbTables = dbTables;
-            sendEvent({
-              type: 'schema',
-              tables: dbTables,
-            });
-          }
-        }
-      };
-
-      const promoteToBuildPhase = () => {
-        resolvedKind = 'build';
-        if (effectiveCreditBudget !== null && effectiveCreditBudget <= 0) {
-          triggerCreditPause();
-          return;
-        }
-        if (!emittedBuildPhase) {
-          emittedBuildPhase = true;
-          sendEvent({
-            type: 'phase',
-            phase: 'building',
-            kind: 'build',
-            label: 'Building live app...',
-          });
-        }
-      };
-
-      const syncLiveBuildArtifacts = (htmlSoFar: string) => {
-        const cleanHtml = htmlSoFar.split(END_MARKER)[0] ?? htmlSoFar;
-        const artifacts = extractLiveBuildArtifacts(cleanHtml);
-        let emittedNewFile = false;
-
-        for (const art of artifacts) {
-          if (!emittedFiles.includes(art.path)) {
-            emittedFiles.push(art.path);
-            emittedNewFile = true;
-            sendEvent({
-              type: 'file',
-              action: art.action,
-              path: art.path,
-              allFiles: [...emittedFiles],
-              bytesBuilt: cleanHtml.length,
-            });
-          }
-        }
-
-        const nowMs = Date.now();
-        if (!emittedNewFile && nowMs - lastProgressSentAt >= 220) {
-          lastProgressSentAt = nowMs;
-          sendEvent({
-            type: 'progress',
-            bytesBuilt: cleanHtml.length,
-          });
-        }
-
-        const targetCredits = calculateBuildCreditsForBytes(cleanHtml.length, {
-          filesCount: emittedFiles.length,
-          dbTablesCount: emittedDbTables.length,
-        });
-        const cappedTargetCredits =
-          effectiveCreditBudget !== null
-            ? Math.min(targetCredits, effectiveCreditBudget)
-            : targetCredits;
-        buildCreditsEmitted = Math.max(buildCreditsEmitted, cappedTargetCredits);
-      };
-
-      const emitCleanProseRange = (upToIndex: number) => {
-        if (upToIndex <= emittedProseLength) return;
-        const rawSlice = fullRaw.slice(emittedProseLength, upToIndex);
-        if (!rawSlice || fullRaw.slice(0, upToIndex).includes('```')) return;
-        const cleanDelta = stripTagMarkers(rawSlice)
-          .replace(/<<<[\s\S]*/g, '')
-          .replace(/```[\s\S]*/g, '')
-          .replace(/^\s*(?:PART\s*[123]\s*[:\-–]?)\s*/gim, '');
-        if (cleanDelta) {
-          sendEvent({ type: 'delta', text: cleanDelta });
-        }
-        emittedProseLength = upToIndex;
-      };
-
-      const safeProseTailEnd = (): number => {
-        const baseSafeEnd = Math.max(
-          emittedProseLength,
-          fullRaw.length - Math.max(HOLDBACK_CHARS, 72)
-        );
-        const pendingChunk = fullRaw.slice(emittedProseLength, baseSafeEnd);
-        const unclosedBracketOffset = pendingChunk.lastIndexOf('[[');
-        if (
-          unclosedBracketOffset !== -1 &&
-          !pendingChunk.slice(unclosedBracketOffset).includes(']]')
-        ) {
-          return emittedProseLength + unclosedBracketOffset;
-        }
-        return baseSafeEnd;
-      };
-
-      const processBodyChunk = (bodyChunk: string) => {
-        if (!bodyChunk) return;
-        fullRaw += bodyChunk;
-
-        if (!reachedHtml) {
-          syncLivePlanSteps(fullRaw);
-        }
-
-        if (resolvedKind === 'chat') {
-          if (initialRoute === 'chat') {
-            const trimmedStart = fullRaw.trimStart();
-            if (
-              emittedProseLength === 0 &&
-              (trimmedStart.length === 0 || trimmedStart.startsWith('['))
-            ) {
-              const titleDone = /\[\[\s*TITLE\s*:[^\]]+\]\]/i.test(fullRaw);
-              const notTag =
-                trimmedStart.length >= 2 && !trimmedStart.startsWith('[[');
-              if (titleDone || notTag || fullRaw.length > 90) {
-                emitCleanProseRange(fullRaw.length);
-              }
-              return;
-            }
-            emitCleanProseRange(fullRaw.length);
-            return;
-          }
-
-          // 'auto' tentatively resolved as chat: hold back potential markers/HTML start
-          const codeStart = findCodeStart(fullRaw);
-          if (codeStart) {
-            emitCleanProseRange(codeStart.markerIdx);
-            reachedHtml = true;
-            htmlStartIndex = codeStart.htmlOffset;
-            promoteToBuildPhase();
-            syncLiveBuildArtifacts(fullRaw.slice(htmlStartIndex));
-          } else {
-            emitCleanProseRange(safeProseTailEnd());
-          }
-          return;
-        }
-
-        if (!reachedHtml) {
-          const codeStart = findCodeStart(fullRaw);
-          if (codeStart) {
-            emitCleanProseRange(codeStart.markerIdx);
-            reachedHtml = true;
-            htmlStartIndex = codeStart.htmlOffset;
-            promoteToBuildPhase();
-            syncLiveBuildArtifacts(fullRaw.slice(htmlStartIndex));
-          } else {
-            emitCleanProseRange(safeProseTailEnd());
-          }
-        } else if (htmlStartIndex !== -1) {
-          syncLiveBuildArtifacts(fullRaw.slice(htmlStartIndex));
-        }
-      };
-
-      const handleTextChunk = (text: string) => {
-        if (!text) return;
-
-        if (!headerResolved) {
-          headerBuffer += text;
-          const cleanedHeader = stripReasoningTags(headerBuffer);
-          if (/^\s*<(?:think|thought|reasoning)\b/i.test(headerBuffer) && !cleanedHeader) {
-            return;
-          }
-          const inspectHeader = cleanedHeader || headerBuffer;
-          const intentMatch =
-            /^\s*\[\[\s*INTENT\s*:\s*(CHAT|BUILD)\s*\]\]\s*\n?/i.exec(
-              inspectHeader
-            );
-          if (intentMatch) {
-            headerResolved = true;
-            resolvedKind =
-              intentMatch[1].toUpperCase() === 'BUILD' ? 'build' : 'chat';
-            const remainder = inspectHeader.slice(intentMatch[0].length);
-            headerBuffer = '';
-            if (remainder) {
-              processBodyChunk(remainder);
-            }
-            return;
-          }
-
-          const trimmedStart = inspectHeader.trimStart();
-          const couldStillBeTag =
-            trimmedStart.length === 0 ||
-            ('[['.startsWith(trimmedStart) ||
-              (trimmedStart.startsWith('[') && inspectHeader.length < 36 && !trimmedStart.includes('\n')));
-
-          if (!couldStillBeTag) {
-            headerResolved = true;
-            resolvedKind = findCodeStart(inspectHeader) ? 'build' : 'chat';
-            headerBuffer = '';
-            processBodyChunk(inspectHeader);
-          }
-          return;
-        }
-
-        processBodyChunk(text);
-      };
-
-      const flushPendingStreamBuffer = () => {
-        if (!headerResolved && headerBuffer) {
-          headerResolved = true;
-          const cleaned = headerBuffer
-            .replace(/^\s*\[\[\s*INTENT\s*:\s*(CHAT|BUILD)\s*\]\]\s*\n?/i, (_, kind: string) => {
-              resolvedKind = kind.toUpperCase() === 'BUILD' ? 'build' : 'chat';
-              return '';
-            });
-          headerBuffer = '';
-          if (cleaned) {
-            processBodyChunk(cleaned);
-          }
-        }
-        if (
-          resolvedKind === 'chat' &&
-          emittedProseLength < fullRaw.length &&
-          !findCodeStart(fullRaw)
-        ) {
-          const tail = stripTagMarkers(fullRaw.slice(emittedProseLength)).trim();
-          if (tail) {
-            sendEvent({ type: 'delta', text: tail });
-            emittedProseLength = fullRaw.length;
-          }
-        }
-      };
-
-      let succeeded = false;
-      let lastError: Error | null = null;
-      const runtimeSelection: { candidate: GatewayExecutionCandidate | null } = {
-        candidate: null,
-      };
-      let hasAttemptedAnyEngine = false;
-
-      const failedAuthGateways = new Set<AiGatewayId>();
-
-      const runOpenAiPool = async (
-        candidates: GatewayExecutionCandidate[],
-        isFallbackPhase: boolean
-      ) => {
-        for (let i = 0; i < candidates.length; i += 1) {
-          const candidate = candidates[i];
-          if (clientAbort.signal.aborted || pausedDueToCredits) break;
-          if (failedAuthGateways.has(candidate.gateway)) continue;
-
-          const isRetryAttempt = hasAttemptedAnyEngine;
-          hasAttemptedAnyEngine = true;
-
-          try {
-            if (isRetryAttempt) {
-              resetStreamParser();
-            }
-
-            if (mediaKind === null) {
-              sendEvent({
-                type: 'meta',
-                kind: 'chat',
-                modelId: candidate.publicModelId,
-                modelName: candidate.modelName,
-                provider: candidate.provider,
-                gateway: candidate.gateway,
-                isFallback: isFallbackPhase || i > 0,
-              });
-            }
-
-            if ((isFallbackPhase || i > 0) && mediaKind === null) {
-              sendEvent({
-                type: 'phase',
-                phase: 'understanding',
-                kind: 'chat',
-                label: `Routing via ${candidate.modelName}...`,
-              });
-            }
-
-            await streamOpenRouterCompletion(
-              candidate,
-              systemInstruction,
-              conversationMessages,
-              handleTextChunk,
-              () => {
-                if (!noticedReasoning && !emittedBuildPhase) {
-                  noticedReasoning = true;
-                  sendEvent({
-                    type: 'phase',
-                    phase: 'understanding',
-                    kind: 'chat',
-                    label: 'Thinking...',
-                  });
-                }
-              },
-              clientAbort.signal
-            );
-
-            flushPendingStreamBuffer();
-
-            if (pausedDueToCredits) {
-              modelUsed = candidate.publicModelId;
-              runtimeSelection.candidate = candidate;
-              break;
-            }
-
-            if (!fullRaw.trim()) {
-              throw new Error(
-                `Model ${candidate.publicModelId} returned an empty response.`
-              );
-            }
-
-            if (resolvedKind === 'build' && mediaKind === null) {
-              const extractedHtml = extractPreviewHtmlFromRaw(fullRaw);
-              const validation = validateBuiltAppHtml(extractedHtml);
-              if (!validation.valid) {
-                throw new Error(
-                  `Model ${candidate.publicModelId} incomplete build: ${validation.reason || 'unusable HTML'}`
-                );
-              }
-            }
-
-            modelUsed = candidate.publicModelId;
-            runtimeSelection.candidate = candidate;
-            succeeded = true;
-            break;
-          } catch (err) {
-            if (pausedDueToCredits) {
-              modelUsed = candidate.publicModelId;
-              runtimeSelection.candidate = candidate;
-              break;
-            }
-            if (clientAbort.signal.aborted) break;
-            const errMsg = err instanceof Error ? err.message : String(err);
-            const isGenuineInvalidKey =
-              err instanceof GatewayApiError &&
-              (err.status === 401 || err.status === 403) &&
-              /no auth credentials|user not found|invalid api key|unauthorized|authentication failed|invalid token/i.test(
-                errMsg
-              ) &&
-              !/harness|model|endpoint/i.test(errMsg);
-
-            if (isGenuineInvalidKey) {
-              markGatewayCandidateCooldown(candidate.cooldownKey, 120_000);
-              failedAuthGateways.add(candidate.gateway);
-              const envVarName =
-                candidate.gateway === 'groq'
-                  ? 'GROQ_API_KEY'
-                  : candidate.gateway === 'huggingface'
-                    ? 'HUGGING_FACE_API_KEY'
-                    : candidate.gateway === 'ngrok'
-                      ? 'NGROK_API_KEY'
-                      : 'OPENROUTER_API_KEY';
-              lastError = new Error(
-                `${candidate.gatewayLabel} authentication failed (${errMsg}). Please check ${envVarName} in Settings > Secrets.`
-              );
-              console.warn(
-                `[${candidate.gatewayLabel}] Auth error (${err.status}): ${errMsg}`
-              );
-              continue;
-            }
-
-            if (
-              err instanceof GatewayApiError &&
-              (err.status === 429 ||
-                err.status === 402 ||
-                err.status === 503 ||
-                err.status === 502 ||
-                err.status === 504)
-            ) {
-              markGatewayCandidateCooldown(candidate.cooldownKey, 75_000);
-            }
-
-            lastError = err instanceof Error ? err : new Error(errMsg);
-            console.warn(
-              `[${candidate.gatewayLabel}] Candidate "${candidate.publicModelId}" failed: ${lastError.message}`
-            );
-          }
-        }
-      };
-
-      const runGeminiPool = async (isFallbackPhase: boolean) => {
-        if (geminiClients.length === 0) return;
-
-        const conversationContext = history
-          .slice(-6)
-          .map((item) => `${item.role === 'user' ? 'User' : 'AI Craft'}: ${item.text}`)
-          .join('\n');
-
-        const promptParts: string[] = [];
-        if (conversationContext) {
-          promptParts.push(`Conversation history:\n${conversationContext}`);
-        }
-        if (previousHtml && initialRoute !== 'chat') {
-          promptParts.push(
-            `Existing Preview app HTML (for context or surgical updates if building/editing):\n${previousHtml.slice(0, 28000)}`
-          );
-        } else if (previousHtml && initialRoute === 'chat') {
-          promptParts.push(
-            `Current Preview app summary (user is chatting/asking a question):\n${previewSummary}`
-          );
-        }
-        if (attachmentText) {
-          promptParts.push(
-            `Attached reference text (${options.attachmentName || 'file'}):\n${attachmentText}`
-          );
-        } else if (attachmentDataUrl) {
-          promptParts.push(
-            `The user attached a screenshot (${options.attachmentName || 'screenshot.jpg'}). Inspect it visually together with the Live Preview app and apply the exact edits or build requested.`
-          );
-        }
-        promptParts.push(`User request:\n${message}`);
-        const fullPrompt = promptParts.join('\n\n');
-
-        let geminiContents:
-          | string
-          | {
-              parts: Array<
-                | { inlineData: { mimeType: string; data: string } }
-                | { text: string }
-              >;
-            } = fullPrompt;
-
-        if (attachmentDataUrl) {
-          const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/i.exec(
-            attachmentDataUrl
-          );
-          if (match) {
-            geminiContents = {
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: attachmentMimeType || match[1],
-                    data: match[2],
-                  },
-                },
-                { text: fullPrompt },
-              ],
-            };
-          }
-        }
-
-        for (let gIdx = 0; gIdx < geminiClients.length; gIdx += 1) {
-          const entry = geminiClients[gIdx];
-          if (clientAbort.signal.aborted || pausedDueToCredits) break;
-
-          const isRetryAttempt = hasAttemptedAnyEngine;
-          hasAttemptedAnyEngine = true;
-
-          try {
-            if (isRetryAttempt) {
-              resetStreamParser();
-            }
-
-            if (mediaKind === null) {
-              sendEvent({
-                type: 'meta',
-                kind: 'chat',
-                modelId: 'google/gemini-4-hydrogen',
-                modelName: 'AI Craft Architect · Gemini',
-                provider: 'google',
-                gateway: 'gemini',
-                isFallback: isFallbackPhase || gIdx > 0,
-              });
-            }
-
-            const runGeminiStream = async (withSearchTool: boolean) =>
-              entry.client.models.generateContentStream({
-                model: 'gemini-4-hydrogen',
-                contents: geminiContents,
-                config: {
-                  systemInstruction,
-                  thinkingConfig: {
-                    thinkingLevel: ThinkingLevel.MEDIUM,
-                  },
-                  ...(withSearchTool ? { tools: [{ googleSearch: {} }] } : {}),
-                },
-              });
-
-            let stream;
-            try {
-              stream = await runGeminiStream(webSearchEnabled);
-            } catch (toolErr) {
-              if (webSearchEnabled) {
-                console.warn(
-                  '[Gemini] Retrying stream without googleSearch tool:',
-                  toolErr instanceof Error ? toolErr.message : String(toolErr)
-                );
-                stream = await runGeminiStream(false);
-              } else {
-                throw toolErr;
-              }
-            }
-
-            for await (const chunk of stream) {
-              if (clientAbort.signal.aborted || pausedDueToCredits) break;
-              if (chunk.text) {
-                handleTextChunk(chunk.text);
-                if (pausedDueToCredits) break;
-              }
-            }
-
-            flushPendingStreamBuffer();
-
-            if (pausedDueToCredits) {
-              modelUsed = 'google/gemini-4-hydrogen';
-              runtimeSelection.candidate = null;
-              break;
-            }
-
-            if (!fullRaw.trim()) {
-              throw new Error('Gemini returned an empty response.');
-            }
-
-            if (resolvedKind === 'build' && mediaKind === null) {
-              const extractedHtml = extractPreviewHtmlFromRaw(fullRaw);
-              const validation = validateBuiltAppHtml(extractedHtml);
-              if (!validation.valid) {
-                throw new Error(
-                  `Gemini incomplete build: ${validation.reason || 'unusable HTML'}`
-                );
-              }
-            }
-
-            modelUsed = 'google/gemini-4-hydrogen';
-            runtimeSelection.candidate = null;
-            succeeded = true;
-            break;
-          } catch (err) {
-            if (pausedDueToCredits) {
-              modelUsed = 'google/gemini-4-hydrogen';
-              runtimeSelection.candidate = null;
-              break;
-            }
-            if (clientAbort.signal.aborted) break;
-            const errMsg = err instanceof Error ? err.message : String(err);
-            if (
-              /429|quota|rate.?limit|resource_exhausted|too many requests|exceeded/i.test(
-                errMsg
-              )
-            ) {
-              markGatewayCandidateCooldown(entry.cooldownKey, 75_000);
-            } else if (/api key not valid|invalid api key|unauthorized|401|403/i.test(errMsg)) {
-              markGatewayCandidateCooldown(entry.cooldownKey, 120_000);
-            }
-            lastError = err instanceof Error ? err : new Error(errMsg);
-            console.warn(
-              `[Gemini] Key slot #${gIdx + 1} failed: ${lastError.message}`
-            );
-          }
-        }
-      };
-
-      if (executionPlan.preferGeminiFirst) {
-        await runGeminiPool(false);
-        if (!succeeded && !pausedDueToCredits && !clientAbort.signal.aborted) {
-          await runOpenAiPool(
-            executionPlan.keyedOpenAiCandidates,
-            geminiClients.length > 0
-          );
-        }
-        if (!succeeded && !pausedDueToCredits && !clientAbort.signal.aborted) {
-          await runOpenAiPool(executionPlan.pollinationsCandidates, true);
-        }
-      } else {
-        await runOpenAiPool(executionPlan.keyedOpenAiCandidates, false);
-        if (!succeeded && !pausedDueToCredits && !clientAbort.signal.aborted) {
-          await runGeminiPool(executionPlan.keyedOpenAiCandidates.length > 0);
-        }
-        if (!succeeded && !pausedDueToCredits && !clientAbort.signal.aborted) {
-          await runOpenAiPool(executionPlan.pollinationsCandidates, true);
-        }
-      }
+      const effectiveIntent =
+        requestedMediaKind !== null && classification.intent !== 'chat'
+          ? (`generate_${requestedMediaKind}` as const)
+          : options.forceChat
+            ? ('chat' as const)
+            : classification.intent;
 
       clearInterval(keepAlive);
 
-      if (clientAbort.signal.aborted && !pausedDueToCredits) {
-        res.end();
-        return;
-      }
+      if (
+        effectiveIntent === 'generate_image' ||
+        effectiveIntent === 'generate_music' ||
+        effectiveIntent === 'generate_video'
+      ) {
+        const mediaKind =
+          effectiveIntent === 'generate_music'
+            ? 'music'
+            : effectiveIntent === 'generate_video'
+              ? 'video'
+              : 'image';
 
-      if (pausedDueToCredits) {
-        const partialHtml = sanitizeAndHardenPreviewHtml(
-          finalizePartialPreviewHtml(fullRaw)
-        );
-        const codeStart = findCodeStart(fullRaw);
-        const partialProse = codeStart
-          ? sanitizeBuildProse(fullRaw.slice(0, codeStart.markerIdx))
-          : sanitizeBuildProse(fullRaw);
-        const partialFiles = partialHtml
-          ? extractLiveBuildArtifacts(partialHtml).map((a) => a.path)
-          : emittedFiles;
-        const partialDbTables = mergeParsedDbTables(
-          emittedDbTables,
-          extractDbSchemaFromRaw(fullRaw),
-          extractDbSchemaFromHtml(partialHtml)
-        );
-        if (partialDbTables.length > 0) {
-          sendEvent({ type: 'schema', tables: partialDbTables });
-        }
-
-        const creditsToConsume =
-          effectiveCreditBudget !== null
-            ? Math.max(0, effectiveCreditBudget)
-            : buildCreditsEmitted;
-        let updatedBilling = initialBillingSummary;
-        if (creditsToConsume > 0 && generationCreditContext) {
-          updatedBilling =
-            (await commitGenerationCredits(
-              generationCreditContext,
-              creditsToConsume
-            ).catch(() => null)) ?? initialBillingSummary;
-        }
-        const exhaustInfo = generationCreditContext
-          ? getCreditExhaustionInfo({
-              ...generationCreditContext.state,
-              monthlyCreditsRemaining: Math.max(
-                0,
-                updatedBilling?.monthlyCreditsRemaining ??
-                  generationCreditContext.state.monthlyCreditsRemaining - creditsToConsume
-              ),
-              dailyCreditsUsed:
-                updatedBilling?.dailyCreditsUsed ??
-                generationCreditContext.state.dailyCreditsUsed + creditsToConsume,
-            })
-          : {
-              code: 'MONTHLY_LIMIT_REACHED' as const,
-              error:
-                'Your remaining credits reached 0 during building. Building is paused with all progress saved until credits reset or you upgrade.',
-            };
-
-        const finalTitle =
-          emittedTitle ||
-          (shouldGenerateTitle
-            ? deriveServerSessionTitle(message, mode, partialHtml)
-            : undefined);
-        if (finalTitle && finalTitle !== emittedTitle) {
-          emittedTitle = finalTitle;
-          sendEvent({ type: 'title', title: finalTitle });
-        }
-
-        const finalLogo = extractLogoDirectiveFromRaw(fullRaw) ?? undefined;
-        const finalInfo = runtimeSelection.candidate
-          ? {
-              id: runtimeSelection.candidate.publicModelId,
-              name: runtimeSelection.candidate.modelName,
-              provider: runtimeSelection.candidate.provider,
-            }
-          : resolveModelInfo(modelUsed || 'openrouter/free');
         sendEvent({
-          type: 'paused',
-          reason: exhaustInfo.code,
-          message: exhaustInfo.error,
-          kind: 'build',
-          title: finalTitle,
-          logo: finalLogo,
-          fullText:
-            partialProse ||
-            'Build progress was automatically saved right when your remaining tokens ran out.',
-          previewHtml: partialHtml,
-          allFiles: partialFiles,
-          dbTables: partialDbTables,
-          bytesBuilt: partialHtml.length,
-          creditsUsed: creditsToConsume,
-          billing: updatedBilling,
-          modelUsed: finalInfo.id,
-          modelName: finalInfo.name,
-          provider: finalInfo.provider,
-          startedAt: job.startedAt,
+          type: 'phase',
+          phase: 'building',
+          kind: 'media',
+          label:
+            mediaKind === 'video'
+              ? 'Generating video...'
+              : mediaKind === 'music'
+                ? 'Composing music...'
+                : 'Generating image...',
         });
-        return;
-      }
 
-      if (!succeeded) {
-        throw lastError ?? new Error('Unable to reach AI Craft engine right now.');
-      }
+        const mediaResult: GeneratedMediaResult = await generateMediaAsset({
+          kind: mediaKind,
+          prompt: classification.mediaPrompt || message,
+          requestedModel,
+        });
 
-      // Dynamic role-aware Image / Music / Video generation (NO web link, NO HTML preview)
-      if (mediaKind !== null) {
-        const isGenerateMode =
-          /\[\[\s*MODE\s*:\s*GENERATE\s*\]\]/i.test(fullRaw) ||
-          /\[\[\s*MEDIA_PROMPT\s*:/i.test(fullRaw);
-        const mediaPromptMatch = /\[\[\s*MEDIA_PROMPT\s*:\s*([^\]]+?)\s*\]\]/i.exec(
-          fullRaw
-        );
-        const finalTitle =
-          emittedTitle ||
-          (shouldGenerateTitle
-            ? deriveServerSessionTitle(message, mode, '')
-            : undefined);
-        if (finalTitle && finalTitle !== emittedTitle) {
-          emittedTitle = finalTitle;
-          sendEvent({ type: 'title', title: finalTitle });
-        }
-
-        const cleanReplyText = stripTagMarkers(fullRaw).trim();
-
-        if (isGenerateMode) {
-          const generationPrompt = (mediaPromptMatch?.[1] || message).trim();
-          sendEvent({
-            type: 'phase',
-            phase: 'building',
-            kind: 'media',
-            label:
-              mediaKind === 'video'
-                ? 'Generating video...'
-                : mediaKind === 'music'
-                  ? 'Composing music...'
-                  : 'Generating image...',
-          });
-
-          const mediaResult: GeneratedMediaResult = await generateMediaAsset({
-            kind: mediaKind,
-            prompt: generationPrompt,
-            requestedModel,
-          });
-
-          sendEvent({
-            type: 'media',
-            media: mediaResult,
-          });
-
-          sendEvent({
-            type: 'done',
-            kind: 'media',
-            title: finalTitle,
-            fullText:
-              cleanReplyText ||
-              `Generated your ${mediaKind}: "${generationPrompt.slice(0, 120)}"`,
-            previewHtml: '',
-            allFiles: [],
-            suggestions: [],
-            dbTables: [],
-            bytesBuilt: 0,
-            creditsUsed: 0,
-            billing: initialBillingSummary,
-            media: mediaResult,
-            modelUsed: requestedModel || mediaResult.modelId,
-            modelName: executionPlan.requestedModelLabel || mediaResult.modelId,
-            provider: mediaResult.gateway,
-            startedAt: job.startedAt,
-          });
-          return;
-        }
-
-        const finalInfo = runtimeSelection.candidate
-          ? {
-              id: runtimeSelection.candidate.publicModelId,
-              name: runtimeSelection.candidate.modelName,
-              provider: runtimeSelection.candidate.provider,
-            }
-          : resolveModelInfo(modelUsed);
-
+        sendEvent({ type: 'media', media: mediaResult });
         sendEvent({
           type: 'done',
-          kind: 'chat',
-          title: finalTitle,
-          fullText: cleanReplyText,
+          kind: 'media',
+          title: shouldGenerateTitle ? classification.appTitle : undefined,
+          fullText:
+            classification.replyMessage ||
+            `Generated your ${mediaKind}: "${(classification.mediaPrompt || message).slice(0, 120)}"`,
           previewHtml: '',
           allFiles: [],
           suggestions: [],
           dbTables: [],
+          classifiedIntent: effectiveIntent,
+          classifiedModules: classification.componentIds,
+          classifiedFeatures: classification.featureIds,
           bytesBuilt: 0,
           creditsUsed: 0,
           billing: initialBillingSummary,
-          modelUsed: requestedModel || finalInfo.id,
-          modelName: executionPlan.requestedModelLabel || finalInfo.name,
-          provider: finalInfo.provider,
+          media: mediaResult,
+          modelUsed: mediaResult.modelId || 'google/gemini-4-hydrogen',
+          modelName: executionPlan.requestedModelLabel || 'Gemini Intent Router',
+          provider: mediaResult.gateway,
           startedAt: job.startedAt,
         });
         return;
       }
 
-      let finalProse = '';
-      let previewHtml = '';
-      let finalFiles: string[] = [];
-      let finalSuggestions: string[] = [];
-      let finalDbTables: ParsedDbTable[] = [];
-
-      if (resolvedKind === 'chat') {
-        finalProse = stripTagMarkers(fullRaw).trim();
-      } else {
-        const codeStart = findCodeStart(fullRaw);
-        if (codeStart) {
-          finalProse = sanitizeBuildProse(fullRaw.slice(0, codeStart.markerIdx));
-        } else {
-          finalProse = sanitizeBuildProse(fullRaw);
-        }
-
-        previewHtml = sanitizeAndHardenPreviewHtml(
-          extractPreviewHtmlFromRaw(fullRaw)
-        );
-        const parsedSuggestions = extractSuggestionsFromRaw(fullRaw);
-        finalSuggestions =
-          parsedSuggestions.length > 0
-            ? parsedSuggestions
-            : buildSmartFollowUpSuggestions(message, previewHtml, mode);
-
-        finalDbTables = mergeParsedDbTables(
-          emittedDbTables,
-          extractDbSchemaFromRaw(fullRaw),
-          extractDbSchemaFromHtml(previewHtml)
-        );
-
-        if (!finalProse && previewHtml) {
-          finalProse =
-            'Your real-time app is thoughtfully structured, styled, and ready with monetization built in. Tap Preview to try it live, or pick an upgrade below.';
-        }
-
-        if (previewHtml) {
-          finalFiles = extractLiveBuildArtifacts(previewHtml).map((a) => a.path);
-          sendEvent({
-            type: 'file',
-            action: 'Built',
-            path: finalFiles[0] || 'index.html',
-            allFiles: finalFiles,
-            bytesBuilt: previewHtml.length,
-          });
-        }
-
-        if (finalDbTables.length > 0) {
-          sendEvent({
-            type: 'schema',
-            tables: finalDbTables,
-          });
-        }
+      if (effectiveIntent === 'chat') {
+        sendEvent({ type: 'delta', text: classification.replyMessage });
+        sendEvent({
+          type: 'done',
+          kind: 'chat',
+          title: shouldGenerateTitle ? classification.appTitle : undefined,
+          fullText: classification.replyMessage,
+          previewHtml: '',
+          allFiles: [],
+          suggestions: classification.followUpSuggestions,
+          dbTables: [],
+          classifiedIntent: effectiveIntent,
+          classifiedModules: classification.componentIds,
+          classifiedFeatures: classification.featureIds,
+          bytesBuilt: 0,
+          creditsUsed: 0,
+          billing: initialBillingSummary,
+          modelUsed: classification.modelUsed,
+          modelName: 'Gemini Intent Router',
+          provider: 'google',
+          startedAt: job.startedAt,
+        });
+        return;
       }
 
-      const finalTitle =
-        emittedTitle ||
-        (shouldGenerateTitle
-          ? deriveServerSessionTitle(message, mode, previewHtml)
-          : undefined);
-      if (finalTitle && finalTitle !== emittedTitle) {
-        emittedTitle = finalTitle;
-        sendEvent({ type: 'title', title: finalTitle });
+      const emittedSteps: string[] = [];
+      for (const step of classification.planSteps) {
+        emittedSteps.push(step);
+        sendEvent({
+          type: 'plan',
+          step,
+          allSteps: [...emittedSteps],
+        });
+        await new Promise((r) => setTimeout(r, 45));
       }
 
-      const rawCreditsUsed =
-        resolvedKind === 'build' && (previewHtml.length > 0 || finalFiles.length > 0)
-          ? Math.max(
-              1,
-              calculateBuildCreditsForBytes(previewHtml.length, {
-                filesCount: finalFiles.length,
-                dbTablesCount: finalDbTables.length,
-              })
-            )
-          : 0;
+      const assembled = assembleModularInterface({
+        route: classification,
+        previousHtml,
+        mode,
+        searchData,
+      });
+
+      sendEvent({
+        type: 'route',
+        intent: effectiveIntent,
+        componentIds: assembled.manifest.componentIds,
+        featureIds: assembled.manifest.featureIds,
+        addComponentIds: classification.addComponentIds,
+        removeComponentIds: classification.removeComponentIds,
+      });
+
+      if (assembled.dbTables.length > 0) {
+        sendEvent({ type: 'schema', tables: assembled.dbTables });
+      }
+
+      sendEvent({
+        type: 'phase',
+        phase: 'building',
+        kind: 'build',
+        label: 'Assembling classified modules locally...',
+      });
+
+      const builtPaths: string[] = [];
+      const totalSteps = Math.max(1, assembled.steps.length);
+      for (let idx = 0; idx < assembled.steps.length; idx += 1) {
+        const step = assembled.steps[idx];
+        builtPaths.push(step.path);
+        const partialBytes = Math.round(
+          (assembled.html.length * (idx + 1)) / totalSteps
+        );
+        sendEvent({
+          type: 'file',
+          action: step.action,
+          path: step.path,
+          allFiles: [...builtPaths],
+          bytesBuilt: partialBytes,
+        });
+        await new Promise((r) => setTimeout(r, 55));
+      }
+
+      const rawCreditsUsed = Math.max(
+        1,
+        calculateBuildCreditsForBytes(assembled.html.length, {
+          filesCount: builtPaths.length,
+          dbTablesCount: assembled.dbTables.length,
+        })
+      );
       const finalCreditsUsed =
         effectiveCreditBudget !== null
           ? Math.min(rawCreditsUsed, effectiveCreditBudget)
@@ -3762,38 +3035,40 @@ async function startServer() {
           ).catch(() => null)) ?? initialBillingSummary;
       }
 
-      const finalLogo = extractLogoDirectiveFromRaw(fullRaw) ?? undefined;
-      const finalInfo = runtimeSelection.candidate
-        ? {
-            id: runtimeSelection.candidate.publicModelId,
-            name: runtimeSelection.candidate.modelName,
-            provider: runtimeSelection.candidate.provider,
-          }
-        : resolveModelInfo(modelUsed);
+      const suggestions =
+        classification.followUpSuggestions.length > 0
+          ? classification.followUpSuggestions
+          : buildSmartFollowUpSuggestions(message, assembled.html, mode);
+
       sendEvent({
         type: 'done',
-        kind: resolvedKind,
-        title: finalTitle,
-        logo: finalLogo,
-        fullText: finalProse,
-        previewHtml,
-        allFiles: finalFiles,
-        suggestions: finalSuggestions,
-        dbTables: finalDbTables,
-        bytesBuilt: previewHtml.length,
+        kind: 'build',
+        title: shouldGenerateTitle ? assembled.manifest.appTitle : undefined,
+        logo: assembled.logoDirective,
+        fullText: classification.replyMessage,
+        previewHtml: assembled.html,
+        allFiles: builtPaths,
+        suggestions,
+        dbTables: assembled.dbTables,
+        classifiedIntent: effectiveIntent,
+        classifiedModules: assembled.manifest.componentIds,
+        classifiedFeatures: assembled.manifest.featureIds,
+        bytesBuilt: assembled.html.length,
         creditsUsed: finalCreditsUsed,
         billing: updatedBilling,
-        modelUsed: finalInfo.id,
-        modelName: finalInfo.name,
-        provider: finalInfo.provider,
+        modelUsed: classification.modelUsed,
+        modelName: 'Gemini Intent Router',
+        provider: 'google',
         startedAt: job.startedAt,
       });
     } catch (err) {
       clearInterval(keepAlive);
       const errorMessage =
-        err instanceof Error
+        err instanceof GeminiRouterError
           ? err.message
-          : 'Unable to reach AI Craft engine right now.';
+          : err instanceof Error
+            ? err.message
+            : 'Unable to reach Gemini router right now.';
       sendEvent({
         type: 'error',
         message: errorMessage,

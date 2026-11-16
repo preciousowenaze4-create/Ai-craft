@@ -167,6 +167,9 @@ export interface BuilderTurn {
   activeFile: string;
   files: string[];
   planSteps?: string[];
+  classifiedIntent?: string;
+  classifiedModules?: string[];
+  classifiedFeatures?: string[];
   suggestions?: string[];
   aiText: string;
   modelId?: string;
