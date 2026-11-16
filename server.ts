@@ -88,6 +88,14 @@ import {
   resolveFreeModelInfo,
   type NormalizedOpenRouterModel,
 } from './api/_openrouterModels.js';
+import {
+  ModerationActionType,
+  applyOwnerModerationAction,
+  checkExpressUserModeration,
+  listAllRealSignedInUsers,
+  recordSignedInUser,
+  resolveUserWithModeration,
+} from './api/_moderation.js';
 
 const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -1755,10 +1763,24 @@ async function startServer() {
       if (accessToken) {
         const { data, error } = await supabase.auth.getUser(accessToken);
         if (!error && data.user) {
+          await recordSignedInUser(data.user);
+          const resolved = await resolveUserWithModeration(data.user);
+          if (resolved?.flags.banned) {
+            clearAuthCookies(res);
+            res.status(403).json({
+              configured: true,
+              authenticated: false,
+              banned: true,
+              code: 'ACCOUNT_BANNED',
+              user: null,
+              error: 'This account has been suspended by the app owner.',
+            });
+            return;
+          }
           res.json({
             configured: true,
             authenticated: true,
-            user: serializeSupabaseUser(data.user),
+            user: resolved?.serialized ?? serializeSupabaseUser(data.user),
             accessToken,
             refreshToken: refreshToken || undefined,
           });
@@ -1771,6 +1793,20 @@ async function startServer() {
           refresh_token: refreshToken,
         });
         if (!error && data.session && data.user) {
+          await recordSignedInUser(data.user);
+          const resolved = await resolveUserWithModeration(data.user);
+          if (resolved?.flags.banned) {
+            clearAuthCookies(res);
+            res.status(403).json({
+              configured: true,
+              authenticated: false,
+              banned: true,
+              code: 'ACCOUNT_BANNED',
+              user: null,
+              error: 'This account has been suspended by the app owner.',
+            });
+            return;
+          }
           setAuthCookies(
             res,
             data.session.access_token,
@@ -1779,7 +1815,7 @@ async function startServer() {
           res.json({
             configured: true,
             authenticated: true,
-            user: serializeSupabaseUser(data.user),
+            user: resolved?.serialized ?? serializeSupabaseUser(data.user),
             accessToken: data.session.access_token,
             refreshToken: data.session.refresh_token,
           });
@@ -1854,6 +1890,18 @@ async function startServer() {
       }
 
       if (data.session?.access_token) {
+        await recordSignedInUser(data.user);
+        const resolved = await resolveUserWithModeration(data.user);
+        if (resolved?.flags.banned) {
+          clearAuthCookies(res);
+          res.status(403).json({
+            authenticated: false,
+            banned: true,
+            code: 'ACCOUNT_BANNED',
+            error: 'This account has been suspended by the app owner.',
+          });
+          return;
+        }
         setAuthCookies(
           res,
           data.session.access_token,
@@ -1862,17 +1910,21 @@ async function startServer() {
         res.json({
           authenticated: true,
           needsEmailConfirmation: false,
-          user: serializeSupabaseUser(data.user),
+          user: resolved?.serialized ?? serializeSupabaseUser(data.user),
           accessToken: data.session.access_token,
           refreshToken: data.session.refresh_token,
         });
         return;
       }
 
+      if (data.user) {
+        await recordSignedInUser(data.user);
+      }
+      const resolvedPending = await resolveUserWithModeration(data.user);
       res.json({
         authenticated: false,
         needsEmailConfirmation: true,
-        user: serializeSupabaseUser(data.user),
+        user: resolvedPending?.serialized ?? serializeSupabaseUser(data.user),
         message: 'Check your email to confirm your account, then sign in.',
       });
     } catch (err) {
@@ -1919,10 +1971,23 @@ async function startServer() {
         return;
       }
 
+      await recordSignedInUser(data.user);
+      const resolved = await resolveUserWithModeration(data.user);
+      if (resolved?.flags.banned) {
+        clearAuthCookies(res);
+        res.status(403).json({
+          authenticated: false,
+          banned: true,
+          code: 'ACCOUNT_BANNED',
+          error: 'This account has been suspended by the app owner.',
+        });
+        return;
+      }
+
       setAuthCookies(res, data.session.access_token, data.session.refresh_token);
       res.json({
         authenticated: true,
-        user: serializeSupabaseUser(data.user),
+        user: resolved?.serialized ?? serializeSupabaseUser(data.user),
         accessToken: data.session.access_token,
         refreshToken: data.session.refresh_token,
       });
@@ -2026,10 +2091,23 @@ async function startServer() {
         return;
       }
 
+      await recordSignedInUser(data.user);
+      const resolved = await resolveUserWithModeration(data.user);
+      if (resolved?.flags.banned) {
+        clearAuthCookies(res);
+        res.status(403).json({
+          authenticated: false,
+          banned: true,
+          code: 'ACCOUNT_BANNED',
+          error: 'This account has been suspended by the app owner.',
+        });
+        return;
+      }
+
       setAuthCookies(res, accessToken, refreshToken);
       res.json({
         ok: true,
-        user: serializeSupabaseUser(data.user),
+        user: resolved?.serialized ?? serializeSupabaseUser(data.user),
         accessToken,
         refreshToken,
       });
@@ -2128,10 +2206,23 @@ async function startServer() {
         return;
       }
 
+      await recordSignedInUser(data.user);
+      const resolved = await resolveUserWithModeration(data.user);
+      if (resolved?.flags.banned) {
+        clearAuthCookies(res);
+        res.status(403).json({
+          authenticated: false,
+          banned: true,
+          code: 'ACCOUNT_BANNED',
+          error: 'This account has been suspended by the app owner.',
+        });
+        return;
+      }
+
       setAuthCookies(res, accessToken, refreshToken || null);
       res.json({
         authenticated: true,
-        user: serializeSupabaseUser(data.user),
+        user: resolved?.serialized ?? serializeSupabaseUser(data.user),
         accessToken,
         refreshToken: refreshToken || undefined,
       });
@@ -2141,6 +2232,86 @@ async function startServer() {
           err instanceof Error ? err.message : 'Failed to verify session.',
       });
     }
+  });
+
+  app.get('/api/admin', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const auth = await checkExpressUserModeration({
+      cookieHeader: req.headers.cookie,
+      authorizationHeader: req.headers.authorization,
+      refreshTokenHeader:
+        typeof req.headers['x-refresh-token'] === 'string'
+          ? req.headers['x-refresh-token']
+          : undefined,
+    });
+    if (!auth.user) {
+      res.status(401).json({ error: 'Authentication required.' });
+      return;
+    }
+    if (!auth.isOwner) {
+      res.status(403).json({ error: 'Forbidden.' });
+      return;
+    }
+    const users = await listAllRealSignedInUsers();
+    res.json({ ok: true, users });
+  });
+
+  app.post('/api/admin', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const auth = await checkExpressUserModeration({
+      cookieHeader: req.headers.cookie,
+      authorizationHeader: req.headers.authorization,
+      refreshTokenHeader:
+        typeof req.headers['x-refresh-token'] === 'string'
+          ? req.headers['x-refresh-token']
+          : undefined,
+    });
+    if (!auth.user) {
+      res.status(401).json({ error: 'Authentication required.' });
+      return;
+    }
+    if (!auth.isOwner) {
+      res.status(403).json({ error: 'Forbidden.' });
+      return;
+    }
+
+    const body = (req.body || {}) as {
+      userId?: string;
+      email?: string;
+      action?: string;
+      reason?: string;
+    };
+    const validActions: ModerationActionType[] = [
+      'ban',
+      'unban',
+      'verify',
+      'unverify',
+      'restrict',
+      'unrestrict',
+    ];
+    const action =
+      typeof body.action === 'string'
+        ? (body.action.trim().toLowerCase() as ModerationActionType)
+        : ('' as ModerationActionType);
+
+    if (!validActions.includes(action)) {
+      res.status(400).json({ error: 'Invalid moderation action.' });
+      return;
+    }
+
+    const result = await applyOwnerModerationAction({
+      actorEmail: auth.user.email || '',
+      targetUserId: body.userId,
+      targetEmail: body.email,
+      action,
+      reason: body.reason,
+    });
+
+    if (result.ok === false) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({ ok: true, user: result.user });
   });
 
   app.post('/api/auth/logout', async (req, res) => {
@@ -2727,6 +2898,29 @@ async function startServer() {
         ? await getAuthenticatedSupabaseUser(accessToken, refreshToken).catch(() => ({ user: null }))
         : { user: null };
 
+    if (auth.user) {
+      const resolved = await resolveUserWithModeration(auth.user);
+      if (resolved?.flags.banned) {
+        clearAuthCookies(res);
+        res.status(403).json({
+          ok: false,
+          error: 'This account has been suspended by the app owner.',
+          code: 'ACCOUNT_BANNED',
+          banned: true,
+        });
+        return;
+      }
+      if (resolved?.flags.restricted) {
+        res.status(403).json({
+          ok: false,
+          error: 'Your account is currently restricted from publishing apps.',
+          code: 'ACCOUNT_RESTRICTED',
+          restricted: true,
+        });
+        return;
+      }
+    }
+
     const slug = sanitizeAppId(body.slug || body.title || projectId);
     let targetAppId = sanitizeAppId(body.appId || slug);
     const existing = await loadPublishedApp(targetAppId);
@@ -2988,6 +3182,31 @@ async function startServer() {
   app.post('/api/media', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     try {
+      const modCheck = await checkExpressUserModeration({
+        cookieHeader: req.headers.cookie,
+        authorizationHeader: req.headers.authorization,
+        refreshTokenHeader:
+          typeof req.headers['x-refresh-token'] === 'string'
+            ? req.headers['x-refresh-token']
+            : undefined,
+      });
+      if (modCheck.flags?.banned) {
+        clearAuthCookies(res);
+        res.status(403).json({
+          error: 'This account has been suspended by the app owner.',
+          code: 'ACCOUNT_BANNED',
+          banned: true,
+        });
+        return;
+      }
+      if (modCheck.flags?.restricted) {
+        res.status(403).json({
+          error: 'Your account is currently restricted from generating media.',
+          code: 'ACCOUNT_RESTRICTED',
+          restricted: true,
+        });
+        return;
+      }
       const body = req.body as {
         kind?: string;
         prompt?: string;
@@ -3132,6 +3351,24 @@ async function startServer() {
       if (accessToken || refreshToken) {
         const auth = await getAuthenticatedSupabaseUser(accessToken, refreshToken);
         if (auth.user) {
+          const resolvedMod = await resolveUserWithModeration(auth.user);
+          if (resolvedMod?.flags.banned) {
+            clearAuthCookies(res);
+            res.status(403).json({
+              error: 'This account has been suspended by the app owner.',
+              code: 'ACCOUNT_BANNED',
+              banned: true,
+            });
+            return;
+          }
+          if (resolvedMod?.flags.restricted) {
+            res.status(403).json({
+              error: 'Your account is currently restricted from building or chatting.',
+              code: 'ACCOUNT_RESTRICTED',
+              restricted: true,
+            });
+            return;
+          }
           const currentBilling = await reconcileAndLoadBillingState({
             user: auth.user,
             accessToken: auth.accessToken,

@@ -34,6 +34,11 @@ export interface AuthUser {
   name: string;
   avatarUrl: string | null;
   provider: string;
+  isOwner?: boolean;
+  verified?: boolean;
+  banned?: boolean;
+  restricted?: boolean;
+  banReason?: string;
 }
 
 export type SubscriptionTier = 'free' | 'starter' | 'plus' | 'studio' | 'annual';

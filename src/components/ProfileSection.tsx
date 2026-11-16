@@ -1,5 +1,6 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
+  BadgeCheck,
   Bell,
   Check,
   Crown,
@@ -9,23 +10,30 @@ import {
   Pencil,
   ReceiptText,
   RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
   Smartphone,
   Sparkles,
   Trash2,
   Volume2,
 } from 'lucide-react';
 import {
+  AuthUser,
   BillingSummary,
   BuildMode,
   MODE_THEMES,
   PaymentTransaction,
   UserProfile,
 } from '../types/craft';
+import { OwnerAdminPanel } from './OwnerAdminPanel';
 import { PRO_PLANS } from './ProUpgradeModal';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface ProfileSectionProps {
   profile: UserProfile;
+  authUser?: AuthUser | null;
+  authHeaders?: Record<string, string>;
+  initialTab?: 'account' | 'transactions' | 'admin';
   credits: number;
   proPlanId: string | null;
   billing: BillingSummary | null;
@@ -118,6 +126,9 @@ function formatResetDate(iso: string | undefined | null): string {
 
 export function ProfileSection({
   profile,
+  authUser,
+  authHeaders = {},
+  initialTab,
   credits,
   proPlanId,
   billing,
@@ -141,8 +152,25 @@ export function ProfileSection({
 }: ProfileSectionProps) {
   const theme = MODE_THEMES[mode];
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const isOwner = Boolean(authUser?.isOwner);
 
-  const [profileTab, setProfileTab] = useState<'account' | 'transactions'>('account');
+  const [profileTab, setProfileTab] = useState<'account' | 'transactions' | 'admin'>(() =>
+    initialTab === 'admin' && isOwner
+      ? 'admin'
+      : initialTab === 'transactions'
+        ? 'transactions'
+        : 'account'
+  );
+  useEffect(() => {
+    if (initialTab === 'admin' && isOwner) {
+      setProfileTab('admin');
+    } else if (initialTab === 'transactions') {
+      setProfileTab('transactions');
+    } else if (initialTab === 'account') {
+      setProfileTab('account');
+    }
+  }, [initialTab, isOwner]);
+
   const [editingIdentity, setEditingIdentity] = useState(false);
   const [draftName, setDraftName] = useState(profile.name);
   const [draftEmail, setDraftEmail] = useState(profile.email);
@@ -217,7 +245,7 @@ export function ProfileSection({
         <div
           role="tablist"
           aria-label="Profile sections"
-          className="grid grid-cols-2 gap-1 rounded-[11px] bg-[#F2F2F5] p-0.5 border border-black/[0.05]"
+          className={`grid ${isOwner ? 'grid-cols-3' : 'grid-cols-2'} gap-1 rounded-[11px] bg-[#F2F2F5] p-0.5 border border-black/[0.05]`}
         >
           <button
             type="button"
@@ -253,6 +281,22 @@ export function ProfileSection({
               </span>
             )}
           </button>
+          {isOwner && (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={profileTab === 'admin'}
+              onClick={() => setProfileTab('admin')}
+              className={`h-7 rounded-[9px] text-[12px] font-display font-semibold flex items-center justify-center gap-1 transition-all ${
+                profileTab === 'admin'
+                  ? 'bg-[#0B0B0F] text-white shadow-[0_1px_4px_rgba(15,15,30,0.14)]'
+                  : 'text-[#0B0B0F]/75 hover:text-[#0B0B0F]'
+              }`}
+            >
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>Admin</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -294,10 +338,27 @@ export function ProfileSection({
               </div>
 
               <div className="mt-2 w-full min-w-0 flex flex-col items-center">
-                <div className="flex items-center justify-center gap-1.5 max-w-full">
+                <div className="flex items-center justify-center gap-1.5 max-w-full flex-wrap">
                   <p className="font-display font-bold text-[13.5px] text-[#0B0B0F] truncate leading-tight">
                     {profile.name}
                   </p>
+                  {authUser?.verified && (
+                    <BadgeCheck
+                      aria-label="Verified account"
+                      className="w-4 h-4 text-[#0D5BFF] shrink-0"
+                    />
+                  )}
+                  {isOwner && (
+                    <span className="px-1.5 py-[0.5px] rounded-full bg-[#0B0B0F] text-white text-[9.5px] font-semibold shrink-0">
+                      Owner
+                    </span>
+                  )}
+                  {authUser?.restricted && (
+                    <span className="px-1.5 py-[0.5px] rounded-full bg-amber-100 text-amber-800 text-[9.5px] font-semibold inline-flex items-center gap-0.5 shrink-0">
+                      <ShieldAlert className="w-2.5 h-2.5" />
+                      Restricted
+                    </span>
+                  )}
                   <span className="text-[11px] font-semibold text-[#0D5BFF] shrink-0">
                     · {activePlanName}
                   </span>
@@ -582,6 +643,8 @@ export function ProfileSection({
           {/* Compact Home-Screen Install Card */}
           <PWAInstallButton variant="card" />
         </div>
+      ) : profileTab === 'admin' && isOwner ? (
+        <OwnerAdminPanel authHeaders={authHeaders} currentUserId={authUser?.id} />
       ) : (
         /* TRANSACTIONS TAB */
         <div className="flex-1 min-h-0 flex flex-col gap-2 overflow-hidden">

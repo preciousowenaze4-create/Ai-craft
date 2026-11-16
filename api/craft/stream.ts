@@ -11,6 +11,8 @@ import {
   getCreditExhaustionInfo,
   verifyUserCanGenerate,
 } from '../_billing.js';
+import { authenticateRequestForModeration } from '../_moderation.js';
+import { appendClearAuthCookies } from '../_supabaseAuth.js';
 import {
   buildCandidateCooldownKey,
   buildGatewayExecutionPlan,
@@ -1304,6 +1306,30 @@ export async function POST(request: Request): Promise<Response> {
 
   if (!message) {
     return Response.json({ error: 'Prompt message is required.' }, { status: 400 });
+  }
+
+  const modCheck = await authenticateRequestForModeration(request);
+  if (modCheck.flags?.banned) {
+    const headers = new Headers();
+    appendClearAuthCookies(headers);
+    return Response.json(
+      {
+        error: 'This account has been suspended by the app owner.',
+        code: 'ACCOUNT_BANNED',
+        banned: true,
+      },
+      { status: 403, headers }
+    );
+  }
+  if (modCheck.flags?.restricted) {
+    return Response.json(
+      {
+        error: 'Your account is currently restricted from building or chatting.',
+        code: 'ACCOUNT_RESTRICTED',
+        restricted: true,
+      },
+      { status: 403 }
+    );
   }
 
   const creditCheck = await verifyUserCanGenerate(request);

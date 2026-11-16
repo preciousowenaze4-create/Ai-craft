@@ -27,6 +27,7 @@ interface AuthScreenProps {
   initialView?: AuthViewMode;
   recoveryTokens?: StoredSupabaseSession | null;
   onAuthenticated: (user: AuthUser, session: StoredSupabaseSession) => void;
+  onBanned?: (message?: string) => void;
 }
 
 const CODE_GLYPHS = [
@@ -109,6 +110,7 @@ export function AuthScreen({
   initialView = 'welcome',
   recoveryTokens = null,
   onAuthenticated,
+  onBanned,
 }: AuthScreenProps) {
   const [view, setView] = useState<AuthViewMode>(initialView);
   const [email, setEmail] = useState('');
@@ -217,7 +219,12 @@ export function AuthScreen({
       } else if (data.type === 'OAUTH_AUTH_ERROR') {
         stopPopupPolling();
         setLoadingProvider(null);
-        setErrorMessage(data.message || 'Sign-in was canceled or failed.');
+        const msg = data.message || 'Sign-in was canceled or failed.';
+        if (/banned|suspended/i.test(msg)) {
+          onBanned?.(msg);
+          return;
+        }
+        setErrorMessage(msg);
       } else if (data.type === 'SUPABASE_AUTH_RECOVERY' && data.accessToken) {
         stopPopupPolling();
         setLoadingProvider(null);
@@ -230,7 +237,7 @@ export function AuthScreen({
       window.removeEventListener('message', handleMessage);
       stopPopupPolling();
     };
-  }, [onAuthenticated]);
+  }, [onAuthenticated, onBanned]);
 
   const switchView = (next: AuthViewMode) => {
     setErrorMessage(null);
@@ -410,11 +417,18 @@ export function AuthScreen({
       });
       const data = await safeParseJson<{
         authenticated?: boolean;
+        banned?: boolean;
+        code?: string;
         user?: AuthUser;
         accessToken?: string;
         refreshToken?: string;
         error?: string;
       }>(response);
+
+      if (data?.banned || data?.code === 'ACCOUNT_BANNED') {
+        onBanned?.(data.error);
+        return;
+      }
 
       if (!response.ok || !data?.authenticated || !data.user || !data.accessToken) {
         setErrorMessage(data?.error || 'Invalid email or password.');

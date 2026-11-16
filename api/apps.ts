@@ -16,6 +16,8 @@ import {
   extractAuthTokensFromRequest,
   getAuthenticatedSupabaseUser,
 } from './_billing.js';
+import { resolveUserWithModeration } from './_moderation.js';
+import { appendClearAuthCookies } from './_supabaseAuth.js';
 
 function parseAppRequest(request: Request): { rawId: string; asset: string } {
   const reqUrl = new URL(request.url);
@@ -194,6 +196,34 @@ export async function POST(request: Request): Promise<Response> {
           user: null,
         }))
       : { user: null };
+
+  if (auth.user) {
+    const resolved = await resolveUserWithModeration(auth.user);
+    if (resolved?.flags.banned) {
+      const headers = new Headers();
+      appendClearAuthCookies(headers);
+      return Response.json(
+        {
+          ok: false,
+          error: 'This account has been suspended by the app owner.',
+          code: 'ACCOUNT_BANNED',
+          banned: true,
+        },
+        { status: 403, headers }
+      );
+    }
+    if (resolved?.flags.restricted) {
+      return Response.json(
+        {
+          ok: false,
+          error: 'Your account is currently restricted from publishing apps.',
+          code: 'ACCOUNT_RESTRICTED',
+          restricted: true,
+        },
+        { status: 403 }
+      );
+    }
+  }
 
   const slug = sanitizeAppId(body.slug || body.title || projectId);
   let targetAppId = sanitizeAppId(body.appId || slug);

@@ -1,4 +1,4 @@
-import { Plus } from 'lucide-react';
+import { Plus, ShieldCheck } from 'lucide-react';
 import { BuildMode, MODE_THEMES } from '../types/craft';
 import { PWAInstallButton } from './PWAInstallButton';
 
@@ -6,9 +6,11 @@ interface TopBarProps {
   mode: BuildMode;
   credits: number;
   avatarDataUrl?: string | null;
+  isOwner?: boolean;
   onScanClick: () => void;
   onCreditsClick: () => void;
   onAvatarClick: () => void;
+  onAdminClick?: () => void;
   onOpenInstallGuide?: () => void;
 }
 
@@ -16,9 +18,11 @@ export function TopBar({
   mode,
   credits,
   avatarDataUrl,
+  isOwner,
   onScanClick,
   onCreditsClick,
   onAvatarClick,
+  onAdminClick,
   onOpenInstallGuide,
 }: TopBarProps) {
   const theme = MODE_THEMES[mode];
@@ -57,6 +61,18 @@ export function TopBar({
             variant="compact"
             onOpenInstallGuide={onOpenInstallGuide}
           />
+
+          {isOwner && onAdminClick && (
+            <button
+              type="button"
+              onClick={onAdminClick}
+              aria-label="Open Owner Admin"
+              className="h-8 px-2.5 rounded-full bg-[#0B0B0F] text-white text-[11px] font-semibold inline-flex items-center gap-1 shadow-xs hover:bg-black/85 active:scale-95 transition-all shrink-0"
+            >
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>Admin</span>
+            </button>
+          )}
         </div>
 
         {/* Right: Credits Pill & Profile Avatar */}

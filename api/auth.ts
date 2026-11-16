@@ -9,6 +9,10 @@ import {
   parseCookies,
   serializeSupabaseUser,
 } from './_supabaseAuth.js';
+import {
+  recordSignedInUser,
+  resolveUserWithModeration,
+} from './_moderation.js';
 
 function getAuthSubroute(request: Request): string {
   const reqUrl = new URL(request.url);
@@ -67,11 +71,28 @@ async function handleMe(request: Request): Promise<Response> {
     if (accessToken) {
       const { data, error } = await supabase.auth.getUser(accessToken);
       if (!error && data.user) {
+        await recordSignedInUser(data.user);
+        const resolved = await resolveUserWithModeration(data.user);
+        if (resolved?.flags.banned) {
+          const headers = new Headers({ 'Cache-Control': 'no-store' });
+          appendClearAuthCookies(headers);
+          return Response.json(
+            {
+              configured: true,
+              authenticated: false,
+              banned: true,
+              code: 'ACCOUNT_BANNED',
+              user: null,
+              error: 'This account has been suspended by the app owner.',
+            },
+            { status: 403, headers }
+          );
+        }
         return Response.json(
           {
             configured: true,
             authenticated: true,
-            user: serializeSupabaseUser(data.user),
+            user: resolved?.serialized ?? serializeSupabaseUser(data.user),
             accessToken,
             refreshToken: refreshToken || undefined,
           },
@@ -85,6 +106,23 @@ async function handleMe(request: Request): Promise<Response> {
         refresh_token: refreshToken,
       });
       if (!error && data.session && data.user) {
+        await recordSignedInUser(data.user);
+        const resolved = await resolveUserWithModeration(data.user);
+        if (resolved?.flags.banned) {
+          const headers = new Headers({ 'Cache-Control': 'no-store' });
+          appendClearAuthCookies(headers);
+          return Response.json(
+            {
+              configured: true,
+              authenticated: false,
+              banned: true,
+              code: 'ACCOUNT_BANNED',
+              user: null,
+              error: 'This account has been suspended by the app owner.',
+            },
+            { status: 403, headers }
+          );
+        }
         const headers = new Headers({ 'Cache-Control': 'no-store' });
         appendAuthCookies(
           headers,
@@ -95,7 +133,7 @@ async function handleMe(request: Request): Promise<Response> {
           {
             configured: true,
             authenticated: true,
-            user: serializeSupabaseUser(data.user),
+            user: resolved?.serialized ?? serializeSupabaseUser(data.user),
             accessToken: data.session.access_token,
             refreshToken: data.session.refresh_token,
           },
@@ -412,6 +450,21 @@ async function handleSignup(request: Request): Promise<Response> {
     }
 
     if (data.session?.access_token) {
+      await recordSignedInUser(data.user);
+      const resolved = await resolveUserWithModeration(data.user);
+      if (resolved?.flags.banned) {
+        const headers = new Headers();
+        appendClearAuthCookies(headers);
+        return Response.json(
+          {
+            authenticated: false,
+            banned: true,
+            code: 'ACCOUNT_BANNED',
+            error: 'This account has been suspended by the app owner.',
+          },
+          { status: 403, headers }
+        );
+      }
       const headers = new Headers();
       appendAuthCookies(
         headers,
@@ -422,7 +475,7 @@ async function handleSignup(request: Request): Promise<Response> {
         {
           authenticated: true,
           needsEmailConfirmation: false,
-          user: serializeSupabaseUser(data.user),
+          user: resolved?.serialized ?? serializeSupabaseUser(data.user),
           accessToken: data.session.access_token,
           refreshToken: data.session.refresh_token,
         },
@@ -430,10 +483,14 @@ async function handleSignup(request: Request): Promise<Response> {
       );
     }
 
+    if (data.user) {
+      await recordSignedInUser(data.user);
+    }
+    const resolvedPending = await resolveUserWithModeration(data.user);
     return Response.json({
       authenticated: false,
       needsEmailConfirmation: true,
-      user: serializeSupabaseUser(data.user),
+      user: resolvedPending?.serialized ?? serializeSupabaseUser(data.user),
       message: 'Check your email to confirm your account, then sign in.',
     });
   } catch (err) {
@@ -488,6 +545,22 @@ async function handleLogin(request: Request): Promise<Response> {
       );
     }
 
+    await recordSignedInUser(data.user);
+    const resolved = await resolveUserWithModeration(data.user);
+    if (resolved?.flags.banned) {
+      const headers = new Headers();
+      appendClearAuthCookies(headers);
+      return Response.json(
+        {
+          authenticated: false,
+          banned: true,
+          code: 'ACCOUNT_BANNED',
+          error: 'This account has been suspended by the app owner.',
+        },
+        { status: 403, headers }
+      );
+    }
+
     const headers = new Headers();
     appendAuthCookies(
       headers,
@@ -497,7 +570,7 @@ async function handleLogin(request: Request): Promise<Response> {
     return Response.json(
       {
         authenticated: true,
-        user: serializeSupabaseUser(data.user),
+        user: resolved?.serialized ?? serializeSupabaseUser(data.user),
         accessToken: data.session.access_token,
         refreshToken: data.session.refresh_token,
       },
@@ -618,12 +691,28 @@ async function handleUpdatePassword(request: Request): Promise<Response> {
       );
     }
 
+    await recordSignedInUser(data.user);
+    const resolved = await resolveUserWithModeration(data.user);
+    if (resolved?.flags.banned) {
+      const headers = new Headers();
+      appendClearAuthCookies(headers);
+      return Response.json(
+        {
+          authenticated: false,
+          banned: true,
+          code: 'ACCOUNT_BANNED',
+          error: 'This account has been suspended by the app owner.',
+        },
+        { status: 403, headers }
+      );
+    }
+
     const headers = new Headers();
     appendAuthCookies(headers, accessToken, refreshToken);
     return Response.json(
       {
         ok: true,
-        user: serializeSupabaseUser(data.user),
+        user: resolved?.serialized ?? serializeSupabaseUser(data.user),
         accessToken,
         refreshToken,
       },
@@ -673,12 +762,28 @@ async function handleSession(request: Request): Promise<Response> {
       );
     }
 
+    await recordSignedInUser(data.user);
+    const resolved = await resolveUserWithModeration(data.user);
+    if (resolved?.flags.banned) {
+      const headers = new Headers();
+      appendClearAuthCookies(headers);
+      return Response.json(
+        {
+          authenticated: false,
+          banned: true,
+          code: 'ACCOUNT_BANNED',
+          error: 'This account has been suspended by the app owner.',
+        },
+        { status: 403, headers }
+      );
+    }
+
     const headers = new Headers();
     appendAuthCookies(headers, accessToken, refreshToken || null);
     return Response.json(
       {
         authenticated: true,
-        user: serializeSupabaseUser(data.user),
+        user: resolved?.serialized ?? serializeSupabaseUser(data.user),
         accessToken,
         refreshToken: refreshToken || undefined,
       },

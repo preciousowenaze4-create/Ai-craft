@@ -8,6 +8,7 @@ import {
   STORAGE_SB_SESSION_KEY,
   StoredSupabaseSession,
 } from './components/AuthScreen';
+import { BannedOverlay } from './components/BannedOverlay';
 import { BottomNav } from './components/BottomNav';
 import { BuilderWorkspace } from './components/BuilderWorkspace';
 import { Head3DOverlay } from './components/Head3DOverlay';
@@ -254,11 +255,11 @@ function loadSavedProfile(): UserProfile {
           name:
             typeof parsed.name === 'string' && parsed.name.trim()
               ? parsed.name.trim()
-              : 'Precious Owenaze',
+              : 'AI Craft User',
           email:
             typeof parsed.email === 'string' && parsed.email.trim()
               ? parsed.email.trim()
-              : 'preciousowenaze4@gmail.com',
+              : '',
           avatarDataUrl:
             typeof parsed.avatarDataUrl === 'string' ? parsed.avatarDataUrl : null,
         };
@@ -268,8 +269,8 @@ function loadSavedProfile(): UserProfile {
     // ignore storage read error
   }
   return {
-    name: 'Precious Owenaze',
-    email: 'preciousowenaze4@gmail.com',
+    name: 'AI Craft User',
+    email: '',
     avatarDataUrl: null,
   };
 }
@@ -366,6 +367,28 @@ export default function App() {
     return null;
   });
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [bannedNotice, setBannedNotice] = useState<string | null>(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const authError = params.get('auth_error') || '';
+      if (/suspended|banned/i.test(authError)) {
+        params.delete('auth_error');
+        const nextSearch = params.toString();
+        window.history.replaceState(
+          {},
+          '',
+          nextSearch ? `${window.location.pathname}?${nextSearch}` : window.location.pathname
+        );
+        return authError;
+      }
+    } catch {
+      // ignore URL check error
+    }
+    return null;
+  });
+  const [profileInitialTab, setProfileInitialTab] = useState<
+    'account' | 'transactions' | 'admin' | undefined
+  >(undefined);
   const [authChecking, setAuthChecking] = useState<boolean>(() =>
     Boolean(loadStoredJson<StoredSupabaseSession>(STORAGE_SB_SESSION_KEY))
   );
@@ -533,6 +556,25 @@ export default function App() {
     projects.find((p) => p.id === activeProjectId) ?? null;
   const activeProjectIsStreaming = isProjectWorking(activeProject);
 
+  const triggerBannedLockout = useCallback((message?: string) => {
+    activeConnectionsRef.current.forEach((ctrl) => ctrl.abort());
+    activeConnectionsRef.current.clear();
+    try {
+      window.localStorage.removeItem(STORAGE_SB_SESSION_KEY);
+    } catch {
+      // ignore storage error
+    }
+    cloudHydratedUserRef.current = null;
+    setShowProUpgrade(false);
+    setViewMode('home');
+    setAuthUser(null);
+    setAuthChecking(false);
+    setBannedNotice(
+      message ||
+        'Your account has been suspended by the app owner and cannot access AI Craft right now.'
+    );
+  }, []);
+
   // Verify any existing Supabase session via backend on startup
   useEffect(() => {
     let cancelled = false;
@@ -551,6 +593,9 @@ export default function App() {
         const rawText = await res.text();
         let data: {
           authenticated?: boolean;
+          banned?: boolean;
+          code?: string;
+          error?: string;
           user?: AuthUser | null;
           accessToken?: string;
           refreshToken?: string;
@@ -562,7 +607,13 @@ export default function App() {
         }
         if (cancelled) return;
 
+        if (res.status === 403 || data.banned || data.code === 'ACCOUNT_BANNED') {
+          triggerBannedLockout(data.error);
+          return;
+        }
+
         if (data.authenticated && data.user) {
+          setBannedNotice(null);
           setAuthUser(data.user);
           if (data.accessToken) {
             try {
@@ -602,7 +653,73 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [triggerBannedLockout]);
+
+  // Real-time moderation watcher: polls /api/auth/me while signed in so Ban / Verify / Restrict update live
+  useEffect(() => {
+    if (!authUser) return;
+    let inFlight = false;
+    let cancelled = false;
+
+    const pollModerationStatus = async () => {
+      if (cancelled || inFlight) return;
+      if (document.visibilityState !== 'visible') return;
+      inFlight = true;
+      try {
+        const res = await fetch('/api/auth/me', {
+          headers: getStoredAuthHeaders(),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          authenticated?: boolean;
+          banned?: boolean;
+          code?: string;
+          error?: string;
+          user?: AuthUser | null;
+        };
+        if (cancelled) return;
+        if (res.status === 403 || data.banned || data.code === 'ACCOUNT_BANNED') {
+          triggerBannedLockout(data.error);
+          return;
+        }
+        if (data.authenticated && data.user) {
+          setAuthUser((prev) => {
+            if (!prev) return data.user!;
+            if (
+              prev.isOwner === data.user!.isOwner &&
+              prev.verified === data.user!.verified &&
+              prev.restricted === data.user!.restricted &&
+              prev.banned === data.user!.banned
+            ) {
+              return prev;
+            }
+            return { ...prev, ...data.user! };
+          });
+        }
+      } catch {
+        // ignore transient network glitches
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const interval = window.setInterval(() => {
+      void pollModerationStatus();
+    }, 4000);
+    const onFocusOrVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void pollModerationStatus();
+      }
+    };
+    window.addEventListener('focus', onFocusOrVisible);
+    document.addEventListener('visibilitychange', onFocusOrVisible);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      window.removeEventListener('focus', onFocusOrVisible);
+      document.removeEventListener('visibilitychange', onFocusOrVisible);
+    };
+  }, [authUser, getStoredAuthHeaders, triggerBannedLockout]);
 
   // Real-time dynamic mobile browser theme-color update
   useEffect(() => {
@@ -1076,6 +1193,10 @@ export default function App() {
 
         const data = (await res.json().catch(() => ({}))) as {
           ok?: boolean;
+          banned?: boolean;
+          restricted?: boolean;
+          code?: string;
+          error?: string;
           appId?: string;
           slug?: string;
           path?: string;
@@ -1084,6 +1205,17 @@ export default function App() {
           version?: number;
           deployedAt?: string;
         };
+
+        if (res.status === 403 && (data.banned || data.code === 'ACCOUNT_BANNED')) {
+          triggerBannedLockout(data.error);
+          return;
+        }
+        if (res.status === 403 && (data.restricted || data.code === 'ACCOUNT_RESTRICTED')) {
+          setAuthUser((prev) => (prev ? { ...prev, restricted: true } : prev));
+          setInlineNotice(
+            data.error || 'Your account is currently restricted from publishing apps.'
+          );
+        }
 
         if (res.ok && data.ok && data.path) {
           const liveUrl = `${publicOrigin}${data.path}`;
@@ -1143,7 +1275,7 @@ export default function App() {
         );
       }
     },
-    []
+    [triggerBannedLockout]
   );
 
   const adjustLocalCredits = useCallback((delta: number) => {
@@ -1838,17 +1970,37 @@ export default function App() {
 
         if (!response.ok || !response.body) {
           let errorText = 'Failed to connect to AI Craft.';
+          let errCode = '';
+          let errBanned = false;
+          let errRestricted = false;
           try {
             const errJson = (await response.json()) as {
               error?: string;
+              code?: string;
+              banned?: boolean;
+              restricted?: boolean;
               billing?: BillingSummary;
             };
             if (errJson.billing) {
               applyBillingSummary(errJson.billing);
             }
             if (errJson.error) errorText = errJson.error;
+            if (errJson.code) errCode = errJson.code;
+            errBanned = Boolean(errJson.banned);
+            errRestricted = Boolean(errJson.restricted);
           } catch {
             // ignore parse error
+          }
+          if (response.status === 403 && (errBanned || errCode === 'ACCOUNT_BANNED')) {
+            triggerBannedLockout(errorText);
+            return;
+          }
+          if (
+            response.status === 403 &&
+            (errRestricted || errCode === 'ACCOUNT_RESTRICTED')
+          ) {
+            setAuthUser((prev) => (prev ? { ...prev, restricted: true } : prev));
+            setInlineNotice(errorText);
           }
           if (response.status === 402) {
             setInlineNotice(errorText);
@@ -1917,7 +2069,7 @@ export default function App() {
         }
       }
     },
-    [applyBillingSummary, consumeSseStream, models, updateTurn]
+    [applyBillingSummary, consumeSseStream, models, triggerBannedLockout, updateTurn]
   );
 
   const resumeJobStream = useCallback(
@@ -2726,6 +2878,11 @@ export default function App() {
 
   const handleAuthenticated = useCallback(
     (user: AuthUser, session: StoredSupabaseSession) => {
+      if (user.banned) {
+        triggerBannedLockout(user.banReason);
+        return;
+      }
+      setBannedNotice(null);
       setAuthUser(user);
       setAuthChecking(false);
       setRecoveryTokens(null);
@@ -2818,15 +2975,29 @@ export default function App() {
             className="w-14 h-14 object-contain animate-pulse"
           />
         </div>
+      ) : bannedNotice ? (
+        <BannedOverlay
+          message={bannedNotice}
+          onRetrySignIn={() => {
+            setBannedNotice(null);
+            setAuthUser(null);
+          }}
+        />
       ) : !authUser ? (
         <AuthScreen
           initialView={initialAuthView}
           recoveryTokens={recoveryTokens}
           onAuthenticated={handleAuthenticated}
+          onBanned={(msg) => triggerBannedLockout(msg)}
         />
       ) : viewMode === 'builder' && activeProject ? (
         <>
           {activeWorkspaceView !== 'preview' && <OfflineIndicator />}
+          {authUser.restricted && (
+            <div className="fixed top-2 left-1/2 -translate-x-1/2 z-[60] max-w-[92vw] px-3 py-1 rounded-full bg-amber-50 border border-amber-200 text-amber-800 text-[11px] font-medium shadow-sm pointer-events-none">
+              Account Restricted — Building & publishing paused
+            </div>
+          )}
           <BuilderWorkspace
             projectId={activeProject.id}
             projectTitle={activeProject.title}
@@ -2998,11 +3169,30 @@ export default function App() {
         mode={mode}
         credits={credits}
         avatarDataUrl={userProfile.avatarDataUrl}
+        isOwner={Boolean(authUser?.isOwner)}
         onScanClick={handleScanClick}
         onCreditsClick={handleCreditsClick}
-        onAvatarClick={() => setActiveTab('setting')}
-        onOpenInstallGuide={() => setActiveTab('setting')}
+        onAvatarClick={() => {
+          setProfileInitialTab('account');
+          setActiveTab('setting');
+        }}
+        onAdminClick={() => {
+          setProfileInitialTab('admin');
+          setActiveTab('setting');
+        }}
+        onOpenInstallGuide={() => {
+          setProfileInitialTab('account');
+          setActiveTab('setting');
+        }}
       />
+
+      {authUser?.restricted && (
+        <div className="relative z-20 shrink-0 w-full max-w-[460px] mx-auto px-4 mb-1">
+          <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-1.5 text-[11.5px] font-medium text-amber-800 text-center">
+            Account Restricted — Building, generating media, and publishing are paused by the admin.
+          </div>
+        </div>
+      )}
 
       {/* Main Content Area — Strictly Single Screen, No Overlapping Screens */}
       <main className="relative z-10 flex-1 min-h-0 w-full flex flex-col">
@@ -3149,6 +3339,9 @@ export default function App() {
             >
               <ProfileSection
                 profile={userProfile}
+                authUser={authUser}
+                authHeaders={getStoredAuthHeaders()}
+                initialTab={profileInitialTab}
                 credits={credits}
                 proPlanId={proPlanId}
                 billing={billing}
