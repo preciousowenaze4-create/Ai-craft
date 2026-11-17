@@ -1,8 +1,17 @@
-import { buildFocusedSearchQuery, runLiveBrowserSearch, formatWebSearchContext } from './_builderCore.js';
-import { GeminiRouterError, routeMessageWithGemini } from './_geminiRouter.js';
-import { assembleModularInterface } from './_moduleAssembler.js';
 import { authenticateRequestForModeration } from './_moderation.js';
 import { appendClearAuthCookies } from './_supabaseAuth.js';
+import {
+  MIN_CHAT_CREDITS_THRESHOLD,
+  calculateBuildCreditsForBytes,
+  commitGenerationCredits,
+  verifyUserCanGenerate,
+} from './_billing.js';
+import {
+  finalizeRealtimeOutput,
+  prepareRealtimePrompt,
+  streamPollinationsRealTime,
+  type VisualHintsSpec,
+} from './_realtimeEngine.js';
 
 export async function POST(request: Request): Promise<Response> {
   try {
@@ -31,117 +40,228 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     const body = (await request.json().catch(() => ({}))) as {
+      action?: 'prepare' | 'finalize';
       message?: string;
       mode?: string;
+      model?: string;
+      gateway?: string;
       previousHtml?: string;
       history?: Array<{ role: string; text: string }>;
       webSearchEnabled?: boolean;
-      assemble?: boolean;
+      forceChat?: boolean;
+      needsTitle?: boolean;
+      reactEnabled?: boolean;
+      backendEnabled?: boolean;
       attachmentName?: string | null;
       attachmentDataUrl?: string | null;
       attachmentMimeType?: string | null;
       attachmentText?: string | null;
+      secretKeys?: string[];
+      secretHints?: Array<{ key?: string; hint?: string }>;
+      databaseTables?: string[];
+      clientCreditsRemaining?: number;
       clientTime?: string;
       clientTimeZone?: string;
+      visualHints?: VisualHintsSpec | null;
+      rawOutput?: string;
+      modelUsed?: string;
+      modelName?: string;
+      provider?: string;
+      startedAt?: number;
+      options?: Record<string, unknown>;
     };
 
+    const opts = (body.options || {}) as Record<string, unknown>;
     const message = typeof body?.message === 'string' ? body.message.trim() : '';
+    const mode = body?.mode === 'web' ? 'web' : 'mobile';
+
+    if (body.action === 'finalize') {
+      const rawOutput = typeof body.rawOutput === 'string' ? body.rawOutput : '';
+      if (!rawOutput.trim()) {
+        return Response.json({ error: 'Streamed AI output is empty.' }, { status: 400 });
+      }
+
+      const creditCheck = await verifyUserCanGenerate(request);
+      if (!creditCheck.allowed) {
+        return Response.json(
+          {
+            error: creditCheck.error,
+            code: creditCheck.code,
+            billing: creditCheck.billing,
+          },
+          { status: creditCheck.status }
+        );
+      }
+      const isOwnerRequest = Boolean(modCheck.isOwner || creditCheck.context?.isOwner);
+
+      const finalized = finalizeRealtimeOutput({
+        rawOutput,
+        message: message || 'App build',
+        mode,
+        previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
+        modelUsed: body.modelUsed,
+        modelName: body.modelName,
+        provider: body.provider,
+        startedAt: body.startedAt,
+      });
+
+      let creditsUsed = 0;
+      let updatedBilling = creditCheck.billing;
+      if (finalized.kind === 'build' && finalized.previewHtml && !isOwnerRequest) {
+        const rawCost = Math.max(
+          1,
+          calculateBuildCreditsForBytes(finalized.previewHtml.length, {
+            filesCount: finalized.files.length,
+            dbTablesCount: finalized.dbTables.length,
+          })
+        );
+        creditsUsed =
+          creditCheck.creditBudget !== null
+            ? Math.min(rawCost, creditCheck.creditBudget)
+            : rawCost;
+        if (creditsUsed > 0) {
+          updatedBilling =
+            (await commitGenerationCredits(creditCheck.context, creditsUsed).catch(
+              () => null
+            )) ?? creditCheck.billing;
+        }
+      }
+
+      return Response.json(
+        {
+          ...finalized,
+          creditsUsed,
+          billing: updatedBilling,
+        },
+        { headers: { 'Cache-Control': 'no-store' } }
+      );
+    }
+
     if (!message) {
       return Response.json({ error: 'Prompt message is required.' }, { status: 400 });
     }
 
-    const mode = body?.mode === 'web' ? 'web' : 'mobile';
-    const webSearchEnabled = body?.webSearchEnabled !== false;
-    const shouldAssemble = body?.assemble !== false;
+    const creditCheck = await verifyUserCanGenerate(request);
+    if (!creditCheck.allowed) {
+      return Response.json(
+        {
+          error: creditCheck.error,
+          code: creditCheck.code,
+          billing: creditCheck.billing,
+        },
+        { status: creditCheck.status }
+      );
+    }
 
-    const searchData = webSearchEnabled
-      ? await runLiveBrowserSearch(buildFocusedSearchQuery(message))
-      : { query: '', results: [], images: [] };
-    const webSearchContext = formatWebSearchContext(searchData);
+    const isOwnerRequest = Boolean(modCheck.isOwner || creditCheck.context?.isOwner);
+    const clientCreditsHint =
+      typeof (body.clientCreditsRemaining ?? opts.clientCreditsRemaining) === 'number'
+        ? Math.max(
+            0,
+            Math.floor(
+              Number(body.clientCreditsRemaining ?? opts.clientCreditsRemaining)
+            )
+          )
+        : null;
 
-    const timeContext = [
-      body.clientTime ? `User local date/time: ${body.clientTime}` : '',
-      body.clientTimeZone ? `User timezone: ${body.clientTimeZone}` : '',
-      `Server UTC date/time: ${new Date().toUTCString()}`,
-    ]
-      .filter(Boolean)
-      .join(' | ');
+    if (
+      !isOwnerRequest &&
+      creditCheck.creditBudget === null &&
+      clientCreditsHint !== null &&
+      clientCreditsHint <= MIN_CHAT_CREDITS_THRESHOLD
+    ) {
+      return Response.json(
+        {
+          error: `You have ${clientCreditsHint.toLocaleString()} tokens remaining (minimum ${MIN_CHAT_CREDITS_THRESHOLD + 1} tokens required to chat or build). Top up or upgrade a plan to continue.`,
+          code: 'LOW_CREDITS_THRESHOLD',
+        },
+        { status: 402 }
+      );
+    }
 
-    const classification = await routeMessageWithGemini({
+    const prepared = await prepareRealtimePrompt({
       message,
       mode,
+      requestedModel: typeof body.model === 'string' ? body.model : undefined,
+      requestedGateway: typeof body.gateway === 'string' ? body.gateway : undefined,
       history: Array.isArray(body.history) ? body.history : [],
       previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
-      attachmentName: body.attachmentName ?? null,
-      attachmentDataUrl: body.attachmentDataUrl ?? null,
-      attachmentMimeType: body.attachmentMimeType ?? null,
-      attachmentText: body.attachmentText ?? null,
-      webSearchContext,
-      timeContext,
+      webSearchEnabled: (body.webSearchEnabled ?? opts.webSearchEnabled) !== false,
+      forceChat: Boolean(body.forceChat ?? opts.forceChat),
+      needsTitle: Boolean(body.needsTitle ?? opts.needsTitle),
+      reactEnabled: Boolean(body.reactEnabled ?? opts.reactEnabled),
+      backendEnabled: Boolean(body.backendEnabled ?? opts.backendEnabled),
+      attachmentName:
+        typeof (body.attachmentName ?? opts.attachmentName) === 'string'
+          ? String(body.attachmentName ?? opts.attachmentName)
+          : null,
+      attachmentDataUrl:
+        typeof (body.attachmentDataUrl ?? opts.attachmentDataUrl) === 'string'
+          ? String(body.attachmentDataUrl ?? opts.attachmentDataUrl)
+          : null,
+      attachmentText:
+        typeof (body.attachmentText ?? opts.attachmentText) === 'string'
+          ? String(body.attachmentText ?? opts.attachmentText)
+          : null,
+      secretKeys: Array.isArray(body.secretKeys ?? opts.secretKeys)
+        ? ((body.secretKeys ?? opts.secretKeys) as string[])
+        : [],
+      secretHints: Array.isArray(body.secretHints ?? opts.secretHints)
+        ? ((body.secretHints ?? opts.secretHints) as Array<{ key?: string; hint?: string }>)
+        : [],
+      databaseTables: Array.isArray(body.databaseTables ?? opts.databaseTables)
+        ? ((body.databaseTables ?? opts.databaseTables) as string[])
+        : [],
+      clientTime: body.clientTime,
+      clientTimeZone: body.clientTimeZone,
+      visualHints: (body.visualHints ?? opts.visualHints ?? null) as VisualHintsSpec | null,
     });
 
-    const isBuildIntent =
-      classification.intent === 'build_app' || classification.intent === 'edit_app';
+    if (body.action === 'prepare') {
+      return Response.json(
+        {
+          ok: true,
+          isOwnerRequest,
+          billing: creditCheck.billing,
+          ...prepared,
+        },
+        { headers: { 'Cache-Control': 'no-store' } }
+      );
+    }
 
-    const assembled =
-      shouldAssemble && isBuildIntent
-        ? assembleModularInterface({
-            route: classification,
-            previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
-            mode,
-            searchData,
-          })
-        : null;
+    // Default synchronous test/endpoint mode: run real-time Pollinations stream and finalize
+    let rawOutput = '';
+    await streamPollinationsRealTime({
+      systemPrompt: prepared.systemPrompt,
+      historyMessages: prepared.historyMessages,
+      userPrompt: prepared.userPrompt,
+      onContentChunk: (chunk) => {
+        rawOutput += chunk;
+      },
+    });
+
+    const finalized = finalizeRealtimeOutput({
+      rawOutput,
+      message,
+      mode,
+      previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
+      modelUsed: body.model || 'pollinations::openai-fast',
+      modelName: prepared.requestedModelLabel,
+      provider: 'pollinations',
+    });
 
     return Response.json(
       {
-        ok: true,
-        router: classification.modelUsed,
-        intent: classification.intent,
-        appTitle: classification.appTitle,
-        brandTagline: classification.brandTagline,
-        summary: classification.replyMessage,
-        primaryColor: classification.primaryColor,
-        surfaceTheme: classification.surfaceTheme,
-        componentIds: assembled?.manifest.componentIds ?? classification.componentIds,
-        featureIds: assembled?.manifest.featureIds ?? classification.featureIds,
-        addComponentIds: classification.addComponentIds,
-        removeComponentIds: classification.removeComponentIds,
-        customTabs: assembled?.manifest.customTabs ?? classification.customTabs,
-        dataTables: assembled?.dbTables ?? classification.dataTables,
-        planSteps: classification.planSteps,
-        followUpSuggestions: classification.followUpSuggestions,
-        mediaPrompt:
-          classification.intent === 'generate_image' ||
-          classification.intent === 'generate_music' ||
-          classification.intent === 'generate_video'
-            ? classification.mediaPrompt
-            : undefined,
-        ...(assembled
-          ? {
-              assembledModules: assembled.steps,
-              previewHtml: assembled.html,
-            }
-          : {}),
+        ...finalized,
+        searchData: prepared.searchData,
       },
-      {
-        headers: {
-          'Cache-Control': 'no-store',
-        },
-      }
+      { headers: { 'Cache-Control': 'no-store' } }
     );
   } catch (err) {
-    if (err instanceof GeminiRouterError) {
-      return Response.json(
-        {
-          error: err.message,
-          code: err.code,
-        },
-        { status: err.status }
-      );
-    }
     const message =
-      err instanceof Error ? err.message : 'Unable to route message through Gemini.';
+      err instanceof Error
+        ? err.message
+        : 'Unable to run free browser AI right now.';
     return Response.json({ error: message }, { status: 502 });
   }
 }

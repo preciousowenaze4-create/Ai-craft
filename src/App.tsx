@@ -25,6 +25,10 @@ import { PromptComposer } from './components/PromptComposer';
 import { SwipeableProjectRow } from './components/SwipeableProjectRow';
 import { TopBar } from './components/TopBar';
 import { unlockSpeechSynthesis } from './hooks/useSpeechNarration';
+import {
+  analyzeAttachmentVisualHints,
+  streamRealTimeBrowserAi,
+} from './utils/browserAi';
 import { buildProjectSecretHints } from './utils/secretHints';
 import {
   deriveSmartProjectTitle,
@@ -434,9 +438,11 @@ export default function App() {
   const [swipedProjectId, setSwipedProjectId] = useState<string | null>(null);
   const [inlineNotice, setInlineNotice] = useState<string | null>(null);
   const [models, setModels] = useState<OpenRouterModel[]>([]);
-  const [selectedModel, setSelectedModel] = useState<string>(
-    () => loadSavedString(STORAGE_MODEL_KEY) || 'auto::architect'
-  );
+  const [selectedModel, setSelectedModel] = useState<string>(() => {
+    const saved = loadSavedString(STORAGE_MODEL_KEY);
+    if (!saved || saved === 'auto::architect') return 'auto::free-browser';
+    return saved;
+  });
   const [modelsLoading, setModelsLoading] = useState<boolean>(true);
   const [modelsError, setModelsError] = useState<string | null>(null);
   const [transactions, setTransactions] = useState<PaymentTransaction[]>(() => {
@@ -1013,27 +1019,28 @@ export default function App() {
       if (fetched.length > 0) {
         setModels(fetched);
         setSelectedModel((prev) => {
-          const matched = prev
+          const normalizedPrev =
+            !prev || prev === 'auto::architect' ? 'auto::free-browser' : prev;
+          const matched = normalizedPrev
             ? fetched.find(
                 (m) =>
-                  m.id === prev &&
+                  m.id === normalizedPrev &&
                   (m.isFree ||
                     m.gateway === 'auto' ||
-                    m.gateway === 'groq' ||
-                    m.gateway === 'huggingface' ||
-                    m.gateway === 'ngrok' ||
+                    m.gateway === 'puter' ||
                     m.gateway === 'pollinations' ||
-                    m.gateway === 'gemini')
+                    m.gateway === 'browser' ||
+                    m.gateway === 'web-search')
               )
             : undefined;
           return matched ? matched.id : fetched[0].id;
         });
       } else if (!response.ok || data?.error) {
-        setModelsError(data?.error || 'Unable to load AI gateway models.');
+        setModelsError(data?.error || 'Unable to load free browser AI models.');
       }
     } catch (err) {
       setModelsError(
-        err instanceof Error ? err.message : 'Unable to load free OpenRouter models.'
+        err instanceof Error ? err.message : 'Unable to load free browser AI models.'
       );
     } finally {
       setModelsLoading(false);
@@ -1411,12 +1418,6 @@ export default function App() {
                 files?: string[];
                 allSteps?: string[];
                 planSteps?: string[];
-                intent?: string;
-                componentIds?: string[];
-                featureIds?: string[];
-                classifiedIntent?: string;
-                classifiedModules?: string[];
-                classifiedFeatures?: string[];
                 suggestions?: string[];
                 tables?: IncomingSchemaTable[];
                 dbTables?: IncomingSchemaTable[];
@@ -1534,17 +1535,6 @@ export default function App() {
                 }));
               } else if (evt.type === 'title' && evt.title) {
                 updateProjectTitle(projectId, evt.title);
-              } else if (evt.type === 'route') {
-                updateTurn(projectId, turnId, (t) => ({
-                  ...t,
-                  classifiedIntent: evt.intent ?? t.classifiedIntent,
-                  classifiedModules: Array.isArray(evt.componentIds)
-                    ? evt.componentIds
-                    : t.classifiedModules,
-                  classifiedFeatures: Array.isArray(evt.featureIds)
-                    ? evt.featureIds
-                    : t.classifiedFeatures,
-                }));
               } else if (evt.type === 'plan' && Array.isArray(evt.allSteps)) {
                 flushBuffered();
                 updateTurn(projectId, turnId, (t) => ({
@@ -1689,17 +1679,6 @@ export default function App() {
                         : evt.previewHtml || t.previewHtml,
                     media: evt.media ?? t.media,
                     files: resolvedFiles,
-                    classifiedIntent: evt.classifiedIntent ?? evt.intent ?? t.classifiedIntent,
-                    classifiedModules: Array.isArray(evt.classifiedModules)
-                      ? evt.classifiedModules
-                      : Array.isArray(evt.componentIds)
-                        ? evt.componentIds
-                        : t.classifiedModules,
-                    classifiedFeatures: Array.isArray(evt.classifiedFeatures)
-                      ? evt.classifiedFeatures
-                      : Array.isArray(evt.featureIds)
-                        ? evt.featureIds
-                        : t.classifiedFeatures,
                     suggestions: Array.isArray(evt.suggestions)
                       ? evt.suggestions
                       : t.suggestions,
@@ -1988,12 +1967,58 @@ export default function App() {
       let knownJobId: string | undefined;
       let streamStarted = false;
 
-      try {
+      const handleHttpFailureResponse = async (
+        response: Response,
+        fallbackMessage: string
+      ): Promise<never> => {
+        let errorText = fallbackMessage;
+        let errCode = '';
+        let errBanned = false;
+        let errRestricted = false;
+        try {
+          const errJson = (await response.json()) as {
+            error?: string;
+            code?: string;
+            banned?: boolean;
+            restricted?: boolean;
+            billing?: BillingSummary;
+          };
+          if (errJson.billing) {
+            applyBillingSummary(errJson.billing);
+          }
+          if (errJson.error) errorText = errJson.error;
+          if (errJson.code) errCode = errJson.code;
+          errBanned = Boolean(errJson.banned);
+          errRestricted = Boolean(errJson.restricted);
+        } catch {
+          // ignore parse error
+        }
+        if (response.status === 403 && (errBanned || errCode === 'ACCOUNT_BANNED')) {
+          triggerBannedLockout(errorText);
+          const abortErr = new Error(errorText);
+          abortErr.name = 'AbortError';
+          throw abortErr;
+        }
+        if (
+          response.status === 403 &&
+          (errRestricted || errCode === 'ACCOUNT_RESTRICTED')
+        ) {
+          setAuthUser((prev) => (prev ? { ...prev, restricted: true } : prev));
+          setInlineNotice(errorText);
+        }
+        if (response.status === 402) {
+          setInlineNotice(errorText);
+          setShowProUpgrade(true);
+        }
+        throw new Error(errorText);
+      };
+
+      const runServerSseStream = async (visualHints: unknown) => {
+        const matchedModel = models.find((m) => m.id === modelToUse);
         const clientTimeZone =
           Intl.DateTimeFormat().resolvedOptions().timeZone || '';
         const clientTime = new Date().toLocaleString();
 
-        const matchedModel = models.find((m) => m.id === modelToUse);
         const response = await fetch('/api/craft/stream', {
           method: 'POST',
           headers: {
@@ -2009,50 +2034,14 @@ export default function App() {
             clientTimeZone,
             previousHtml,
             history,
+            visualHints,
             options,
           }),
           signal: controller.signal,
         });
 
         if (!response.ok || !response.body) {
-          let errorText = 'Failed to connect to AI Craft.';
-          let errCode = '';
-          let errBanned = false;
-          let errRestricted = false;
-          try {
-            const errJson = (await response.json()) as {
-              error?: string;
-              code?: string;
-              banned?: boolean;
-              restricted?: boolean;
-              billing?: BillingSummary;
-            };
-            if (errJson.billing) {
-              applyBillingSummary(errJson.billing);
-            }
-            if (errJson.error) errorText = errJson.error;
-            if (errJson.code) errCode = errJson.code;
-            errBanned = Boolean(errJson.banned);
-            errRestricted = Boolean(errJson.restricted);
-          } catch {
-            // ignore parse error
-          }
-          if (response.status === 403 && (errBanned || errCode === 'ACCOUNT_BANNED')) {
-            triggerBannedLockout(errorText);
-            return;
-          }
-          if (
-            response.status === 403 &&
-            (errRestricted || errCode === 'ACCOUNT_RESTRICTED')
-          ) {
-            setAuthUser((prev) => (prev ? { ...prev, restricted: true } : prev));
-            setInlineNotice(errorText);
-          }
-          if (response.status === 402) {
-            setInlineNotice(errorText);
-            setShowProUpgrade(true);
-          }
-          throw new Error(errorText);
+          await handleHttpFailureResponse(response, 'Failed to connect to AI Craft.');
         }
 
         streamStarted = true;
@@ -2088,6 +2077,339 @@ export default function App() {
             );
           }
         }
+      };
+
+      try {
+        const clientTimeZone =
+          Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        const clientTime = new Date().toLocaleString();
+        const matchedModel = models.find((m) => m.id === modelToUse);
+        const visualHints = await analyzeAttachmentVisualHints(
+          options.attachmentDataUrl
+        );
+
+        // 1. Prepare live grounded prompt (checks moderation, billing, live clinic/web search & photography)
+        const prepareRes = await fetch('/api/route', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...getStoredAuthHeaders(),
+          },
+          body: JSON.stringify({
+            action: 'prepare',
+            message,
+            mode: targetMode,
+            model: modelToUse || undefined,
+            gateway: matchedModel?.gateway || undefined,
+            clientTime,
+            clientTimeZone,
+            previousHtml,
+            history,
+            visualHints,
+            options,
+          }),
+          signal: controller.signal,
+        });
+
+        if (!prepareRes.ok) {
+          await handleHttpFailureResponse(
+            prepareRes,
+            'Unable to prepare free browser AI request.'
+          );
+        }
+
+        const prepared = (await prepareRes.json()) as {
+          ok?: boolean;
+          initialRoute?: 'chat' | 'build' | 'auto';
+          mediaKind?: 'image' | 'music' | 'video' | null;
+          naturalMediaIntent?: 'image' | 'music' | 'video' | null;
+          requestedModelLabel?: string;
+          shouldGenerateTitle?: boolean;
+          systemPrompt: string;
+          userPrompt: string;
+          historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
+          searchData?: {
+            query?: string;
+            results?: Array<{ title: string; url: string; snippet: string }>;
+            images?: Array<{ url: string; title: string; source: string }>;
+          };
+          billing?: BillingSummary | null;
+        };
+
+        if (prepared.billing) {
+          applyBillingSummary(prepared.billing);
+        }
+
+        // 2. Direct Media Studio (Image / Music / Video) goes cleanly to /api/craft/stream
+        if (prepared.mediaKind || prepared.naturalMediaIntent) {
+          await runServerSseStream(visualHints);
+          return;
+        }
+
+        // 3. True Real-Time Browser AI Streaming (Puter.js v2 & Browser-Direct Pollinations SSE)
+        const hasSearchHits = Boolean(prepared.searchData?.results?.length);
+        updateTurn(projectId, turnId, (t) => ({
+          ...t,
+          kind: prepared.initialRoute === 'build' ? 'build' : t.kind,
+          phase: 'understanding',
+          phaseLabel: hasSearchHits
+            ? 'Searched live web · Thinking step by step...'
+            : 'Thinking step by step...',
+        }));
+
+        let browserResult: Awaited<ReturnType<typeof streamRealTimeBrowserAi>> | null =
+          null;
+        let browserStreamError: Error | null = null;
+
+        try {
+          browserResult = await streamRealTimeBrowserAi({
+            modelId: modelToUse || 'auto::free-browser',
+            systemPrompt: prepared.systemPrompt,
+            historyMessages: prepared.historyMessages,
+            userPrompt: prepared.userPrompt,
+            attachmentDataUrl: options.attachmentDataUrl,
+            signal: controller.signal,
+            onModelSelected: (info) => {
+              updateTurn(projectId, turnId, (t) => ({
+                ...t,
+                modelId: info.modelId,
+                modelName: info.modelName,
+                modelProvider: info.provider,
+              }));
+            },
+            onReasoning: () => {
+              updateTurn(projectId, turnId, (t) =>
+                t.phase === 'understanding'
+                  ? {
+                      ...t,
+                      phaseLabel: 'Planning real-time architecture & database...',
+                    }
+                  : t
+              );
+            },
+            onTitle: (title) => {
+              updateProjectTitle(projectId, title);
+            },
+            onPlanSteps: (steps) => {
+              updateTurn(projectId, turnId, (t) => ({
+                ...t,
+                planSteps: steps,
+              }));
+            },
+            onDbTables: (tables) => {
+              setProjects((prev) =>
+                prev.map((p) =>
+                  p.id === projectId
+                    ? {
+                        ...p,
+                        databaseConfig: mergeIncomingDbSchema(
+                          p.databaseConfig,
+                          tables
+                        ),
+                      }
+                    : p
+                )
+              );
+              window.dispatchEvent(
+                new CustomEvent('aicraft:db-updated', { detail: { projectId } })
+              );
+            },
+            onPhaseChange: (phase, label) => {
+              updateTurn(projectId, turnId, (t) => ({
+                ...t,
+                kind: phase === 'building' ? 'build' : t.kind,
+                phase,
+                phaseLabel: label,
+              }));
+            },
+            onProseUpdate: (proseText) => {
+              updateTurn(projectId, turnId, (t) => ({
+                ...t,
+                aiText: proseText,
+              }));
+            },
+            onBuildProgress: (progress) => {
+              updateTurn(projectId, turnId, (t) => ({
+                ...t,
+                kind: 'build',
+                phase: 'building',
+                phaseLabel: `Building ${progress.activeFile}...`,
+                files: progress.files,
+                activeAction: progress.activeAction,
+                activeFile: progress.activeFile,
+                bytesBuilt: progress.bytesBuilt,
+              }));
+            },
+          });
+        } catch (err) {
+          if ((err as Error)?.name === 'AbortError') {
+            throw err;
+          }
+          browserStreamError =
+            err instanceof Error
+              ? err
+              : new Error('Free browser AI stream unavailable.');
+        }
+
+        // If browser-direct AI couldn't complete (e.g., CORS/402), try server SSE stream cleanly
+        if (!browserResult || !browserResult.rawOutput.trim()) {
+          if (browserStreamError) {
+            await runServerSseStream(visualHints);
+            return;
+          }
+          throw new Error('Free browser AI did not return any output. Please retry.');
+        }
+
+        // 4. Finalize & harden the streamed output on /api/route
+        const finalizeRes = await fetch('/api/route', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...getStoredAuthHeaders(),
+          },
+          body: JSON.stringify({
+            action: 'finalize',
+            rawOutput: browserResult.rawOutput,
+            message,
+            mode: targetMode,
+            previousHtml,
+            modelUsed: browserResult.modelUsed,
+            modelName: browserResult.modelName,
+            provider: browserResult.provider,
+            startedAt,
+          }),
+          signal: controller.signal,
+        });
+
+        if (!finalizeRes.ok) {
+          await handleHttpFailureResponse(
+            finalizeRes,
+            'Failed to finalize built app.'
+          );
+        }
+
+        const finalized = (await finalizeRes.json()) as {
+          ok?: boolean;
+          kind: TurnKind;
+          title?: string;
+          aiText: string;
+          previewHtml?: string;
+          files: string[];
+          planSteps?: string[];
+          dbTables?: IncomingSchemaTable[];
+          suggestions?: string[];
+          logo?: Record<string, string> | null;
+          thoughtSeconds?: number;
+          bytesBuilt?: number;
+          creditsUsed?: number;
+          billing?: BillingSummary | null;
+          modelUsed?: string;
+          modelName?: string;
+          provider?: string;
+        };
+
+        activeConnectionsRef.current.delete(turnId);
+
+        if (finalized.title) {
+          updateProjectTitle(projectId, finalized.title);
+        }
+
+        const finalSeconds = Math.max(
+          1,
+          finalized.thoughtSeconds ?? Math.round((Date.now() - startedAt) / 1000)
+        );
+        const resolvedKind: TurnKind = finalized.kind === 'build' ? 'build' : 'chat';
+
+        updateTurn(projectId, turnId, (t) => ({
+          ...t,
+          kind: resolvedKind,
+          phase: 'complete',
+          phaseLabel:
+            resolvedKind === 'build' ? 'Build complete' : 'Answered',
+          thoughtSeconds: finalSeconds,
+          aiText: finalized.aiText || t.aiText,
+          previewHtml:
+            resolvedKind === 'build' ? finalized.previewHtml || t.previewHtml : '',
+          files:
+            Array.isArray(finalized.files) && finalized.files.length > 0
+              ? finalized.files
+              : t.files,
+          planSteps:
+            Array.isArray(finalized.planSteps) && finalized.planSteps.length > 0
+              ? finalized.planSteps
+              : t.planSteps,
+          suggestions: Array.isArray(finalized.suggestions)
+            ? finalized.suggestions
+            : t.suggestions,
+          activeAction: resolvedKind === 'build' ? 'Built' : 'Answered',
+          activeFile: finalized.files?.[0] ?? t.activeFile,
+          bytesBuilt:
+            typeof finalized.bytesBuilt === 'number'
+              ? finalized.bytesBuilt
+              : t.bytesBuilt,
+          creditsUsed:
+            typeof finalized.creditsUsed === 'number'
+              ? finalized.creditsUsed
+              : 0,
+          modelId: finalized.modelUsed ?? browserResult.modelUsed,
+          modelName: finalized.modelName ?? browserResult.modelName,
+          modelProvider: finalized.provider ?? browserResult.provider,
+        }));
+
+        if (resolvedKind === 'build' && finalized.previewHtml) {
+          void publishProjectLive(projectId, finalized.previewHtml, {
+            title: finalized.title,
+            logo: finalized.logo || undefined,
+          });
+        }
+
+        if (Array.isArray(finalized.dbTables) && finalized.dbTables.length > 0) {
+          const finalTables = finalized.dbTables;
+          setProjects((prev) =>
+            prev.map((p) =>
+              p.id === projectId
+                ? {
+                    ...p,
+                    databaseConfig: mergeIncomingDbSchema(
+                      p.databaseConfig,
+                      finalTables
+                    ),
+                  }
+                : p
+            )
+          );
+          window.dispatchEvent(
+            new CustomEvent('aicraft:db-updated', { detail: { projectId } })
+          );
+        }
+
+        if (finalized.billing) {
+          applyBillingSummary(finalized.billing);
+        } else if (typeof finalized.creditsUsed === 'number' && finalized.creditsUsed > 0) {
+          adjustLocalCredits(-finalized.creditsUsed);
+          void syncBillingFromServer();
+        }
+
+        if (
+          notificationsEnabled &&
+          document.visibilityState === 'hidden' &&
+          typeof Notification !== 'undefined' &&
+          Notification.permission === 'granted'
+        ) {
+          try {
+            const matchedProj = projectsRef.current.find(
+              (p) => p.id === projectId
+            );
+            new Notification(matchedProj?.title || 'AI Craft', {
+              body:
+                resolvedKind === 'build'
+                  ? 'Your real-time app build is finished and ready to preview.'
+                  : 'AI Craft finished answering your question.',
+            });
+          } catch {
+            // ignore notification errors
+          }
+        }
       } catch (err) {
         activeConnectionsRef.current.delete(turnId);
         if ((err as Error).name !== 'AbortError') {
@@ -2105,7 +2427,7 @@ export default function App() {
           const msg =
             err instanceof Error
               ? err.message
-              : 'Unable to reach AI Craft engine right now.';
+              : 'Unable to reach free browser AI right now.';
           updateTurn(projectId, turnId, (t) => ({
             ...t,
             phase: 'error',
@@ -2115,7 +2437,18 @@ export default function App() {
         }
       }
     },
-    [applyBillingSummary, consumeSseStream, models, triggerBannedLockout, updateTurn]
+    [
+      adjustLocalCredits,
+      applyBillingSummary,
+      consumeSseStream,
+      models,
+      notificationsEnabled,
+      publishProjectLive,
+      syncBillingFromServer,
+      triggerBannedLockout,
+      updateProjectTitle,
+      updateTurn,
+    ]
   );
 
   const resumeJobStream = useCallback(

@@ -1,10 +1,9 @@
 import {
   ARCHITECT_PUBLIC_MODEL,
   POLLINATIONS_FALLBACK_MODELS,
+  PUTER_BROWSER_MODELS,
   fetchAllGatewayModels,
-  getGroqApiKey,
 } from './_aiGateways.js';
-import { getGeminiApiKey, getOpenRouterApiKey } from './_openrouterModels.js';
 
 export async function GET(request: Request): Promise<Response> {
   try {
@@ -18,14 +17,10 @@ export async function GET(request: Request): Promise<Response> {
       {
         models: result.models,
         gateways: result.gateways,
-        groqConfigured: result.groqConfigured,
-        openRouterConfigured: result.openRouterConfigured,
-        huggingFaceConfigured: result.huggingFaceConfigured,
-        ngrokConfigured: result.ngrokConfigured,
         pollinationsConfigured: result.pollinationsConfigured,
-        geminiConfigured: result.geminiConfigured,
-        freeOnly: !result.huggingFaceConfigured && !result.ngrokConfigured,
-        keyStatus: result.keyStatus,
+        puterConfigured: result.puterConfigured,
+        keyless: true,
+        freeOnly: true,
       },
       {
         headers: {
@@ -33,24 +28,21 @@ export async function GET(request: Request): Promise<Response> {
         },
       }
     );
-  } catch (err) {
-    const message =
-      err instanceof Error ? err.message : 'Unable to load AI gateway models.';
-    const geminiConfigured = Boolean(getGeminiApiKey());
-    const groqConfigured = Boolean(getGroqApiKey());
-    const openRouterConfigured = Boolean(getOpenRouterApiKey());
-
-    const fallbackModels = [ARCHITECT_PUBLIC_MODEL, ...POLLINATIONS_FALLBACK_MODELS.filter((m) => m.category !== 'code')];
+  } catch {
+    const fallbackModels = [
+      ARCHITECT_PUBLIC_MODEL,
+      ...POLLINATIONS_FALLBACK_MODELS.filter((m) => m.category === 'code'),
+      ...PUTER_BROWSER_MODELS,
+      ...POLLINATIONS_FALLBACK_MODELS.filter((m) => m.category !== 'code'),
+    ];
 
     return Response.json(
       {
         models: fallbackModels,
-        groqConfigured,
-        openRouterConfigured,
-        geminiConfigured,
         pollinationsConfigured: true,
+        puterConfigured: true,
+        keyless: true,
         freeOnly: true,
-        error: fallbackModels.length > 0 ? undefined : message,
       },
       {
         status: 200,

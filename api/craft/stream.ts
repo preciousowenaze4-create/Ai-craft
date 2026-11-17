@@ -1,14 +1,12 @@
 import {
-  buildFocusedSearchQuery,
-  buildSmartFollowUpSuggestions,
-  formatWebSearchContext,
-  runLiveBrowserSearch,
+  extractDbSchemaFromRaw,
+  extractLiveBuildArtifacts,
+  extractPlanStepsFromRaw,
+  extractSessionTitleFromRaw,
+  findCodeStart,
+  sanitizeBuildProse,
+  stripReasoningTags,
 } from '../_builderCore.js';
-import {
-  GeminiRouterError,
-  routeMessageWithGemini,
-} from '../_geminiRouter.js';
-import { assembleModularInterface } from '../_moduleAssembler.js';
 import {
   MIN_CHAT_CREDITS_THRESHOLD,
   calculateBuildCreditsForBytes,
@@ -17,15 +15,16 @@ import {
 } from '../_billing.js';
 import { authenticateRequestForModeration } from '../_moderation.js';
 import { appendClearAuthCookies } from '../_supabaseAuth.js';
-import { buildGatewayExecutionPlan } from '../_aiGateways.js';
 import {
   generateMediaAsset,
   type GeneratedMediaResult,
 } from '../_mediaService.js';
-
-function waitMs(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+import {
+  finalizeRealtimeOutput,
+  prepareRealtimePrompt,
+  streamPollinationsRealTime,
+  type VisualHintsSpec,
+} from '../_realtimeEngine.js';
 
 export async function POST(request: Request): Promise<Response> {
   let body: {
@@ -37,6 +36,7 @@ export async function POST(request: Request): Promise<Response> {
     clientTimeZone?: string;
     previousHtml?: string;
     history?: Array<{ role: string; text: string }>;
+    visualHints?: VisualHintsSpec | null;
     options?: {
       reactEnabled?: boolean;
       backendEnabled?: boolean;
@@ -51,6 +51,7 @@ export async function POST(request: Request): Promise<Response> {
       databaseTables?: string[];
       clientCreditsRemaining?: number;
       needsTitle?: boolean;
+      visualHints?: VisualHintsSpec | null;
     };
   };
 
@@ -71,14 +72,11 @@ export async function POST(request: Request): Promise<Response> {
   const previousHtml = typeof body?.previousHtml === 'string' ? body.previousHtml : '';
   const history = Array.isArray(body?.history) ? body.history : [];
   const options = body?.options ?? {};
+  const visualHints = body.visualHints ?? options.visualHints ?? null;
   const attachmentDataUrl =
     typeof options.attachmentDataUrl === 'string' &&
     options.attachmentDataUrl.startsWith('data:image/')
       ? options.attachmentDataUrl
-      : null;
-  const attachmentMimeType =
-    typeof options.attachmentMimeType === 'string'
-      ? options.attachmentMimeType
       : null;
   const attachmentText =
     typeof options.attachmentText === 'string' && options.attachmentText.trim()
@@ -130,6 +128,7 @@ export async function POST(request: Request): Promise<Response> {
       { status: creditCheck.status }
     );
   }
+
   const isOwnerRequest = Boolean(modCheck.isOwner || creditCheck.context?.isOwner);
   const effectiveCreditBudget = isOwnerRequest
     ? null
@@ -182,112 +181,65 @@ export async function POST(request: Request): Promise<Response> {
       };
 
       try {
+        const startedAt = Date.now();
         sendEvent({
           type: 'phase',
           phase: 'understanding',
           kind: 'chat',
-          label: 'Routing intent & classifying modules via Gemini...',
+          label: 'Searching live web & thinking...',
+        });
+
+        const prepared = await prepareRealtimePrompt({
+          message,
+          mode,
+          requestedModel,
+          requestedGateway,
+          history,
+          previousHtml,
+          webSearchEnabled,
+          forceChat: Boolean(options.forceChat),
+          needsTitle: Boolean(options.needsTitle),
+          reactEnabled: Boolean(options.reactEnabled),
+          backendEnabled: Boolean(options.backendEnabled),
+          attachmentName: options.attachmentName ?? null,
+          attachmentDataUrl,
+          attachmentText,
+          secretKeys: options.secretKeys ?? [],
+          secretHints: options.secretHints ?? [],
+          databaseTables: options.databaseTables ?? [],
+          clientTime,
+          clientTimeZone,
+          visualHints,
         });
 
         sendEvent({
           type: 'meta',
-          kind: 'chat',
-          modelId: 'google/gemini-4-hydrogen',
-          modelName: 'Gemini Intent Router',
-          provider: 'google',
-          gateway: 'gemini',
+          kind: prepared.naturalMediaIntent ? 'media' : 'chat',
+          modelId: requestedModel || 'pollinations::openai-fast',
+          modelName: prepared.requestedModelLabel || 'Free Browser AI',
+          provider: requestedGateway || 'pollinations',
+          gateway: requestedGateway || 'pollinations',
           isFallback: false,
         });
 
-        const executionPlan = buildGatewayExecutionPlan({
-          requestedModel,
-          requestedGateway,
-          openRouterCatalog: [],
-          huggingFaceCatalog: [],
-          ngrokCatalog: [],
-          groqCatalog: [],
-          pollinationsCatalog: [],
-        });
-        const requestedMediaKind = executionPlan.requestedMediaKind;
-
-        const searchData = webSearchEnabled
-          ? await runLiveBrowserSearch(buildFocusedSearchQuery(message))
-          : { query: '', results: [], images: [] };
-        const webSearchContext = formatWebSearchContext(searchData);
-
-        const timeContext = [
-          clientTime ? `User local date/time: ${clientTime}` : '',
-          clientTimeZone ? `User timezone: ${clientTimeZone}` : '',
-          `Server UTC date/time: ${new Date().toUTCString()}`,
-        ]
-          .filter(Boolean)
-          .join(' | ');
-
-        // Route every incoming message directly to Gemini API key as intent router & module classifier
-        const classification = await routeMessageWithGemini({
-          message,
-          mode,
-          requestedMediaKind,
-          history,
-          previousHtml,
-          attachmentName: options.attachmentName ?? null,
-          attachmentDataUrl,
-          attachmentMimeType,
-          attachmentText,
-          webSearchContext,
-          timeContext,
-        });
-
-        const shouldGenerateTitle =
-          history.length === 0 || Boolean(options.needsTitle);
-        if (shouldGenerateTitle && classification.appTitle) {
-          sendEvent({ type: 'title', title: classification.appTitle });
-        }
-
-        sendEvent({
-          type: 'route',
-          intent: classification.intent,
-          componentIds: classification.componentIds,
-          featureIds: classification.featureIds,
-          addComponentIds: classification.addComponentIds,
-          removeComponentIds: classification.removeComponentIds,
-        });
-
-        const effectiveIntent =
-          requestedMediaKind !== null && classification.intent !== 'chat'
-            ? (`generate_${requestedMediaKind}` as const)
-            : options.forceChat
-              ? ('chat' as const)
-              : classification.intent;
-
-        // Branch 1: Media Generation (Image / Music / Video)
-        if (
-          effectiveIntent === 'generate_image' ||
-          effectiveIntent === 'generate_music' ||
-          effectiveIntent === 'generate_video'
-        ) {
-          const mediaKind =
-            effectiveIntent === 'generate_music'
-              ? 'music'
-              : effectiveIntent === 'generate_video'
-                ? 'video'
-                : 'image';
-
+        // Direct Media Studio execution
+        if (prepared.naturalMediaIntent) {
+          const mediaKind = prepared.naturalMediaIntent;
           sendEvent({
             type: 'phase',
             phase: 'building',
             kind: 'media',
             label:
               mediaKind === 'video'
-                ? 'Generating video...'
+                ? 'Generating motion preview...'
                 : mediaKind === 'music'
-                  ? 'Composing music...'
-                  : 'Generating image...',
+                  ? 'Composing custom studio track...'
+                  : 'Generating image & searching visual references...',
           });
 
           const mediaResult: GeneratedMediaResult = await generateMediaAsset({
             kind: mediaKind,
-            prompt: classification.mediaPrompt || message,
+            prompt: message,
             requestedModel,
           });
 
@@ -295,119 +247,201 @@ export async function POST(request: Request): Promise<Response> {
           sendEvent({
             type: 'done',
             kind: 'media',
-            title: shouldGenerateTitle ? classification.appTitle : undefined,
-            fullText:
-              classification.replyMessage ||
-              `Generated your ${mediaKind}: "${(classification.mediaPrompt || message).slice(0, 120)}"`,
+            fullText: `Generated your ${mediaKind}: "${message.slice(0, 120)}"`,
             previewHtml: '',
             allFiles: [],
             suggestions: [],
             dbTables: [],
-            classifiedIntent: effectiveIntent,
-            classifiedModules: classification.componentIds,
-            classifiedFeatures: classification.featureIds,
             bytesBuilt: 0,
             creditsUsed: 0,
             billing: creditCheck.billing,
             media: mediaResult,
-            modelUsed: mediaResult.modelId || 'google/gemini-4-hydrogen',
-            modelName: executionPlan.requestedModelLabel || 'Gemini Intent Router',
+            modelUsed: mediaResult.modelId || 'pollinations::sana',
+            modelName: prepared.requestedModelLabel || 'Free Browser AI Studio',
             provider: mediaResult.gateway,
           });
           closeStream();
           return;
         }
 
-        // Branch 2: Pure Conversational Chat
-        if (effectiveIntent === 'chat') {
-          sendEvent({ type: 'delta', text: classification.replyMessage });
+        // True Real-Time Streaming LLM Generation (Zero Hardcoded Templates!)
+        let rawAccumulated = '';
+        let emittedTitle = '';
+        let emittedPlanCount = 0;
+        let emittedDbKey = '';
+        let emittedProseLen = 0;
+        let enteredCodePhase = false;
+        let lastFilesKey = '';
+        let lastBytesSent = 0;
+
+        await streamPollinationsRealTime({
+          systemPrompt: prepared.systemPrompt,
+          historyMessages: prepared.historyMessages,
+          userPrompt: prepared.userPrompt,
+          onReasoningChunk: () => {
+            if (!enteredCodePhase) {
+              sendEvent({
+                type: 'phase',
+                phase: 'understanding',
+                kind: 'chat',
+                label: 'Planning architecture step by step...',
+              });
+            }
+          },
+          onContentChunk: (chunk) => {
+            rawAccumulated += chunk;
+            const cleanSoFar = stripReasoningTags(rawAccumulated);
+
+            const foundTitle = extractSessionTitleFromRaw(cleanSoFar);
+            if (foundTitle && foundTitle !== emittedTitle) {
+              emittedTitle = foundTitle;
+              sendEvent({ type: 'title', title: foundTitle });
+            }
+
+            const stepsSoFar = extractPlanStepsFromRaw(cleanSoFar);
+            while (emittedPlanCount < stepsSoFar.length) {
+              const nextStep = stepsSoFar[emittedPlanCount];
+              emittedPlanCount += 1;
+              sendEvent({
+                type: 'plan',
+                step: nextStep,
+                allSteps: stepsSoFar.slice(0, emittedPlanCount),
+              });
+            }
+
+            const tablesSoFar = extractDbSchemaFromRaw(cleanSoFar);
+            if (tablesSoFar.length > 0) {
+              const key = tablesSoFar.map((t) => `${t.name}:${t.columns.length}`).join('|');
+              if (key !== emittedDbKey) {
+                emittedDbKey = key;
+                sendEvent({ type: 'schema', tables: tablesSoFar });
+              }
+            }
+
+            const codeStart = findCodeStart(cleanSoFar);
+            if (!codeStart) {
+              const proseSoFar = sanitizeBuildProse(cleanSoFar);
+              if (proseSoFar.length > emittedProseLen) {
+                const delta = proseSoFar.slice(emittedProseLen);
+                emittedProseLen = proseSoFar.length;
+                if (delta) {
+                  sendEvent({ type: 'delta', text: delta });
+                }
+              }
+            } else {
+              const preCodeProse = sanitizeBuildProse(cleanSoFar.slice(0, codeStart.markerIdx));
+              if (preCodeProse.length > emittedProseLen) {
+                const delta = preCodeProse.slice(emittedProseLen);
+                emittedProseLen = preCodeProse.length;
+                if (delta) {
+                  sendEvent({ type: 'delta', text: delta });
+                }
+              }
+
+              if (!enteredCodePhase) {
+                enteredCodePhase = true;
+                sendEvent({
+                  type: 'phase',
+                  phase: 'building',
+                  kind: 'build',
+                  label: 'Writing real-time code...',
+                });
+              }
+
+              const htmlSoFar = cleanSoFar
+                .slice(codeStart.htmlOffset)
+                .replace(/<<<\s*END_AICRAFT_APP_HTML\s*>>>[\s\S]*/i, '');
+              const artifacts = extractLiveBuildArtifacts(htmlSoFar);
+              const paths = artifacts.map((a) => a.path);
+              const filesKey = paths.join('|');
+              if (
+                filesKey !== lastFilesKey ||
+                htmlSoFar.length - lastBytesSent >= 450
+              ) {
+                lastFilesKey = filesKey;
+                lastBytesSent = htmlSoFar.length;
+                const active = artifacts[artifacts.length - 1];
+                sendEvent({
+                  type: 'file',
+                  action: active?.action || 'Coding',
+                  path: active?.path || 'index.html',
+                  allFiles: paths,
+                  bytesBuilt: htmlSoFar.length,
+                });
+              }
+            }
+          },
+        });
+
+        clearInterval(keepAlive);
+
+        const finalized = finalizeRealtimeOutput({
+          rawOutput: rawAccumulated,
+          message,
+          mode,
+          previousHtml,
+          modelUsed: requestedModel || 'pollinations::openai-fast',
+          modelName: prepared.requestedModelLabel || 'Free Browser AI',
+          provider: requestedGateway || 'pollinations',
+          startedAt,
+        });
+
+        if (finalized.kind === 'chat') {
           sendEvent({
             type: 'done',
             kind: 'chat',
-            title: shouldGenerateTitle ? classification.appTitle : undefined,
-            fullText: classification.replyMessage,
+            title: prepared.shouldGenerateTitle ? finalized.title : undefined,
+            fullText: finalized.aiText,
             previewHtml: '',
             allFiles: [],
-            suggestions: classification.followUpSuggestions,
+            suggestions: [],
             dbTables: [],
-            classifiedIntent: effectiveIntent,
-            classifiedModules: classification.componentIds,
-            classifiedFeatures: classification.featureIds,
             bytesBuilt: 0,
             creditsUsed: 0,
             billing: creditCheck.billing,
-            modelUsed: classification.modelUsed,
-            modelName: 'Gemini Intent Router',
-            provider: 'google',
+            modelUsed: finalized.modelUsed,
+            modelName: finalized.modelName,
+            provider: finalized.provider,
           });
           closeStream();
           return;
         }
 
-        // Branch 3: Local Modular Interface Assembly (No code from Gemini!)
-        const emittedSteps: string[] = [];
-        for (const step of classification.planSteps) {
-          emittedSteps.push(step);
-          sendEvent({
-            type: 'plan',
-            step,
-            allSteps: [...emittedSteps],
+        if (finalized.kind === 'media') {
+          const mediaResult: GeneratedMediaResult = await generateMediaAsset({
+            kind: 'image',
+            prompt: finalized.mediaPrompt || message,
+            requestedModel,
           });
-          await waitMs(45);
-        }
-
-        const assembled = assembleModularInterface({
-          route: classification,
-          previousHtml,
-          mode,
-          searchData,
-        });
-
-        sendEvent({
-          type: 'route',
-          intent: effectiveIntent,
-          componentIds: assembled.manifest.componentIds,
-          featureIds: assembled.manifest.featureIds,
-          addComponentIds: classification.addComponentIds,
-          removeComponentIds: classification.removeComponentIds,
-        });
-
-        if (assembled.dbTables.length > 0) {
-          sendEvent({ type: 'schema', tables: assembled.dbTables });
-        }
-
-        sendEvent({
-          type: 'phase',
-          phase: 'building',
-          kind: 'build',
-          label: 'Assembling classified modules locally...',
-        });
-
-        const builtPaths: string[] = [];
-        const totalSteps = Math.max(1, assembled.steps.length);
-        for (let idx = 0; idx < assembled.steps.length; idx += 1) {
-          const step = assembled.steps[idx];
-          builtPaths.push(step.path);
-          const partialBytes = Math.round(
-            (assembled.html.length * (idx + 1)) / totalSteps
-          );
+          sendEvent({ type: 'media', media: mediaResult });
           sendEvent({
-            type: 'file',
-            action: step.action,
-            path: step.path,
-            allFiles: [...builtPaths],
-            bytesBuilt: partialBytes,
+            type: 'done',
+            kind: 'media',
+            title: prepared.shouldGenerateTitle ? finalized.title : undefined,
+            fullText: finalized.aiText,
+            previewHtml: '',
+            allFiles: [],
+            suggestions: [],
+            dbTables: [],
+            bytesBuilt: 0,
+            creditsUsed: 0,
+            billing: creditCheck.billing,
+            media: mediaResult,
+            modelUsed: mediaResult.modelId || 'pollinations::sana',
+            modelName: prepared.requestedModelLabel,
+            provider: mediaResult.gateway,
           });
-          await waitMs(55);
+          closeStream();
+          return;
         }
 
         const rawCreditsUsed = isOwnerRequest
           ? 0
           : Math.max(
               1,
-              calculateBuildCreditsForBytes(assembled.html.length, {
-                filesCount: builtPaths.length,
-                dbTablesCount: assembled.dbTables.length,
+              calculateBuildCreditsForBytes(finalized.previewHtml.length, {
+                filesCount: finalized.files.length,
+                dbTablesCount: finalized.dbTables.length,
               })
             );
         const finalCreditsUsed = isOwnerRequest
@@ -415,6 +449,7 @@ export async function POST(request: Request): Promise<Response> {
           : effectiveCreditBudget !== null
             ? Math.min(rawCreditsUsed, effectiveCreditBudget)
             : rawCreditsUsed;
+
         let updatedBilling = creditCheck.billing;
         if (finalCreditsUsed > 0) {
           updatedBilling =
@@ -423,39 +458,29 @@ export async function POST(request: Request): Promise<Response> {
             )) ?? creditCheck.billing;
         }
 
-        const suggestions =
-          classification.followUpSuggestions.length > 0
-            ? classification.followUpSuggestions
-            : buildSmartFollowUpSuggestions(message, assembled.html, mode);
-
         sendEvent({
           type: 'done',
           kind: 'build',
-          title: shouldGenerateTitle ? assembled.manifest.appTitle : undefined,
-          logo: assembled.logoDirective,
-          fullText: classification.replyMessage,
-          previewHtml: assembled.html,
-          allFiles: builtPaths,
-          suggestions,
-          dbTables: assembled.dbTables,
-          classifiedIntent: effectiveIntent,
-          classifiedModules: assembled.manifest.componentIds,
-          classifiedFeatures: assembled.manifest.featureIds,
-          bytesBuilt: assembled.html.length,
+          title: prepared.shouldGenerateTitle ? finalized.title : undefined,
+          logo: finalized.logo ?? undefined,
+          fullText: finalized.aiText,
+          previewHtml: finalized.previewHtml,
+          allFiles: finalized.files,
+          suggestions: finalized.suggestions,
+          dbTables: finalized.dbTables,
+          bytesBuilt: finalized.bytesBuilt,
           creditsUsed: finalCreditsUsed,
           billing: updatedBilling,
-          modelUsed: classification.modelUsed,
-          modelName: 'Gemini Intent Router',
-          provider: 'google',
+          modelUsed: finalized.modelUsed,
+          modelName: finalized.modelName,
+          provider: finalized.provider,
         });
         closeStream();
       } catch (err) {
         const errorMessage =
-          err instanceof GeminiRouterError
+          err instanceof Error
             ? err.message
-            : err instanceof Error
-              ? err.message
-              : 'Unable to reach Gemini router right now.';
+            : 'Unable to reach free AI engine right now.';
         sendEvent({
           type: 'error',
           message: errorMessage,

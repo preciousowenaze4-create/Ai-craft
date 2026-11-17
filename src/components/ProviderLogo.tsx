@@ -10,9 +10,25 @@ function resolveProviderKey(provider?: string, modelId?: string): string {
   const raw = (provider || modelId?.split('/')[0] || 'aicraft')
     .toLowerCase()
     .trim();
-  if (raw === 'auto' || raw.includes('aicraft') || modelId === 'auto::architect') {
+  if (
+    raw === 'auto' ||
+    raw.includes('aicraft') ||
+    modelId === 'auto::free-browser' ||
+    modelId === 'auto::architect'
+  ) {
     return 'aicraft';
   }
+  if (raw.includes('puter') || modelId?.startsWith('puter::')) {
+    if (modelId?.includes('claude')) return 'anthropic';
+    if (modelId?.includes('gpt')) return 'openai';
+    if (modelId?.includes('gemini')) return 'google';
+    if (modelId?.includes('deepseek')) return 'deepseek';
+    if (modelId?.includes('llama') || modelId?.includes('meta')) return 'meta';
+    if (modelId?.includes('qwen')) return 'qwen';
+    return 'puter';
+  }
+  if (raw.includes('web-search') || modelId?.startsWith('web-search::')) return 'perplexity';
+  if (raw.includes('browser') || modelId?.startsWith('browser::')) return 'browser';
   if (raw.includes('openai')) return 'openai';
   if (raw.includes('anthropic')) return 'anthropic';
   if (raw.includes('google')) return 'google';
@@ -31,11 +47,7 @@ function resolveProviderKey(provider?: string, modelId?: string): string {
   if (raw.includes('bytedance')) return 'bytedance';
   if (raw.includes('minimax')) return 'minimax';
   if (raw.includes('z-ai') || raw.includes('zai') || raw.includes('thudm')) return 'zai';
-  if (raw.includes('groq')) return 'groq';
-  if (raw.includes('huggingface') || modelId?.startsWith('hf::')) return 'huggingface';
-  if (raw.includes('ngrok') || modelId?.startsWith('ngrok::')) return 'ngrok';
   if (raw.includes('pollinations') || modelId?.startsWith('pollinations::')) return 'pollinations';
-  if (raw.includes('openrouter')) return 'openrouter';
   return raw;
 }
 
@@ -234,6 +246,23 @@ export function ProviderLogo({
           <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" stroke="#1E3A8A" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <rect x="4" y="4" width="16" height="16" rx="4" fill="#EEF2FF" stroke="#4338CA" />
             <path d="M8.5 15.5V9L15.5 15V8.5" stroke="#312E81" strokeWidth="2.1" />
+          </svg>
+        );
+
+      case 'puter':
+        return (
+          <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <rect x="3" y="4.5" width="18" height="12.5" rx="3" fill="#0D5BFF" />
+            <rect x="5.5" y="7" width="13" height="7.5" rx="1.5" fill="#EFF6FF" />
+            <path d="M8.5 19.5H15.5" stroke="#0D5BFF" strokeWidth="2.1" strokeLinecap="round" />
+          </svg>
+        );
+
+      case 'browser':
+        return (
+          <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" stroke="#0D5BFF" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="8.5" />
+            <path d="M3.5 12h17M12 3.5a12.5 12.5 0 0 1 0 17M12 3.5a12.5 12.5 0 0 0 0 17" />
           </svg>
         );
 

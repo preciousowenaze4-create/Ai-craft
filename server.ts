@@ -5,7 +5,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
 import { createClient, type User as SupabaseUser } from '@supabase/supabase-js';
-import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import {
   BILLING_PLANS,
   buildPaymentCallbackHtml,
@@ -61,37 +60,18 @@ const IS_PROD = process.env.NODE_ENV === 'production';
 
 import {
   ARCHITECT_PUBLIC_MODEL,
-  buildCandidateCooldownKey,
+  POLLINATIONS_FALLBACK_MODELS,
+  PUTER_BROWSER_MODELS,
   buildGatewayExecutionPlan,
   fetchAllGatewayModels,
-  fetchGroqCatalog,
-  fetchHuggingFaceCatalog,
-  fetchNgrokCatalog,
   fetchPollinationsCatalog,
-  getGatewayOrder,
-  getGroqApiKey,
-  getHuggingFaceApiKey,
-  getNgrokApiKey,
-  isGatewayCandidateCoolingDown,
-  markGatewayCandidateCooldown,
-  POLLINATIONS_FALLBACK_MODELS,
-  type AiGatewayId,
-  type GatewayExecutionCandidate,
   type UnifiedAiModel,
 } from './api/_aiGateways.js';
 import {
   generateMediaAsset,
   type GeneratedMediaResult,
 } from './api/_mediaService.js';
-import {
-  cleanEnvKey,
-  fetchFreeOpenRouterCatalog,
-  getGeminiApiKey,
-  getGeminiApiKeyPool,
-  getOpenRouterApiKey,
-  resolveFreeModelInfo,
-  type NormalizedOpenRouterModel,
-} from './api/_openrouterModels.js';
+import { cleanEnvKey } from './api/_openrouterModels.js';
 import {
   ModerationActionType,
   applyOwnerModerationAction,
@@ -102,92 +82,24 @@ import {
   resolveUserWithModeration,
 } from './api/_moderation.js';
 import {
-  END_MARKER,
-  HOLDBACK_CHARS,
-  type InitialRoute,
   type ParsedDbTable,
-  START_MARKER,
-  buildFocusedSearchQuery,
-  buildCraftSystemPrompt,
-  buildProjectInfraContext,
-  buildSmartFollowUpSuggestions,
-  classifyInitialRoute,
-  extractDbSchemaFromHtml,
   extractDbSchemaFromRaw,
   extractLiveBuildArtifacts,
   extractPlanStepsFromRaw,
-  extractPreviewHtmlFromRaw,
-  extractPreviewStructureSummary,
   extractSessionTitleFromRaw,
-  extractSuggestionsFromRaw,
-  finalizePartialPreviewHtml,
   findCodeStart,
-  formatWebSearchContext,
-  mergeParsedDbTables,
   runLiveBrowserSearch,
-  sanitizeAndHardenPreviewHtml,
   sanitizeBuildProse,
-  shouldRunChatSearch,
   stripReasoningTags,
-  stripTagMarkers,
-  validateBuiltAppHtml,
 } from './api/_builderCore.js';
 import {
-  GeminiRouterError,
-  routeMessageWithGemini,
-} from './api/_geminiRouter.js';
-import { assembleModularInterface } from './api/_moduleAssembler.js';
+  finalizeRealtimeOutput,
+  prepareRealtimePrompt,
+  streamPollinationsRealTime,
+  type VisualHintsSpec,
+} from './api/_realtimeEngine.js';
 
-const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
-
-let cachedModels: NormalizedOpenRouterModel[] = [];
-let cachedGroqModels: UnifiedAiModel[] = [];
-let cachedHfModels: UnifiedAiModel[] = [];
-let cachedNgrokModels: UnifiedAiModel[] = [];
 let cachedPollinationsModels: UnifiedAiModel[] = [];
-let modelsCachedAt = 0;
-let modelsCachedKey = '';
-
-interface GeminiKeyClientEntry {
-  apiKey: string;
-  cooldownKey: string;
-  client: GoogleGenAI;
-}
-
-function createGeminiClientPool(): GeminiKeyClientEntry[] {
-  const keys = getGeminiApiKeyPool();
-  const ready: GeminiKeyClientEntry[] = [];
-  const cooling: GeminiKeyClientEntry[] = [];
-  for (const apiKey of keys) {
-    const cooldownKey = buildCandidateCooldownKey(
-      'gemini',
-      apiKey,
-      'gemini-4-hydrogen'
-    );
-    const entry: GeminiKeyClientEntry = {
-      apiKey,
-      cooldownKey,
-      client: new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          },
-        },
-      }),
-    };
-    if (isGatewayCandidateCoolingDown(cooldownKey)) {
-      cooling.push(entry);
-    } else {
-      ready.push(entry);
-    }
-  }
-  return [...ready, ...cooling];
-}
-
-function createGeminiClient() {
-  return createGeminiClientPool()[0]?.client ?? null;
-}
 
 function getSupabaseConfig(): { url: string; anonKey: string; serviceRoleKey: string } {
   const urlCandidates = [
@@ -360,300 +272,6 @@ function serializeSupabaseUser(user: SupabaseUser | null | undefined) {
       typeof appMeta.provider === 'string' ? appMeta.provider : 'email',
   };
 }
-
-function resolveModelInfo(modelId: string): {
-  id: string;
-  name: string;
-  provider: string;
-} {
-  return resolveFreeModelInfo(modelId, cachedModels);
-}
-
-async function fetchOpenRouterModels(forceRefresh = false): Promise<NormalizedOpenRouterModel[]> {
-  const openRouterKey = getOpenRouterApiKey();
-  const now = Date.now();
-
-  if (
-    !forceRefresh &&
-    modelsCachedKey === openRouterKey &&
-    cachedModels.length > 0 &&
-    now - modelsCachedAt < MODELS_CACHE_TTL_MS
-  ) {
-    return cachedModels;
-  }
-
-  const referer = process.env.APP_URL || `http://localhost:${PORT}`;
-  const openRouterModels = await fetchFreeOpenRouterCatalog(openRouterKey, referer);
-
-  if (openRouterModels.length > 0) {
-    cachedModels = openRouterModels;
-    modelsCachedAt = now;
-    modelsCachedKey = openRouterKey;
-  }
-
-  return openRouterModels;
-}
-
-type OpenRouterContentPart =
-  | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string } };
-
-type OpenRouterMessageContent = string | OpenRouterContentPart[];
-
-interface OpenRouterChatMessage {
-  role: 'user' | 'assistant';
-  content: OpenRouterMessageContent;
-}
-
-
-class GatewayApiError extends Error {
-  status: number;
-  constructor(message: string, status: number) {
-    super(message);
-    this.name = 'GatewayApiError';
-    this.status = status;
-  }
-}
-
-function stripImagesFromMessages(
-  messages: OpenRouterChatMessage[]
-): OpenRouterChatMessage[] {
-  return messages.map((msg) => {
-    if (typeof msg.content === 'string') return msg;
-    const textOnly = msg.content
-      .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
-      .map((part) => part.text)
-      .join('\n\n');
-    return {
-      role: msg.role,
-      content: textOnly || 'Please process the user request.',
-    };
-  });
-}
-
-async function streamOpenRouterCompletion(
-  candidate: GatewayExecutionCandidate,
-  systemInstruction: string,
-  messages: OpenRouterChatMessage[],
-  onTextChunk: (chunkText: string) => void,
-  onReasoningChunk?: () => void,
-  signal?: AbortSignal
-): Promise<void> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-  if (candidate.apiKey) {
-    headers.Authorization = `Bearer ${candidate.apiKey}`;
-  }
-  if (candidate.isOpenRouter) {
-    headers['HTTP-Referer'] = process.env.APP_URL || `http://localhost:${PORT}`;
-    headers['X-Title'] = 'AI Craft';
-  }
-
-  const endpointUrl =
-    candidate.gateway === 'pollinations'
-      ? `${candidate.baseUrl}/openai`
-      : `${candidate.baseUrl}/chat/completions`;
-
-  const attemptController = new AbortController();
-  let timedOutReason = '';
-  let receivedAnyStreamData = false;
-
-  const forwardAbort = () => {
-    if (!attemptController.signal.aborted) {
-      attemptController.abort();
-    }
-  };
-  if (signal) {
-    if (signal.aborted) forwardAbort();
-    else signal.addEventListener('abort', forwardAbort, { once: true });
-  }
-
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-  const resetWatchdog = (ms: number, reason: string) => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      timedOutReason = reason;
-      if (!attemptController.signal.aborted) {
-        attemptController.abort();
-      }
-    }, ms);
-  };
-
-  // Initial connect / first-byte timeout: 24s so calm reasoning/thinking models don't abort prematurely
-  resetWatchdog(24_000, `${candidate.modelName} timed out before responding`);
-
-  try {
-    const sendRequest = async (
-      payloadMessages: OpenRouterChatMessage[],
-      withMaxTokens = true
-    ) =>
-      fetch(endpointUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          model: candidate.upstreamModelId,
-          stream: true,
-          ...(withMaxTokens ? { max_tokens: 10240 } : {}),
-          messages: [
-            { role: 'system', content: systemInstruction },
-            ...payloadMessages,
-          ],
-        }),
-        signal: attemptController.signal,
-      });
-
-    let activeMessages = messages;
-    let response = await sendRequest(activeMessages, true);
-    const hasImages = messages.some(
-      (m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url')
-    );
-
-    // If a text-only model rejects multimodal image_url blocks, retry once as text-only
-    if (
-      hasImages &&
-      (!response.ok || !response.body) &&
-      (response.status === 400 || response.status === 404 || response.status === 422)
-    ) {
-      await response.text().catch(() => '');
-      activeMessages = stripImagesFromMessages(messages);
-      response = await sendRequest(activeMessages, true);
-    }
-
-    if ((!response.ok || !response.body) && response.status === 400) {
-      await response.text().catch(() => '');
-      response = await sendRequest(activeMessages, false);
-    }
-
-    if (!response.ok || !response.body) {
-      let errorDetail = `${candidate.gatewayLabel} error (${response.status})`;
-      try {
-        const errBody = (await response.json()) as {
-          error?: { message?: string };
-          message?: string;
-        };
-        if (errBody?.error?.message) {
-          errorDetail = errBody.error.message;
-        } else if (errBody?.message) {
-          errorDetail = errBody.message;
-        }
-      } catch {
-        const text = await response.text().catch(() => '');
-        if (text) errorDetail = text.slice(0, 200);
-      }
-      throw new GatewayApiError(errorDetail, response.status);
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    resetWatchdog(22_000, `${candidate.modelName} stalled mid-stream`);
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-
-      receivedAnyStreamData = true;
-      resetWatchdog(22_000, `${candidate.modelName} stalled mid-stream`);
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() ?? '';
-
-      for (const rawLine of lines) {
-        const trimmedLine = rawLine.trim();
-        if (!trimmedLine || trimmedLine.startsWith(':')) continue;
-
-        const subFrames = trimmedLine.includes('}data:')
-          ? trimmedLine.split(/(?=data:\s*)/)
-          : [trimmedLine];
-
-        for (const frame of subFrames) {
-          const line = frame.trim();
-          if (!line.startsWith('data:')) continue;
-
-          const data = line.slice(5).trim();
-          if (!data || data === '[DONE]') continue;
-
-          let parsed: {
-            error?: { message?: string };
-            choices?: Array<{
-              delta?: {
-                reasoning?: string;
-                reasoning_content?: string;
-                content?: string | Array<{ type?: string; text?: string }>;
-              };
-            }>;
-          };
-
-          try {
-            parsed = JSON.parse(data);
-          } catch {
-            continue;
-          }
-
-          if (parsed?.error?.message) {
-            throw new Error(parsed.error.message);
-          }
-
-          const delta = parsed?.choices?.[0]?.delta;
-          if ((delta?.reasoning || delta?.reasoning_content) && onReasoningChunk) {
-            onReasoningChunk();
-          }
-
-          const content = delta?.content;
-          if (typeof content === 'string' && content.length > 0) {
-            onTextChunk(content);
-          } else if (Array.isArray(content)) {
-            for (const part of content) {
-              if (typeof part?.text === 'string' && part.text.length > 0) {
-                onTextChunk(part.text);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if (buffer.trim().startsWith('data:')) {
-      const tailFrames = buffer.trim().split(/(?=data:\s*)/);
-      for (const frame of tailFrames) {
-        const data = frame.trim().slice(5).trim();
-        if (!data || data === '[DONE]') continue;
-        try {
-          const parsed = JSON.parse(data) as {
-            choices?: Array<{
-              delta?: { content?: string | Array<{ type?: string; text?: string }> };
-            }>;
-          };
-          const content = parsed?.choices?.[0]?.delta?.content;
-          if (typeof content === 'string' && content.length > 0) {
-            onTextChunk(content);
-          }
-        } catch {
-          // ignore partial tail
-        }
-      }
-    }
-
-    if (!receivedAnyStreamData) {
-      throw new Error(`${candidate.modelName} closed without returning data`);
-    }
-  } catch (err) {
-    if (timedOutReason) {
-      throw new GatewayApiError(timedOutReason, 504);
-    }
-    throw err;
-  } finally {
-    if (idleTimer) clearTimeout(idleTimer);
-    if (signal) {
-      signal.removeEventListener('abort', forwardAbort);
-    }
-  }
-}
-
-
 
 interface CraftJob {
   id: string;
@@ -890,14 +508,11 @@ async function startServer() {
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       ok: true,
-      geminiConfigured: Boolean(getGeminiApiKey()),
-      groqConfigured: Boolean(getGroqApiKey()),
-      openRouterConfigured: Boolean(getOpenRouterApiKey()),
-      huggingFaceConfigured: Boolean(getHuggingFaceApiKey()),
-      ngrokConfigured: Boolean(getNgrokApiKey()),
-      pollinationsConfigured: true,
-      gatewayOrder: getGatewayOrder(),
+      keylessBrowserAi: true,
+      puterJsEnabled: true,
+      pollinationsEnabled: true,
       supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
+      paymentsConfigured: Boolean(getPaymentSecretKey()),
     });
   });
 
@@ -2298,56 +1913,21 @@ async function startServer() {
 
   app.post('/api/transcribe', async (req, res) => {
     try {
-      const body = req.body as
-        | { audioBase64?: string; mimeType?: string; language?: string }
-        | undefined;
+      const body = req.body as { audioBase64?: string } | undefined;
       const audioBase64 =
         typeof body?.audioBase64 === 'string' ? body.audioBase64.trim() : '';
-      const rawMime =
-        typeof body?.mimeType === 'string'
-          ? body.mimeType.split(';')[0].trim()
-          : '';
-      const mimeType = rawMime || 'audio/webm';
-      const language =
-        typeof body?.language === 'string' ? body.language.trim() : '';
 
       if (!audioBase64) {
         res.status(400).json({ error: 'Audio data is required.' });
         return;
       }
 
-      const gemini = createGeminiClient();
-      if (!gemini) {
-        res.status(503).json({
-          error: 'Voice transcription backend is not configured yet.',
-        });
-        return;
-      }
-
-      const langHint = language ? ` Primary language hint: ${language}.` : '';
-      const response = await gemini.models.generateContent({
-        model: 'gemini-3.5-transcribe',
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType,
-                data: audioBase64,
-              },
-            },
-            {
-              text: `Transcribe the spoken words accurately with natural punctuation. Output ONLY the transcribed words and nothing else.${langHint}`,
-            },
-          ],
-        },
+      res.status(422).json({
+        error:
+          'Voice typing runs directly in your browser without API keys. Please allow microphone permission in Chrome, Edge, or Safari.',
       });
-
-      const text = (response.text ?? '').trim();
-      res.json({ text });
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Unable to transcribe audio.';
-      res.status(502).json({ error: message });
+    } catch {
+      res.status(400).json({ error: 'Unable to process audio input.' });
     }
   });
 
@@ -2357,36 +1937,29 @@ async function startServer() {
     try {
       const forceRefresh = req.query.refresh === '1';
       const result = await fetchAllGatewayModels(referer, forceRefresh);
+      cachedPollinationsModels = result.models.filter((m) => m.gateway === 'pollinations');
 
       res.json({
         models: result.models,
         gateways: result.gateways,
-        groqConfigured: result.groqConfigured,
-        openRouterConfigured: result.openRouterConfigured,
-        huggingFaceConfigured: result.huggingFaceConfigured,
-        ngrokConfigured: result.ngrokConfigured,
         pollinationsConfigured: result.pollinationsConfigured,
-        geminiConfigured: result.geminiConfigured,
-        freeOnly: !result.huggingFaceConfigured && !result.ngrokConfigured,
-        keyStatus: result.keyStatus,
+        puterConfigured: result.puterConfigured,
+        keyless: true,
+        freeOnly: true,
       });
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Unable to load AI gateway models.';
+    } catch {
       const fallbackModels = [
         ARCHITECT_PUBLIC_MODEL,
+        ...POLLINATIONS_FALLBACK_MODELS.filter((m) => m.category === 'code'),
+        ...PUTER_BROWSER_MODELS,
         ...POLLINATIONS_FALLBACK_MODELS.filter((m) => m.category !== 'code'),
       ];
       res.status(200).json({
         models: fallbackModels,
-        groqConfigured: Boolean(getGroqApiKey()),
-        openRouterConfigured: Boolean(getOpenRouterApiKey()),
-        huggingFaceConfigured: Boolean(getHuggingFaceApiKey()),
-        ngrokConfigured: Boolean(getNgrokApiKey()),
         pollinationsConfigured: true,
-        geminiConfigured: Boolean(getGeminiApiKey()),
+        puterConfigured: true,
+        keyless: true,
         freeOnly: true,
-        error: fallbackModels.length > 0 ? undefined : message,
       });
     }
   });
@@ -2465,6 +2038,11 @@ async function startServer() {
         cookies[SB_REFRESH_COOKIE] ||
         '';
 
+      let generationCreditContext: VerifiedGenerationContext | null = null;
+      let initialBillingSummary = null;
+      let serverCreditBudget: number | null = null;
+      let isOwnerRequest = false;
+
       if (accessToken || refreshToken) {
         const auth = await getAuthenticatedSupabaseUser(accessToken, refreshToken);
         if (auth.user) {
@@ -2486,110 +2064,235 @@ async function startServer() {
             });
             return;
           }
+          isOwnerRequest = Boolean(
+            resolvedMod?.serialized.isOwner || isOwnerEmail(auth.user.email)
+          );
+          const currentBilling = await reconcileAndLoadBillingState({
+            user: auth.user,
+            accessToken: auth.accessToken,
+            refreshToken: auth.refreshToken,
+            checkPaystack: false,
+          });
+          if (isOwnerRequest) {
+            generationCreditContext = {
+              user: auth.user,
+              accessToken: auth.accessToken,
+              refreshToken: auth.refreshToken,
+              state: currentBilling,
+              isOwner: true,
+            };
+            initialBillingSummary = serializeBillingSummary(currentBilling, true);
+            serverCreditBudget = null;
+          } else {
+            generationCreditContext = {
+              user: auth.user,
+              accessToken: auth.accessToken,
+              refreshToken: auth.refreshToken,
+              state: currentBilling,
+            };
+            initialBillingSummary = serializeBillingSummary(currentBilling);
+            serverCreditBudget = getAvailableCreditsBudget(currentBilling, Date.now());
+          }
         }
       }
 
       const body = (req.body || {}) as {
+        action?: 'prepare' | 'finalize';
         message?: string;
         mode?: string;
+        model?: string;
+        gateway?: string;
         previousHtml?: string;
         history?: Array<{ role: string; text: string }>;
         webSearchEnabled?: boolean;
-        assemble?: boolean;
+        forceChat?: boolean;
+        needsTitle?: boolean;
+        reactEnabled?: boolean;
+        backendEnabled?: boolean;
         attachmentName?: string | null;
         attachmentDataUrl?: string | null;
         attachmentMimeType?: string | null;
         attachmentText?: string | null;
+        secretKeys?: string[];
+        secretHints?: Array<{ key?: string; hint?: string }>;
+        databaseTables?: string[];
+        clientCreditsRemaining?: number;
         clientTime?: string;
         clientTimeZone?: string;
+        visualHints?: VisualHintsSpec | null;
+        rawOutput?: string;
+        modelUsed?: string;
+        modelName?: string;
+        provider?: string;
+        startedAt?: number;
+        options?: Record<string, unknown>;
       };
 
+      const opts = (body.options || {}) as Record<string, unknown>;
       const message = typeof body.message === 'string' ? body.message.trim() : '';
+      const mode = body.mode === 'web' ? 'web' : 'mobile';
+
+      if (body.action === 'finalize') {
+        const rawOutput = typeof body.rawOutput === 'string' ? body.rawOutput : '';
+        if (!rawOutput.trim()) {
+          res.status(400).json({ error: 'Streamed AI output is empty.' });
+          return;
+        }
+
+        const finalized = finalizeRealtimeOutput({
+          rawOutput,
+          message: message || 'App build',
+          mode,
+          previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
+          modelUsed: body.modelUsed,
+          modelName: body.modelName,
+          provider: body.provider,
+          startedAt: body.startedAt,
+        });
+
+        let creditsUsed = 0;
+        let updatedBilling = initialBillingSummary;
+        if (finalized.kind === 'build' && finalized.previewHtml && !isOwnerRequest) {
+          const rawCost = Math.max(
+            1,
+            calculateBuildCreditsForBytes(finalized.previewHtml.length, {
+              filesCount: finalized.files.length,
+              dbTablesCount: finalized.dbTables.length,
+            })
+          );
+          creditsUsed =
+            serverCreditBudget !== null ? Math.min(rawCost, serverCreditBudget) : rawCost;
+          if (creditsUsed > 0 && generationCreditContext) {
+            updatedBilling =
+              (await commitGenerationCredits(generationCreditContext, creditsUsed).catch(
+                () => null
+              )) ?? initialBillingSummary;
+          }
+        }
+
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({
+          ...finalized,
+          creditsUsed,
+          billing: updatedBilling,
+        });
+        return;
+      }
+
       if (!message) {
         res.status(400).json({ error: 'Prompt message is required.' });
         return;
       }
 
-      const mode = body.mode === 'web' ? 'web' : 'mobile';
-      const webSearchEnabled = body.webSearchEnabled !== false;
-      const shouldAssemble = body.assemble !== false;
+      const clientCreditsHint =
+        typeof (body.clientCreditsRemaining ?? opts.clientCreditsRemaining) === 'number'
+          ? Math.max(
+              0,
+              Math.floor(
+                Number(body.clientCreditsRemaining ?? opts.clientCreditsRemaining)
+              )
+            )
+          : null;
 
-      const searchData = webSearchEnabled
-        ? await runLiveBrowserSearch(buildFocusedSearchQuery(message))
-        : { query: '', results: [], images: [] };
-      const webSearchContext = formatWebSearchContext(searchData);
+      if (!isOwnerRequest) {
+        if (serverCreditBudget !== null && serverCreditBudget <= MIN_CHAT_CREDITS_THRESHOLD) {
+          res.status(402).json({
+            error: `You have ${serverCreditBudget.toLocaleString()} tokens remaining. Top up or upgrade a plan to continue.`,
+            code: 'LOW_CREDITS_THRESHOLD',
+            billing: initialBillingSummary,
+          });
+          return;
+        }
+        if (
+          serverCreditBudget === null &&
+          clientCreditsHint !== null &&
+          clientCreditsHint <= MIN_CHAT_CREDITS_THRESHOLD
+        ) {
+          res.status(402).json({
+            error: `You have ${clientCreditsHint.toLocaleString()} tokens remaining. Top up or upgrade a plan to continue.`,
+            code: 'LOW_CREDITS_THRESHOLD',
+          });
+          return;
+        }
+      }
 
-      const timeContext = [
-        body.clientTime ? `User local date/time: ${body.clientTime}` : '',
-        body.clientTimeZone ? `User timezone: ${body.clientTimeZone}` : '',
-        `Server UTC date/time: ${new Date().toUTCString()}`,
-      ]
-        .filter(Boolean)
-        .join(' | ');
-
-      const classification = await routeMessageWithGemini({
+      const prepared = await prepareRealtimePrompt({
         message,
         mode,
+        requestedModel: typeof body.model === 'string' ? body.model : undefined,
+        requestedGateway: typeof body.gateway === 'string' ? body.gateway : undefined,
         history: Array.isArray(body.history) ? body.history : [],
         previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
-        attachmentName: body.attachmentName ?? null,
-        attachmentDataUrl: body.attachmentDataUrl ?? null,
-        attachmentMimeType: body.attachmentMimeType ?? null,
-        attachmentText: body.attachmentText ?? null,
-        webSearchContext,
-        timeContext,
+        webSearchEnabled: (body.webSearchEnabled ?? opts.webSearchEnabled) !== false,
+        forceChat: Boolean(body.forceChat ?? opts.forceChat),
+        needsTitle: Boolean(body.needsTitle ?? opts.needsTitle),
+        reactEnabled: Boolean(body.reactEnabled ?? opts.reactEnabled),
+        backendEnabled: Boolean(body.backendEnabled ?? opts.backendEnabled),
+        attachmentName:
+          typeof (body.attachmentName ?? opts.attachmentName) === 'string'
+            ? String(body.attachmentName ?? opts.attachmentName)
+            : null,
+        attachmentDataUrl:
+          typeof (body.attachmentDataUrl ?? opts.attachmentDataUrl) === 'string'
+            ? String(body.attachmentDataUrl ?? opts.attachmentDataUrl)
+            : null,
+        attachmentText:
+          typeof (body.attachmentText ?? opts.attachmentText) === 'string'
+            ? String(body.attachmentText ?? opts.attachmentText)
+            : null,
+        secretKeys: Array.isArray(body.secretKeys ?? opts.secretKeys)
+          ? ((body.secretKeys ?? opts.secretKeys) as string[])
+          : [],
+        secretHints: Array.isArray(body.secretHints ?? opts.secretHints)
+          ? ((body.secretHints ?? opts.secretHints) as Array<{ key?: string; hint?: string }>)
+          : [],
+        databaseTables: Array.isArray(body.databaseTables ?? opts.databaseTables)
+          ? ((body.databaseTables ?? opts.databaseTables) as string[])
+          : [],
+        clientTime: body.clientTime,
+        clientTimeZone: body.clientTimeZone,
+        visualHints: (body.visualHints ?? opts.visualHints ?? null) as VisualHintsSpec | null,
       });
 
-      const isBuildIntent =
-        classification.intent === 'build_app' || classification.intent === 'edit_app';
-      const assembled =
-        shouldAssemble && isBuildIntent
-          ? assembleModularInterface({
-              route: classification,
-              previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
-              mode,
-              searchData,
-            })
-          : null;
+      if (body.action === 'prepare') {
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({
+          ok: true,
+          isOwnerRequest,
+          billing: initialBillingSummary,
+          ...prepared,
+        });
+        return;
+      }
+
+      let rawOutput = '';
+      await streamPollinationsRealTime({
+        systemPrompt: prepared.systemPrompt,
+        historyMessages: prepared.historyMessages,
+        userPrompt: prepared.userPrompt,
+        onContentChunk: (chunk) => {
+          rawOutput += chunk;
+        },
+      });
+
+      const finalized = finalizeRealtimeOutput({
+        rawOutput,
+        message,
+        mode,
+        previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
+        modelUsed: body.model || 'pollinations::openai-fast',
+        modelName: prepared.requestedModelLabel,
+        provider: 'pollinations',
+      });
 
       res.setHeader('Cache-Control', 'no-store');
       res.json({
-        ok: true,
-        router: classification.modelUsed,
-        intent: classification.intent,
-        appTitle: classification.appTitle,
-        brandTagline: classification.brandTagline,
-        summary: classification.replyMessage,
-        primaryColor: classification.primaryColor,
-        surfaceTheme: classification.surfaceTheme,
-        componentIds: assembled?.manifest.componentIds ?? classification.componentIds,
-        featureIds: assembled?.manifest.featureIds ?? classification.featureIds,
-        addComponentIds: classification.addComponentIds,
-        removeComponentIds: classification.removeComponentIds,
-        customTabs: assembled?.manifest.customTabs ?? classification.customTabs,
-        dataTables: assembled?.dbTables ?? classification.dataTables,
-        planSteps: classification.planSteps,
-        followUpSuggestions: classification.followUpSuggestions,
-        mediaPrompt:
-          classification.intent === 'generate_image' ||
-          classification.intent === 'generate_music' ||
-          classification.intent === 'generate_video'
-            ? classification.mediaPrompt
-            : undefined,
-        ...(assembled
-          ? {
-              assembledModules: assembled.steps,
-              previewHtml: assembled.html,
-            }
-          : {}),
+        ...finalized,
+        searchData: prepared.searchData,
       });
     } catch (err) {
-      if (err instanceof GeminiRouterError) {
-        res.status(err.status).json({ error: err.message, code: err.code });
-        return;
-      }
       const message =
-        err instanceof Error ? err.message : 'Unable to route message through Gemini.';
+        err instanceof Error ? err.message : 'Unable to run free browser AI.';
       res.status(502).json({ error: message });
     }
   });
@@ -2607,6 +2310,8 @@ async function startServer() {
       clientTimeZone?: string;
       previousHtml?: string;
       history?: Array<{ role: string; text: string }>;
+      clientClassification?: Record<string, unknown> | null;
+      visualHints?: VisualHintsSpec | null;
       options?: {
         reactEnabled?: boolean;
         backendEnabled?: boolean;
@@ -2621,6 +2326,8 @@ async function startServer() {
         databaseTables?: string[];
         clientCreditsRemaining?: number;
         needsTitle?: boolean;
+        clientClassification?: Record<string, unknown> | null;
+        visualHints?: VisualHintsSpec | null;
       };
     };
 
@@ -2843,240 +2550,265 @@ async function startServer() {
       job.subscribers.delete(res);
     });
 
-    const groqKey = getGroqApiKey();
-    const openRouterKey = getOpenRouterApiKey();
-    const huggingFaceKey = getHuggingFaceApiKey();
-    const ngrokKey = getNgrokApiKey();
-    const geminiClients = createGeminiClientPool();
-
     try {
-      const timeContext = [
-        clientTime ? `User local date/time: ${clientTime}` : '',
-        clientTimeZone ? `User timezone: ${clientTimeZone}` : '',
-        `Server UTC date/time: ${new Date().toUTCString()}`,
-      ]
-        .filter(Boolean)
-        .join(' | ');
-
       sendEvent({
         type: 'phase',
         phase: 'understanding',
         kind: 'chat',
-        label: 'Routing intent & classifying modules via Gemini...',
+        label: 'Searching live web & thinking...',
+      });
+
+      const visualHints = body?.visualHints ?? options.visualHints ?? null;
+      const prepared = await prepareRealtimePrompt({
+        message,
+        mode,
+        requestedModel,
+        requestedGateway,
+        history,
+        previousHtml,
+        webSearchEnabled,
+        forceChat: Boolean(options.forceChat),
+        needsTitle: Boolean(options.needsTitle),
+        reactEnabled: Boolean(options.reactEnabled),
+        backendEnabled: Boolean(options.backendEnabled),
+        attachmentName: options.attachmentName ?? null,
+        attachmentDataUrl,
+        attachmentText,
+        secretKeys,
+        secretHints,
+        databaseTables,
+        clientTime,
+        clientTimeZone,
+        visualHints,
       });
 
       sendEvent({
         type: 'meta',
-        kind: 'chat',
-        modelId: 'google/gemini-4-hydrogen',
-        modelName: 'Gemini Intent Router',
-        provider: 'google',
-        gateway: 'gemini',
+        kind: prepared.naturalMediaIntent ? 'media' : 'chat',
+        modelId: requestedModel || 'pollinations::openai-fast',
+        modelName: prepared.requestedModelLabel || 'Free Browser AI',
+        provider: requestedGateway || 'pollinations',
+        gateway: requestedGateway || 'pollinations',
         isFallback: false,
       });
 
-      const executionPlan = buildGatewayExecutionPlan({
-        requestedModel,
-        requestedGateway,
-        openRouterCatalog: cachedModels,
-        huggingFaceCatalog: cachedHfModels,
-        ngrokCatalog: cachedNgrokModels,
-        groqCatalog: cachedGroqModels,
-        pollinationsCatalog:
-          cachedPollinationsModels.length > 0
-            ? cachedPollinationsModels
-            : POLLINATIONS_FALLBACK_MODELS,
-      });
-      const requestedMediaKind = executionPlan.requestedMediaKind;
-
-      const searchData = webSearchEnabled
-        ? await runLiveBrowserSearch(buildFocusedSearchQuery(message))
-        : { query: '', results: [], images: [] };
-      const webSearchContext = formatWebSearchContext(searchData);
-
-      // Route all incoming user messages directly through Gemini API key as intent router & module classifier
-      const classification = await routeMessageWithGemini({
-        message,
-        mode,
-        requestedMediaKind,
-        history,
-        previousHtml,
-        attachmentName: options.attachmentName ?? null,
-        attachmentDataUrl,
-        attachmentMimeType,
-        attachmentText,
-        webSearchContext,
-        timeContext,
-      });
-
-      const shouldGenerateTitle = history.length === 0 || Boolean(options.needsTitle);
-      if (shouldGenerateTitle && classification.appTitle) {
-        sendEvent({ type: 'title', title: classification.appTitle });
-      }
-
-      sendEvent({
-        type: 'route',
-        intent: classification.intent,
-        componentIds: classification.componentIds,
-        featureIds: classification.featureIds,
-        addComponentIds: classification.addComponentIds,
-        removeComponentIds: classification.removeComponentIds,
-      });
-
-      const effectiveIntent =
-        requestedMediaKind !== null && classification.intent !== 'chat'
-          ? (`generate_${requestedMediaKind}` as const)
-          : options.forceChat
-            ? ('chat' as const)
-            : classification.intent;
-
-      clearInterval(keepAlive);
-
-      if (
-        effectiveIntent === 'generate_image' ||
-        effectiveIntent === 'generate_music' ||
-        effectiveIntent === 'generate_video'
-      ) {
-        const mediaKind =
-          effectiveIntent === 'generate_music'
-            ? 'music'
-            : effectiveIntent === 'generate_video'
-              ? 'video'
-              : 'image';
-
+      if (prepared.naturalMediaIntent) {
+        const mediaKind = prepared.naturalMediaIntent;
         sendEvent({
           type: 'phase',
           phase: 'building',
           kind: 'media',
           label:
             mediaKind === 'video'
-              ? 'Generating video...'
+              ? 'Generating motion preview...'
               : mediaKind === 'music'
-                ? 'Composing music...'
-                : 'Generating image...',
+                ? 'Composing custom studio track...'
+                : 'Generating image & searching visual references...',
         });
 
         const mediaResult: GeneratedMediaResult = await generateMediaAsset({
           kind: mediaKind,
-          prompt: classification.mediaPrompt || message,
+          prompt: message,
           requestedModel,
         });
 
+        clearInterval(keepAlive);
         sendEvent({ type: 'media', media: mediaResult });
         sendEvent({
           type: 'done',
           kind: 'media',
-          title: shouldGenerateTitle ? classification.appTitle : undefined,
-          fullText:
-            classification.replyMessage ||
-            `Generated your ${mediaKind}: "${(classification.mediaPrompt || message).slice(0, 120)}"`,
+          fullText: `Generated your ${mediaKind}: "${message.slice(0, 120)}"`,
           previewHtml: '',
           allFiles: [],
           suggestions: [],
           dbTables: [],
-          classifiedIntent: effectiveIntent,
-          classifiedModules: classification.componentIds,
-          classifiedFeatures: classification.featureIds,
           bytesBuilt: 0,
           creditsUsed: 0,
           billing: initialBillingSummary,
           media: mediaResult,
-          modelUsed: mediaResult.modelId || 'google/gemini-4-hydrogen',
-          modelName: executionPlan.requestedModelLabel || 'Gemini Intent Router',
+          modelUsed: mediaResult.modelId || 'pollinations::sana',
+          modelName: prepared.requestedModelLabel || 'Free Browser AI Studio',
           provider: mediaResult.gateway,
           startedAt: job.startedAt,
         });
         return;
       }
 
-      if (effectiveIntent === 'chat') {
-        sendEvent({ type: 'delta', text: classification.replyMessage });
+      let rawAccumulated = '';
+      let emittedTitle = '';
+      let emittedPlanCount = 0;
+      let emittedDbKey = '';
+      let emittedProseLen = 0;
+      let enteredCodePhase = false;
+      let lastFilesKey = '';
+      let lastBytesSent = 0;
+
+      await streamPollinationsRealTime({
+        systemPrompt: prepared.systemPrompt,
+        historyMessages: prepared.historyMessages,
+        userPrompt: prepared.userPrompt,
+        signal: clientAbort.signal,
+        onReasoningChunk: () => {
+          if (!enteredCodePhase) {
+            sendEvent({
+              type: 'phase',
+              phase: 'understanding',
+              kind: 'chat',
+              label: 'Planning architecture step by step...',
+            });
+          }
+        },
+        onContentChunk: (chunk) => {
+          rawAccumulated += chunk;
+          const cleanSoFar = stripReasoningTags(rawAccumulated);
+
+          const foundTitle = extractSessionTitleFromRaw(cleanSoFar);
+          if (foundTitle && foundTitle !== emittedTitle) {
+            emittedTitle = foundTitle;
+            sendEvent({ type: 'title', title: foundTitle });
+          }
+
+          const stepsSoFar = extractPlanStepsFromRaw(cleanSoFar);
+          while (emittedPlanCount < stepsSoFar.length) {
+            const nextStep = stepsSoFar[emittedPlanCount];
+            emittedPlanCount += 1;
+            sendEvent({
+              type: 'plan',
+              step: nextStep,
+              allSteps: stepsSoFar.slice(0, emittedPlanCount),
+            });
+          }
+
+          const tablesSoFar = extractDbSchemaFromRaw(cleanSoFar);
+          if (tablesSoFar.length > 0) {
+            const key = tablesSoFar.map((t) => `${t.name}:${t.columns.length}`).join('|');
+            if (key !== emittedDbKey) {
+              emittedDbKey = key;
+              sendEvent({ type: 'schema', tables: tablesSoFar });
+            }
+          }
+
+          const codeStart = findCodeStart(cleanSoFar);
+          if (!codeStart) {
+            const proseSoFar = sanitizeBuildProse(cleanSoFar);
+            if (proseSoFar.length > emittedProseLen) {
+              const delta = proseSoFar.slice(emittedProseLen);
+              emittedProseLen = proseSoFar.length;
+              if (delta) {
+                sendEvent({ type: 'delta', text: delta });
+              }
+            }
+          } else {
+            const preCodeProse = sanitizeBuildProse(cleanSoFar.slice(0, codeStart.markerIdx));
+            if (preCodeProse.length > emittedProseLen) {
+              const delta = preCodeProse.slice(emittedProseLen);
+              emittedProseLen = preCodeProse.length;
+              if (delta) {
+                sendEvent({ type: 'delta', text: delta });
+              }
+            }
+
+            if (!enteredCodePhase) {
+              enteredCodePhase = true;
+              sendEvent({
+                type: 'phase',
+                phase: 'building',
+                kind: 'build',
+                label: 'Writing real-time code...',
+              });
+            }
+
+            const htmlSoFar = cleanSoFar
+              .slice(codeStart.htmlOffset)
+              .replace(/<<<\s*END_AICRAFT_APP_HTML\s*>>>[\s\S]*/i, '');
+            const artifacts = extractLiveBuildArtifacts(htmlSoFar);
+            const paths = artifacts.map((a) => a.path);
+            const filesKey = paths.join('|');
+            if (filesKey !== lastFilesKey || htmlSoFar.length - lastBytesSent >= 450) {
+              lastFilesKey = filesKey;
+              lastBytesSent = htmlSoFar.length;
+              const active = artifacts[artifacts.length - 1];
+              sendEvent({
+                type: 'file',
+                action: active?.action || 'Coding',
+                path: active?.path || 'index.html',
+                allFiles: paths,
+                bytesBuilt: htmlSoFar.length,
+              });
+            }
+          }
+        },
+      });
+
+      clearInterval(keepAlive);
+
+      const finalized = finalizeRealtimeOutput({
+        rawOutput: rawAccumulated,
+        message,
+        mode,
+        previousHtml,
+        modelUsed: requestedModel || 'pollinations::openai-fast',
+        modelName: prepared.requestedModelLabel || 'Free Browser AI',
+        provider: requestedGateway || 'pollinations',
+        startedAt: job.startedAt,
+      });
+
+      if (finalized.kind === 'chat') {
         sendEvent({
           type: 'done',
           kind: 'chat',
-          title: shouldGenerateTitle ? classification.appTitle : undefined,
-          fullText: classification.replyMessage,
+          title: prepared.shouldGenerateTitle ? finalized.title : undefined,
+          fullText: finalized.aiText,
           previewHtml: '',
           allFiles: [],
-          suggestions: classification.followUpSuggestions,
+          suggestions: [],
           dbTables: [],
-          classifiedIntent: effectiveIntent,
-          classifiedModules: classification.componentIds,
-          classifiedFeatures: classification.featureIds,
           bytesBuilt: 0,
           creditsUsed: 0,
           billing: initialBillingSummary,
-          modelUsed: classification.modelUsed,
-          modelName: 'Gemini Intent Router',
-          provider: 'google',
+          modelUsed: finalized.modelUsed,
+          modelName: finalized.modelName,
+          provider: finalized.provider,
           startedAt: job.startedAt,
         });
         return;
       }
 
-      const emittedSteps: string[] = [];
-      for (const step of classification.planSteps) {
-        emittedSteps.push(step);
-        sendEvent({
-          type: 'plan',
-          step,
-          allSteps: [...emittedSteps],
+      if (finalized.kind === 'media') {
+        const mediaResult: GeneratedMediaResult = await generateMediaAsset({
+          kind: 'image',
+          prompt: finalized.mediaPrompt || message,
+          requestedModel,
         });
-        await new Promise((r) => setTimeout(r, 45));
-      }
-
-      const assembled = assembleModularInterface({
-        route: classification,
-        previousHtml,
-        mode,
-        searchData,
-      });
-
-      sendEvent({
-        type: 'route',
-        intent: effectiveIntent,
-        componentIds: assembled.manifest.componentIds,
-        featureIds: assembled.manifest.featureIds,
-        addComponentIds: classification.addComponentIds,
-        removeComponentIds: classification.removeComponentIds,
-      });
-
-      if (assembled.dbTables.length > 0) {
-        sendEvent({ type: 'schema', tables: assembled.dbTables });
-      }
-
-      sendEvent({
-        type: 'phase',
-        phase: 'building',
-        kind: 'build',
-        label: 'Assembling classified modules locally...',
-      });
-
-      const builtPaths: string[] = [];
-      const totalSteps = Math.max(1, assembled.steps.length);
-      for (let idx = 0; idx < assembled.steps.length; idx += 1) {
-        const step = assembled.steps[idx];
-        builtPaths.push(step.path);
-        const partialBytes = Math.round(
-          (assembled.html.length * (idx + 1)) / totalSteps
-        );
+        sendEvent({ type: 'media', media: mediaResult });
         sendEvent({
-          type: 'file',
-          action: step.action,
-          path: step.path,
-          allFiles: [...builtPaths],
-          bytesBuilt: partialBytes,
+          type: 'done',
+          kind: 'media',
+          title: prepared.shouldGenerateTitle ? finalized.title : undefined,
+          fullText: finalized.aiText,
+          previewHtml: '',
+          allFiles: [],
+          suggestions: [],
+          dbTables: [],
+          bytesBuilt: 0,
+          creditsUsed: 0,
+          billing: initialBillingSummary,
+          media: mediaResult,
+          modelUsed: mediaResult.modelId || 'pollinations::sana',
+          modelName: prepared.requestedModelLabel,
+          provider: mediaResult.gateway,
+          startedAt: job.startedAt,
         });
-        await new Promise((r) => setTimeout(r, 55));
+        return;
       }
 
       const rawCreditsUsed = isOwnerRequest
         ? 0
         : Math.max(
             1,
-            calculateBuildCreditsForBytes(assembled.html.length, {
-              filesCount: builtPaths.length,
-              dbTablesCount: assembled.dbTables.length,
+            calculateBuildCreditsForBytes(finalized.previewHtml.length, {
+              filesCount: finalized.files.length,
+              dbTablesCount: finalized.dbTables.length,
             })
           );
       const finalCreditsUsed = isOwnerRequest
@@ -3094,40 +2826,28 @@ async function startServer() {
           ).catch(() => null)) ?? initialBillingSummary;
       }
 
-      const suggestions =
-        classification.followUpSuggestions.length > 0
-          ? classification.followUpSuggestions
-          : buildSmartFollowUpSuggestions(message, assembled.html, mode);
-
       sendEvent({
         type: 'done',
         kind: 'build',
-        title: shouldGenerateTitle ? assembled.manifest.appTitle : undefined,
-        logo: assembled.logoDirective,
-        fullText: classification.replyMessage,
-        previewHtml: assembled.html,
-        allFiles: builtPaths,
-        suggestions,
-        dbTables: assembled.dbTables,
-        classifiedIntent: effectiveIntent,
-        classifiedModules: assembled.manifest.componentIds,
-        classifiedFeatures: assembled.manifest.featureIds,
-        bytesBuilt: assembled.html.length,
+        title: prepared.shouldGenerateTitle ? finalized.title : undefined,
+        logo: finalized.logo ?? undefined,
+        fullText: finalized.aiText,
+        previewHtml: finalized.previewHtml,
+        allFiles: finalized.files,
+        suggestions: finalized.suggestions,
+        dbTables: finalized.dbTables,
+        bytesBuilt: finalized.bytesBuilt,
         creditsUsed: finalCreditsUsed,
         billing: updatedBilling,
-        modelUsed: classification.modelUsed,
-        modelName: 'Gemini Intent Router',
-        provider: 'google',
+        modelUsed: finalized.modelUsed,
+        modelName: finalized.modelName,
+        provider: finalized.provider,
         startedAt: job.startedAt,
       });
     } catch (err) {
       clearInterval(keepAlive);
       const errorMessage =
-        err instanceof GeminiRouterError
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : 'Unable to reach Gemini router right now.';
+        err instanceof Error ? err.message : 'Unable to reach free AI engine right now.';
       sendEvent({
         type: 'error',
         message: errorMessage,

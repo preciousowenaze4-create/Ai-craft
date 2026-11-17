@@ -80,12 +80,15 @@ export interface OpenRouterModel {
   isFree: boolean;
   gateway?:
     | 'auto'
+    | 'puter'
+    | 'pollinations'
+    | 'browser'
+    | 'web-search'
     | 'gemini'
     | 'groq'
     | 'openrouter'
     | 'huggingface'
-    | 'ngrok'
-    | 'pollinations';
+    | 'ngrok';
   upstreamModelId?: string;
   tierLabel?: string;
   capabilities?: string[];
@@ -159,6 +162,7 @@ export interface ComposerOptions {
   databaseTables?: string[];
   clientCreditsRemaining?: number;
   needsTitle?: boolean;
+  forceChat?: boolean;
 }
 
 export interface BuilderTurn {
@@ -176,9 +180,6 @@ export interface BuilderTurn {
   activeFile: string;
   files: string[];
   planSteps?: string[];
-  classifiedIntent?: string;
-  classifiedModules?: string[];
-  classifiedFeatures?: string[];
   suggestions?: string[];
   aiText: string;
   modelId?: string;

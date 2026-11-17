@@ -67,7 +67,7 @@ export function buildFocusedSearchQuery(rawPrompt: string): string {
     .replace(/\[\[\s*CONTINUE_BUILD\s*\]\]/gi, '')
     .replace(/["'`]/g, ' ')
     .replace(
-      /\b(?:please|can you|could you|would you|i want you to|i need you to|help me|build me|build|create me|create|make me|make|design me|design|develop|code|craft|generate|put together|an?|the|my|app|mobile app|web app|website|webpage|webapp|clone|like|with|using|that has|for me|so that|real time|real-time|functioning|functional|database|please)\b/gi,
+      /\b(?:please|can you|could you|would you|i want you to|i need you to|help me|build me|build|create me|create|make me|make|design me|design|develop|code|craft|generate|put together|search the|search for|search|find me|look up|an?|the|my|app|mobile app|web app|website|webpage|webapp|clone|like|with|using|that has|for me|so that|real time|real-time|functioning|functional|database|step by step)\b/gi,
       ' '
     )
     .replace(/[^\w\s&+-]/g, ' ')
@@ -75,7 +75,7 @@ export function buildFocusedSearchQuery(rawPrompt: string): string {
     .trim();
 
   if (cleaned.length >= 3) {
-    return `${cleaned} ui design product features`.slice(0, 140).trim();
+    return cleaned.slice(0, 140).trim();
   }
   return String(rawPrompt || '')
     .replace(/\s+/g, ' ')
@@ -291,7 +291,47 @@ export async function runLiveBrowserSearch(query: string): Promise<{
     }
   })();
 
-  await Promise.allSettled([ddgTask, wikiTask, commonsTask, bingImgTask]);
+  const ddgHtmlTask = (async () => {
+    try {
+      const ddgHtmlUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(
+        cleanQuery
+      )}`;
+      const res = await fetchWithTimeout(ddgHtmlUrl, 2800, 'text/html,application/xhtml+xml');
+      if (!res.ok) return;
+      const html = await res.text();
+      const blocks = html.split(/class="result__body"/i).slice(1, 6);
+      for (const block of blocks) {
+        const titleMatch = /class="result__a"[^>]*>([\s\S]*?)<\/a>/i.exec(block);
+        const snippetMatch = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i.exec(block) ||
+          /class="result__snippet"[^>]*>([\s\S]*?)<\/div>/i.exec(block);
+        const hrefMatch = /href="(https?:\/\/[^"]+)"/i.exec(block);
+        const stripHtml = (s: string) =>
+          s
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&amp;/g, '&')
+            .replace(/&quot;/g, '"')
+            .replace(/&#x27;/g, "'")
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/\s+/g, ' ')
+            .trim();
+        const title = titleMatch ? stripHtml(titleMatch[1]) : cleanQuery;
+        const snippet = snippetMatch ? stripHtml(snippetMatch[1]) : '';
+        if (snippet.length > 15) {
+          addResult({
+            title: title || cleanQuery,
+            snippet: snippet.slice(0, 280),
+            url: hrefMatch ? hrefMatch[1] : '',
+            source: 'DuckDuckGo Web',
+          });
+        }
+      }
+    } catch {
+      // ignore timeout or network failure
+    }
+  })();
+
+  await Promise.allSettled([ddgTask, ddgHtmlTask, wikiTask, commonsTask, bingImgTask]);
   return {
     query: cleanQuery,
     results: results.slice(0, 8),
@@ -1105,7 +1145,7 @@ export function extractSuggestionsFromRaw(raw: string): string[] {
     );
   if (!blockMatch) return [];
   const lines = blockMatch[1]
-    .split(/\r?\n/)
+    .split(/\r?\n|\|/)
     .map((line) =>
       line
         .replace(/^\s*(?:[-*•]+|\d+[.)])\s*/, '')
@@ -1344,29 +1384,28 @@ export function buildCraftSystemPrompt(params: {
   const buildRulesBlock = [
     'CALM REPLIT-STYLE STEP-BY-STEP ENGINEERING DISCIPLINE — NEVER RUSH, NEVER STUB, NEVER LIE:',
     '- Slow down and think structurally like a senior Replit full-stack engineer before writing code. Build cleanly section by section so every route, button, form, database table, and screen works together.',
-    '- SURGICAL EDIT & SCREENSHOT PRESERVATION RULE (CRITICAL WHEN EDITING AN EXISTING APP): When existing Preview HTML or an attached screenshot is provided, inspect what already works and ONLY remove, cut, restyle, or modify the exact element/screen the user pointed out! NEVER wipe out working tabs, databases, styles, or unrelated features unless explicitly asked to rebuild from scratch.',
-    '- STRICT HONESTY CONTRACT: NEVER claim in your explanation that you built a feed, upload modal, player, chat box, checkout, search, or live database unless that exact screen, button, handler, and DOM content is genuinely implemented and working inside PART 2.',
-    '- ZERO HARDCODING UNRELATED EXAMPLES: Build ONLY what the user actually asked for — never insert random unrelated sample topics.',
+    '- SURGICAL EDIT & SCREENSHOT PRESERVATION RULE (CRITICAL WHEN EDITING AN EXISTING APP): When existing Preview HTML or an attached screenshot is provided, read the existing code/DOM carefully and ONLY remove, cut, restyle, or modify the exact element/screen the user pointed out! Keep all untouched screens, styling, working JavaScript handlers, and database data intact — NEVER wipe the existing app or replace it with a bare shell.',
+    '- STRICT HONESTY & NO UNSOLICITED "OPEN" BUTTONS: NEVER claim in your explanation that you built a feature unless that exact screen, button, handler, and DOM content is genuinely implemented and working inside PART 2. Never add an "Open" banner or external "Open" launcher button inside the app unless the user explicitly asks for one.',
+    '- REAL-WORLD GROUNDING (ZERO GENERIC PLACEHOLDERS): Use real verified facts, services, names, departments, and real HTTPS photos from `Live Browser & Web Search Results` when available (with clean `onerror` CSS gradient fallbacks). Never output dummy placeholders like "Item 1", "Feature A", or "Lorem ipsum".',
     titleRuleForBuild,
-    'STEP 0 (Calm 5-Step Architecture & Monetization Plan): Output 5 short, crystal-clear module planning lines using exact format `[[PLAN: <step>]]` (tailored specifically to the app being built, e.g., Profile, Chat box, Feed, Database, Monetization):',
-    '  1) `[[PLAN: Core layout, custom brand icon & palette — ...]]`',
+    'STEP 0 (Calm 5-Step Architecture & Database Plan): Output 5 short, crystal-clear planning lines using exact format `[[PLAN: <step>]]` tailored specifically to the user\'s app idea:',
+    '  1) `[[PLAN: Researching domain data, brand palette & custom icon — ...]]`',
     '  2) `[[PLAN: Responsive multi-device shell (Android, iOS, Laptop & TV) — ...]]`',
     '  3) `[[PLAN: Real-time database schema (`window.AICraft.db`) — ...]]`',
-    '  4) `[[PLAN: Interactive screens & core user flows — ...]]`',
-    '  5) `[[PLAN: Built-in monetization & live transactions — ...]]`',
-    'STEP 0B (Real-Time Database Schema Lines): Output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Every interactive app must have real domain tables (e.g., business app -> `customers`, `orders`, `invoices`, `products`; chat app -> `conversations`, `messages`, `contacts`; social feed -> `posts`, `comments`, `creator_profiles`, `transactions`).',
-    'STEP 0C (Custom Brand Logo Tag): Output one `[[LOGO: bg=#HEX, accent=#HEX, theme=#HEX, motif=play|chat|bag|music|camera|heart|bolt|star|wallet|map|flame|spark|letter, letters=XX]]` tailored specifically to the user\'s app & requested colors. NEVER output AI Craft\'s logo.',
-    'PART 1 (Honest Architectural Summary): Write 2–3 calm, clear plain-text sentences summarizing ONLY the exact screens, real-time `window.AICraft.db` tables, interactive controls, and monetization you actually built below. PROHIBITED IN PART 1: raw HTML/CSS/JS, markdown code fences (```), backticks, or the words "PART 1"/"PART 2"/"PART 3".',
+    '  4) `[[PLAN: Interactive screens & real-time state flows — ...]]`',
+    '  5) `[[PLAN: Built-in actions, search & monetization — ...]]`',
+    'STEP 0B (Real-Time Database Schema Lines): Output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Every interactive app must have real domain tables (e.g., clinic app -> `appointments`, `doctors`, `patients`, `services`; chat app -> `conversations`, `messages`, `contacts`; social feed -> `posts`, `comments`, `creator_profiles`).',
+    'STEP 0C (Custom Brand Logo Tag): Output one `[[LOGO: bg=#HEX, accent=#HEX, theme=#HEX, motif=play|chat|bag|music|camera|heart|bolt|star|wallet|map|flame|spark|letter, letters=XX]]` tailored specifically to the user\'s app & colors. NEVER output AI Craft\'s logo.',
+    'PART 1 (Honest Architectural Summary): Write 2–3 calm, clear plain-text sentences summarizing ONLY the exact screens, real-time `window.AICraft.db` tables, interactive controls, and real searched content you built below. PROHIBITED IN PART 1: raw HTML/CSS/JS, markdown code fences (```), backticks, or the words "PART 1"/"PART 2"/"PART 3".',
     'PART 2 (Complete Self-Contained Real-Time App): Immediately output <<<AICRAFT_APP_HTML>>> followed by a COMPLETE, self-contained, runnable <!DOCTYPE html> application ending with <<<END_AICRAFT_APP_HTML>>>.',
     'MANDATORY ANTI-BLANK-SCREEN & MULTI-DEVICE COMPLETENESS RULES FOR PART 2:',
     `1. TARGET EXPERIENCE: Design a complete, immediately populated ${targetLabel}. Every main viewport, tab, button, form, modal, and interactive card MUST be visibly rendered and interactive on first load — ZERO empty black/white voids, ZERO blank middle panes!`,
-    '2. ZERO FRAGILE EXTERNAL CDNs FOR STYLING OR ICONS: Write ALL layout, spacing, typography, cards, feeds, modals, and animations cleanly inside `<style>...</style>`. DO NOT depend on `cdn.tailwindcss.com`, `unpkg.com/lucide`, React/Babel `<script type="text/babel">`, or icon font CDNs — use PURE INLINE `<svg>` paths (`width="20" height="20" viewBox="0 0 24 24"`) on EVERY icon button (Home, Search, Create `+`, Chat, Profile, Settings, Heart, Comment, Share) so no icon can EVER turn invisible!',
+    '2. ZERO FRAGILE EXTERNAL CDNs FOR STYLING OR ICONS: Write ALL layout, spacing, typography, cards, feeds, modals, and animations cleanly inside `<style>...</style>`. DO NOT depend on `cdn.tailwindcss.com`, `unpkg.com/lucide`, React/Babel `<script type="text/babel">`, or icon font CDNs — use PURE INLINE `<svg>` paths (`width="20" height="20" viewBox="0 0 24 24"`) on EVERY icon button so icons never disappear!',
     '3. ANDROID + IOS + LAPTOP/PC + TV VIEWPORT & BOTTOM CLEARANCE MATH: Use `html, body { margin: 0; padding: 0; height: 100dvh; width: 100%; overflow: hidden; }` for app shells with sticky headers/bottom bars, and center app content cleanly inside a responsive container (`width: 100%; max-width: 1120px; margin: 0 auto;` for desktop/laptop/TV views, keeping full width on phones). On Android (`html[data-platform="android"]`) give bottom navigation bars `padding-bottom: max(18px, calc(env(safe-area-inset-bottom, 0px) + 10px))` so Android system nav buttons NEVER overlap or sink into the bottom nav labels, while keeping iOS (`env(safe-area-inset-bottom)`) crisp and natural.',
     '4. CUSTOM BRAND HEAD TAGS & INLINE ICON: Inside `<head>`, include `<meta name="theme-color" content="#HEX" />`, `<meta name="background-color" content="#HEX" />`, `<meta name="aicraft-logo" data-bg="#HEX" data-accent="#HEX" data-theme="#HEX" data-motif="..." data-letters="XX" />`, and render `<svg id="aicraft-app-icon" viewBox="0 0 128 128" ...>` inside the header.',
-    '5. REAL-TIME STRUCTURED DATABASE (`window.AICraft.db`): Wire ALL core app data cleanly to `await window.AICraft.db.list(table)`, `insert(table, row)`, `update(table, id, patch)`, `remove(table, id)`. On startup inside `DOMContentLoaded`: seed 4–6 rich realistic starter items into `window.AICraft.db` ONLY if `list(table)` returns empty, render immediately to the DOM, and also sync any Supabase secrets if configured via `window.AICraft.findSecret(...)`.',
-    '6. WORKING DOMAIN FEATURES & GOOGLE IMAGES (NO FAKE DUMMIES): Use verified HTTPS image URLs returned by search results (with clean CSS gradient fallbacks on `onerror`) or inline SVG artwork when building storefronts, business apps, portfolios, social feeds, or dashboards. For social/video/feed apps: build working Like toggles, real persistent Comments drawer (`window.AICraft.db`), Follow state, Search tab (`window.AICraft.search`), Upload/Create flow, Chat/Inbox tab, Settings tab, and Profile. For chat/business/SaaS apps: build working message threads, search/filtering, create/edit modals, live KPI totals, and persistent settings.',
-    '7. BUILT-IN MONETIZATION FLOW: Include a real working monetization feature tailored naturally to the app (e.g., Pro Plan / VIP Subscription modal with Monthly/Annual toggle, Tip/Coin wallet, or Checkout cart) that persists transactions cleanly into `window.AICraft.db` and updates badges/balance live.',
-    '8. ERROR-FREE VANILLA JAVASCRIPT: Write clean, well-structured vanilla JS inside `<script>...</script>`, wrap initialization cleanly in `DOMContentLoaded` + `try/catch`, null-check DOM lookups, escape dynamic text safely, verify all braces/parentheses match cleanly, and ensure every single clickable button/tab works immediately on tap.',
+    '5. REAL-TIME STRUCTURED DATABASE (`window.AICraft.db`): Wire ALL core app data cleanly to `await window.AICraft.db.list(table)`, `insert(table, row)`, `update(table, id, patch)`, `remove(table, id)`. On startup inside `DOMContentLoaded`: seed 4–6 rich realistic starter items grounded in real-world details into `window.AICraft.db` ONLY if `list(table)` returns empty, render immediately to the DOM, and sync Supabase secrets if configured via `window.AICraft.findSecret(...)`.',
+    '6. WORKING DOMAIN FEATURES & REAL SEARCHED IMAGES: Use verified HTTPS image URLs returned by search results (with clean CSS gradient fallbacks on `onerror`) or inline SVG artwork. Build genuine interactive tabs, live search (`window.AICraft.search` + local filter), working create/booking/chat forms, and real state updates.',
+    '7. ERROR-FREE VANILLA JAVASCRIPT: Write clean vanilla JS inside `<script>...</script>`, wrap initialization cleanly in `DOMContentLoaded` + `try/catch`, null-check DOM lookups, escape dynamic text safely, verify all braces/parentheses match cleanly, and ensure every clickable button works immediately on tap.',
     '9. FINAL SILENT SELF-AUDIT: Before outputting `<<<END_AICRAFT_APP_HTML>>>`, verify mentally that <style> is complete, every tab has real markup + rendering logic, JS has zero syntax errors, and the primary viewport opens directly onto rich, active, interactive content.',
     'PART 3 (Next Suggested Upgrades): Immediately AFTER <<<END_AICRAFT_APP_HTML>>>, output:',
     '[[SUGGESTIONS]]',

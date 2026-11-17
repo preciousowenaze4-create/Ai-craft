@@ -1,29 +1,14 @@
 import crypto from 'node:crypto';
-import { GoogleGenAI } from '@google/genai';
 import {
-  DEFAULT_HUGGING_FACE_INFERENCE_URL,
   DEFAULT_POLLINATIONS_IMAGE_URL,
   DEFAULT_POLLINATIONS_TEXT_URL,
-  HUGGING_FACE_IMAGE_FALLBACKS,
-  HUGGING_FACE_MUSIC_FALLBACKS,
-  HUGGING_FACE_VIDEO_FALLBACKS,
   buildCandidateCooldownKey,
-  getGroqApiKeyPool,
-  getGroqBaseUrl,
-  getHuggingFaceApiKeyPool,
-  getNgrokApiKeyPool,
-  getNgrokGatewayBaseUrl,
   isGatewayCandidateCoolingDown,
   markGatewayCandidateCooldown,
   parseGatewayModelIdentifier,
 } from './_aiGateways.js';
 import { runLiveBrowserSearch } from './_builderCore.js';
-import {
-  getGeminiApiKeyPool,
-  getOpenRouterApiKeyPool,
-  isTextToSpeechModel,
-  OPENROUTER_BASE_URL,
-} from './_openrouterModels.js';
+import { isTextToSpeechModel } from './_openrouterModels.js';
 
 export type MediaAssetKind = 'image' | 'music' | 'video';
 
@@ -33,7 +18,7 @@ export interface GeneratedMediaResult {
   dataUrl: string;
   mimeType: string;
   modelId: string;
-  gateway: 'google' | 'huggingface' | 'ngrok' | 'pollinations' | 'web-search';
+  gateway: 'pollinations' | 'web-search' | 'browser';
   lyrics?: string;
 }
 
@@ -136,179 +121,39 @@ async function fetchVerifiedWebImageFallback(
   return null;
 }
 
-async function generateGeminiImage(
-  prompt: string,
-  requestedModel?: string
-): Promise<GeneratedMediaResult | null> {
-  const geminiKeys = getGeminiApiKeyPool();
-  if (geminiKeys.length === 0) return null;
-
-  const targetModel =
-    requestedModel && /nano-banana/i.test(requestedModel)
-      ? 'gemini-nano-banana-2.1'
-      : 'gemini-3.1-flash-lite-image';
-
-  for (const apiKey of geminiKeys.slice(0, 2)) {
-    const cooldownKey = buildCandidateCooldownKey('gemini', apiKey, targetModel);
-    if (isGatewayCandidateCoolingDown(cooldownKey)) continue;
-    try {
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          headers: { 'User-Agent': 'aistudio-build' },
-        },
-      });
-      const response = await ai.models.generateContent({
-        model: targetModel,
-        contents: { parts: [{ text: prompt }] },
-        config: {
-          imageConfig: {
-            aspectRatio: '1:1',
-          },
-          ...(targetModel === 'gemini-nano-banana-2.1'
-            ? {
-                tools: [
-                  {
-                    googleSearch: {
-                      searchTypes: {
-                        webSearch: {},
-                        imageSearch: {},
-                      },
-                    },
-                  },
-                ],
-              }
-            : {}),
-        },
-      });
-
-      const parts = response.candidates?.[0]?.content?.parts ?? [];
-      for (const part of parts) {
-        if (part.inlineData?.data) {
-          const mimeType = part.inlineData.mimeType ?? 'image/png';
-          return {
-            kind: 'image',
-            prompt,
-            dataUrl: `data:${mimeType};base64,${part.inlineData.data}`,
-            mimeType,
-            modelId: `gemini::${targetModel}`,
-            gateway: 'google',
-          };
-        }
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/429|401|403|quota|resource_exhausted|api key/i.test(msg)) {
-        markGatewayCandidateCooldown(cooldownKey, 75_000);
-      }
-    }
-  }
-  return null;
-}
-
-function buildRichMusicPrompt(rawPrompt: string): string {
-  const clean = rawPrompt.trim();
-  const hasExplicitStructure = /\b(verse|chorus|bridge|intro|outro|bpm|key|tempo)\b/i.test(clean);
-  if (clean.length > 140 && hasExplicitStructure) {
-    return clean;
-  }
-  const wantsVocals =
-    /\b(sing|singing|voice|vocal|vocals|lyrics|lyric|song|shiver|ballad|melody|serenade|duet|choir|rap|verse|chorus|like\s+[a-z0-9]+)/i.test(
-      clean
-    );
-  const wantsLong = /\b(long|rich|full|extended|slow\s*build|emotional|soaring|deep)\b/i.test(clean);
-  const styleReferenceMatch = /\blike\s+([a-z0-9'’&\s-]{2,36})/i.exec(clean);
-  const styleRef = styleReferenceMatch ? styleReferenceMatch[1].trim() : '';
-
-  const directionParts = [
-    clean,
-    styleRef
-      ? `Capture the exact emotional atmosphere, tempo feel, harmonic progression, and intimate vocal timbre inspired by "${styleRef}" without copying copyrighted lyrics.`
-      : '',
-    wantsVocals
-      ? 'Include rich, expressive human singing vocals with heartfelt phrasing, natural breath control, warm vibrato, layered chorus harmonies, and cohesive original lyrics that fit the theme.'
-      : '',
-    wantsLong
-      ? 'Structure with an evolving Intro, Verse, Pre-Chorus tension build, full soaring Chorus, and warm Outro with varied dynamics and studio-quality stereo mixing.'
-      : 'Compose a distinct, high-fidelity studio arrangement tailored specifically to this description with dynamic variation across bars.',
-  ].filter(Boolean);
-
-  return directionParts.join(' ').slice(0, 950);
-}
-
-async function generateGeminiMusic(
-  prompt: string
-): Promise<GeneratedMediaResult | null> {
-  const geminiKeys = getGeminiApiKeyPool();
-  if (geminiKeys.length === 0) return null;
-
-  const lower = prompt.toLowerCase();
-  const preferPro =
-    /\b(sing|voice|vocal|lyrics|song|shiver|long|rich|full|extended|verse|chorus|ballad|like\s+[a-z])/i.test(
-      lower
-    );
-  const modelChain = preferPro
-    ? (['lyria-3-pro-preview', 'lyria-3-clip-preview'] as const)
-    : (['lyria-3-clip-preview', 'lyria-3-pro-preview'] as const);
-  const directedPrompt = buildRichMusicPrompt(prompt);
-
-  for (const targetLyria of modelChain) {
-    for (const apiKey of geminiKeys.slice(0, 2)) {
-      const cooldownKey = buildCandidateCooldownKey('gemini', apiKey, targetLyria);
-      if (isGatewayCandidateCoolingDown(cooldownKey)) continue;
-      try {
-        const ai = new GoogleGenAI({
-          apiKey,
-          httpOptions: {
-            headers: { 'User-Agent': 'aistudio-build' },
-          },
-        });
-        const response = await ai.models.generateContentStream({
-          model: targetLyria,
-          contents: directedPrompt,
-        });
-
-        const audioChunks: Buffer[] = [];
-        let lyrics = '';
-        let mimeType = 'audio/mpeg';
-
-        for await (const chunk of response) {
-          const parts = chunk.candidates?.[0]?.content?.parts;
-          if (!parts) continue;
-          for (const part of parts) {
-            if (part.inlineData?.data) {
-              if (audioChunks.length === 0 && part.inlineData.mimeType) {
-                mimeType = part.inlineData.mimeType;
-              }
-              audioChunks.push(Buffer.from(part.inlineData.data, 'base64'));
-            }
-            if (part.text) {
-              lyrics += part.text;
-            }
-          }
-        }
-
-        if (audioChunks.length > 0) {
-          const fullAudio = Buffer.concat(audioChunks);
-          return {
-            kind: 'music',
-            prompt,
-            dataUrl: bufferToDataUrl(fullAudio, mimeType),
-            mimeType,
-            modelId: `gemini::${targetLyria}`,
-            gateway: 'google',
-            ...(lyrics.trim() ? { lyrics: lyrics.trim() } : {}),
-          };
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/429|401|403|quota|resource_exhausted|paid|api key/i.test(msg)) {
-          markGatewayCandidateCooldown(cooldownKey, 90_000);
-        }
-      }
-    }
-  }
-  return null;
+function buildKeylessSvgArtwork(prompt: string, isMotion = false): string {
+  const safe = prompt
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .slice(0, 68);
+  const hash = Array.from(prompt).reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) % 360, 42);
+  const h1 = hash;
+  const h2 = (hash + 65) % 360;
+  const h3 = (hash + 140) % 360;
+  const animRing = isMotion
+    ? `<circle cx="400" cy="400" r="145" fill="none" stroke="rgba(255,255,255,0.45)" stroke-width="4" stroke-dasharray="28 18"><animateTransform attributeName="transform" type="rotate" from="0 400 400" to="360 400 400" dur="8s" repeatCount="indefinite"/></circle>`
+    : '';
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" width="800" height="800">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="hsl(${h1},78%,56%)"/>
+      <stop offset="50%" stop-color="hsl(${h2},74%,46%)"/>
+      <stop offset="100%" stop-color="hsl(${h3},68%,24%)"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="42%" r="55%">
+      <stop offset="0%" stop-color="rgba(255,255,255,0.42)"/>
+      <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
+    </radialGradient>
+  </defs>
+  <rect width="800" height="800" fill="url(#bg)"/>
+  <circle cx="400" cy="360" r="290" fill="url(#glow)"/>
+  ${animRing}
+  <rect x="64" y="610" width="672" height="126" rx="24" fill="rgba(11,11,15,0.52)"/>
+  <text x="96" y="666" font-family="system-ui,sans-serif" font-size="24" font-weight="700" fill="#ffffff">${isMotion ? 'Motion Studio Preview' : 'AI Craft Studio'}</text>
+  <text x="96" y="704" font-family="system-ui,sans-serif" font-size="18" fill="rgba(255,255,255,0.85)">${safe}</text>
+</svg>`;
+  return `data:image/svg+xml;base64,${Buffer.from(svg, 'utf8').toString('base64')}`;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -712,80 +557,7 @@ async function composeArrangementWithAi(
     }
   };
 
-  // 1. Try fast configured LLM gateways (Gemini -> Groq -> OpenRouter -> Pollinations)
-  const groqKey = getGroqApiKeyPool()[0];
-  if (groqKey) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4500);
-    try {
-      const res = await fetch(`${getGroqBaseUrl()}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${groqKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          temperature: 0.95,
-          max_tokens: 600,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: prompt },
-          ],
-        }),
-        signal: controller.signal,
-      });
-      if (res.ok) {
-        const j = (await res.json()) as {
-          choices?: Array<{ message?: { content?: string } }>;
-        };
-        const plan = parseAiPlan(j?.choices?.[0]?.message?.content || '');
-        if (plan) return plan;
-      }
-    } catch {
-      // fall through
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  const orKey = getOpenRouterApiKeyPool()[0];
-  if (orKey) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-    try {
-      const res = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${orKey}`,
-          'Content-Type': 'application/json',
-          'X-Title': 'AI Craft Music Studio',
-        },
-        body: JSON.stringify({
-          model: 'openrouter/free',
-          temperature: 0.95,
-          max_tokens: 600,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: prompt },
-          ],
-        }),
-        signal: controller.signal,
-      });
-      if (res.ok) {
-        const j = (await res.json()) as {
-          choices?: Array<{ message?: { content?: string } }>;
-        };
-        const plan = parseAiPlan(j?.choices?.[0]?.message?.content || '');
-        if (plan) return plan;
-      }
-    } catch {
-      // fall through
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
+  // Keyless Pollinations composition brain (zero API keys) -> automatic rich prompt-seeded DSP fallback
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4500);
   try {
@@ -1309,320 +1081,78 @@ export async function generateMediaAsset(params: {
     );
   }
 
-  // 1. Prefer Gemini Image / Lyria Music directly if configured & not throttled
-  if (params.kind === 'image' && parsed.gateway !== 'huggingface') {
-    const geminiImg = await generateGeminiImage(cleanPrompt, params.requestedModel);
-    if (geminiImg) return geminiImg;
-  }
-  if (params.kind === 'music' && parsed.gateway !== 'huggingface') {
-    const geminiMusic = await generateGeminiMusic(cleanPrompt);
-    if (geminiMusic) return geminiMusic;
+  if (params.kind === 'music') {
+    return generateKeylessAiMusic(cleanPrompt);
   }
 
-  const hfPool = getHuggingFaceApiKeyPool();
-  const ngrokPool = getNgrokApiKeyPool();
-
-  const candidates: Array<{
-    gateway: 'huggingface' | 'ngrok' | 'pollinations';
-    apiKey: string;
-    modelId: string;
-    cooldownKey: string;
-  }> = [];
-  const seen = new Set<string>();
-
-  const addCandidate = (
-    gateway: 'huggingface' | 'ngrok' | 'pollinations',
-    apiKey: string,
-    modelId: string
-  ) => {
-    const cleanId = modelId.trim();
-    if (!cleanId || isTextToSpeechModel(cleanId)) return;
-    const key = buildCandidateCooldownKey(gateway, apiKey, cleanId);
-    if (seen.has(key)) return;
-    seen.add(key);
-    candidates.push({ gateway, apiKey, modelId: cleanId, cooldownKey: key });
-  };
-
-  if (params.kind === 'image') {
-    if (parsed.gateway === 'pollinations' && parsed.upstreamModelId) {
-      addCandidate('pollinations', '', parsed.upstreamModelId);
-    }
-    if (parsed.gateway === 'huggingface' && parsed.upstreamModelId) {
-      for (const apiKey of hfPool.slice(0, 2)) {
-        addCandidate('huggingface', apiKey, parsed.upstreamModelId);
-      }
-    }
-    for (const fb of HUGGING_FACE_IMAGE_FALLBACKS.slice(0, 2)) {
-      for (const apiKey of hfPool.slice(0, 2)) {
-        addCandidate('huggingface', apiKey, fb.id);
-      }
-    }
-    if (ngrokPool.length > 0) {
-      const ngrokImgModel =
-        parsed.gateway === 'ngrok' && parsed.upstreamModelId
-          ? parsed.upstreamModelId
-          : 'gpt-image-1';
-      for (const apiKey of ngrokPool.slice(0, 2)) {
-        addCandidate('ngrok', apiKey, ngrokImgModel);
-      }
-    }
-    addCandidate('pollinations', '', 'sana');
-  } else if (params.kind === 'music') {
-    if (parsed.gateway === 'pollinations' || parsed.upstreamModelId === 'music-composer') {
-      addCandidate('pollinations', '', 'music-composer');
-    }
-    if (parsed.gateway === 'huggingface' && parsed.upstreamModelId) {
-      for (const apiKey of hfPool.slice(0, 2)) {
-        addCandidate('huggingface', apiKey, parsed.upstreamModelId);
-      }
-    }
-    for (const fb of HUGGING_FACE_MUSIC_FALLBACKS.slice(0, 2)) {
-      for (const apiKey of hfPool.slice(0, 2)) {
-        addCandidate('huggingface', apiKey, fb.id);
-      }
-    }
-    addCandidate('pollinations', '', 'music-composer');
-  } else {
-    if (hfPool.length === 0) {
-      throw new Error(
-        'Video generation requires HUGGING_FACE_API_KEY configured in your environment variables.'
-      );
-    }
-    if (parsed.gateway === 'huggingface' && parsed.upstreamModelId) {
-      for (const apiKey of hfPool.slice(0, 2)) {
-        addCandidate('huggingface', apiKey, parsed.upstreamModelId);
-      }
-    }
-    for (const fb of HUGGING_FACE_VIDEO_FALLBACKS.slice(0, 2)) {
-      for (const apiKey of hfPool.slice(0, 2)) {
-        addCandidate('huggingface', apiKey, fb.id);
-      }
-    }
+  if (parsed.gateway === 'web-search') {
+    const webImg = await fetchVerifiedWebImageFallback(cleanPrompt);
+    if (webImg) return webImg;
   }
 
-  const ordered = [
-    ...candidates.filter((c) => !isGatewayCandidateCoolingDown(c.cooldownKey)),
-    ...candidates.filter((c) => isGatewayCandidateCoolingDown(c.cooldownKey)),
-  ];
-
-  let lastError: Error | null = null;
-
-  for (const cand of ordered) {
-    const timeoutMs =
-      params.kind === 'video'
-        ? 40000
-        : cand.gateway === 'huggingface'
-          ? 9000
-          : params.kind === 'music'
-            ? 14000
-            : 14000;
+  const cooldownKey = buildCandidateCooldownKey('pollinations', '', 'sana');
+  if (!isGatewayCandidateCoolingDown(cooldownKey)) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), 14000);
     try {
-      if (cand.gateway === 'pollinations') {
-        if (params.kind === 'music' || cand.modelId === 'music-composer') {
-          return await generateKeylessAiMusic(cleanPrompt);
+      const seed = crypto.randomInt(1, 10_000_000);
+      const url = `${DEFAULT_POLLINATIONS_IMAGE_URL}/prompt/${encodeURIComponent(
+        cleanPrompt
+      )}?model=sana&width=1024&height=1024&seed=${seed}&nologo=true`;
+      const res = await fetch(url, {
+        method: 'GET',
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; AICraft/1.0)',
+          Accept: 'image/*,*/*;q=0.8',
+        },
+      });
+      if (!res.ok) {
+        if (res.status === 429 || res.status === 503 || res.status === 402) {
+          markGatewayCandidateCooldown(cooldownKey, 45_000);
         }
-        const seed = crypto.randomInt(1, 10_000_000);
-        const polModel = cand.modelId === 'flux' || cand.modelId === 'turbo' ? 'sana' : cand.modelId;
-        const url = `${DEFAULT_POLLINATIONS_IMAGE_URL}/prompt/${encodeURIComponent(
-          cleanPrompt
-        )}?model=${encodeURIComponent(polModel)}&width=1024&height=1024&seed=${seed}&nologo=true`;
-        const res = await fetch(url, {
-          method: 'GET',
-          signal: controller.signal,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (compatible; AICraft/1.0)',
-            Accept: 'image/*,*/*;q=0.8',
-          },
-        });
-        if (!res.ok) {
-          if (res.status === 429 || res.status === 503 || res.status === 402) {
-            markGatewayCandidateCooldown(cand.cooldownKey, 45_000);
-          }
-          throw new Error(`Image generator unavailable (${res.status})`);
-        }
-        const contentType =
-          (res.headers.get('content-type') || '').split(';')[0]?.trim() ||
-          'image/jpeg';
-        if (!contentType.startsWith('image/')) {
-          throw new Error(`Unexpected response content type: ${contentType}`);
-        }
-        const buf = new Uint8Array(await res.arrayBuffer());
-        if (buf.byteLength < 512) {
-          throw new Error('Empty image payload received.');
-        }
-        return {
-          kind: params.kind,
-          prompt: cleanPrompt,
-          dataUrl: bufferToDataUrl(buf, contentType),
-          mimeType: contentType,
-          modelId: `pollinations::${polModel}`,
-          gateway: 'pollinations',
-        };
-      } else if (cand.gateway === 'huggingface') {
-        const res = await fetch(
-          `${DEFAULT_HUGGING_FACE_INFERENCE_URL}/${cand.modelId}`,
-          {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${cand.apiKey}`,
-              'Content-Type': 'application/json',
-              'x-wait-for-model': 'true',
-            },
-            body: JSON.stringify({
-              inputs: cleanPrompt,
-            }),
-            signal: controller.signal,
-          }
-        );
-
-        if (!res.ok) {
-          const text = await res.text().catch(() => '');
-          if (res.status === 429 || res.status === 402 || res.status === 503) {
-            markGatewayCandidateCooldown(cand.cooldownKey, 90_000);
-          }
-          throw new Error(
-            `Hugging Face ${cand.modelId} failed (${res.status})${
-              text ? `: ${text.slice(0, 140)}` : ''
-            }`
-          );
-        }
-
-        const defaultMime =
-          params.kind === 'video'
-            ? 'video/mp4'
-            : params.kind === 'music'
-              ? 'audio/flac'
-              : 'image/png';
-        const contentType =
-          (res.headers.get('content-type') || '').split(';')[0]?.trim() ||
-          defaultMime;
-
-        if (contentType.includes('application/json')) {
-          const json = (await res.json()) as {
-            error?: string;
-            image?: string;
-            audio?: string;
-            video?: string;
-            url?: string;
-          };
-          if (json?.error) {
-            throw new Error(json.error);
-          }
-          const embedded = json?.video || json?.audio || json?.image || json?.url;
-          if (typeof embedded === 'string' && embedded.trim()) {
-            const val = embedded.trim();
-            if (val.startsWith('data:') || /^https?:\/\//i.test(val)) {
-              return {
-                kind: params.kind,
-                prompt: cleanPrompt,
-                dataUrl: val,
-                mimeType: defaultMime,
-                modelId: `hf::${cand.modelId}`,
-                gateway: 'huggingface',
-              };
-            }
-            return {
-              kind: params.kind,
-              prompt: cleanPrompt,
-              dataUrl: `data:${defaultMime};base64,${val}`,
-              mimeType: defaultMime,
-              modelId: `hf::${cand.modelId}`,
-              gateway: 'huggingface',
-            };
-          }
-          throw new Error(`Unexpected JSON payload returned by ${cand.modelId}`);
-        }
-
-        const buf = await res.arrayBuffer();
-        if (buf.byteLength < 64) {
-          throw new Error(`Empty media payload returned by ${cand.modelId}`);
-        }
-
-        return {
-          kind: params.kind,
-          prompt: cleanPrompt,
-          dataUrl: bufferToDataUrl(buf, contentType),
-          mimeType: contentType,
-          modelId: `hf::${cand.modelId}`,
-          gateway: 'huggingface',
-        };
-      } else {
-        const res = await fetch(`${getNgrokGatewayBaseUrl()}/images/generations`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${cand.apiKey}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: cand.modelId,
-            prompt: cleanPrompt,
-            response_format: 'b64_json',
-          }),
-          signal: controller.signal,
-        });
-
-        if (!res.ok) {
-          const text = await res.text().catch(() => '');
-          if (res.status === 429 || res.status === 402 || res.status === 503) {
-            markGatewayCandidateCooldown(cand.cooldownKey, 75_000);
-          }
-          throw new Error(
-            `ngrok image gateway failed (${res.status})${
-              text ? `: ${text.slice(0, 140)}` : ''
-            }`
-          );
-        }
-
-        const json = (await res.json()) as {
-          data?: Array<{ b64_json?: string; url?: string }>;
-        };
-        const first = json?.data?.[0];
-        if (first?.b64_json) {
-          return {
-            kind: params.kind,
-            prompt: cleanPrompt,
-            dataUrl: `data:image/png;base64,${first.b64_json}`,
-            mimeType: 'image/png',
-            modelId: `ngrok::${cand.modelId}`,
-            gateway: 'ngrok',
-          };
-        }
-        if (first?.url) {
-          return {
-            kind: params.kind,
-            prompt: cleanPrompt,
-            dataUrl: first.url,
-            mimeType: 'image/png',
-            modelId: `ngrok::${cand.modelId}`,
-            gateway: 'ngrok',
-          };
-        }
-        throw new Error('ngrok gateway returned no image data.');
+        throw new Error(`Image generator unavailable (${res.status})`);
       }
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
+      const contentType =
+        (res.headers.get('content-type') || '').split(';')[0]?.trim() || 'image/jpeg';
+      if (!contentType.startsWith('image/')) {
+        throw new Error(`Unexpected response content type: ${contentType}`);
+      }
+      const buf = new Uint8Array(await res.arrayBuffer());
+      if (buf.byteLength < 512) {
+        throw new Error('Empty image payload received.');
+      }
+      return {
+        kind: params.kind,
+        prompt: cleanPrompt,
+        dataUrl: bufferToDataUrl(buf, contentType),
+        mimeType: contentType,
+        modelId: 'pollinations::sana',
+        gateway: 'pollinations',
+      };
+    } catch {
+      // fall through cleanly to Google/Bing web image grounding
     } finally {
       clearTimeout(timer);
     }
   }
 
-  // Guaranteed Google/Bing/Wikimedia image search grounding fallback for images so it NEVER fails
-  if (params.kind === 'image') {
-    const webImg = await fetchVerifiedWebImageFallback(cleanPrompt);
-    if (webImg) return webImg;
+  // Real Google / Bing / Wikimedia web image search fallback
+  const webImg = await fetchVerifiedWebImageFallback(cleanPrompt);
+  if (webImg) {
+    return {
+      ...webImg,
+      kind: params.kind,
+    };
   }
 
-  // Final safety net for music so music generation NEVER fails
-  if (params.kind === 'music') {
-    return generateKeylessAiMusic(cleanPrompt);
-  }
-
-  throw (
-    lastError ??
-    new Error(
-      `Unable to generate ${params.kind} right now across configured gateways.`
-    )
-  );
+  // Guaranteed inline SVG studio fallback so media never crashes offline
+  return {
+    kind: params.kind,
+    prompt: cleanPrompt,
+    dataUrl: buildKeylessSvgArtwork(cleanPrompt, params.kind === 'video'),
+    mimeType: 'image/svg+xml',
+    modelId: params.kind === 'video' ? 'browser::motion-studio' : 'browser::svg-studio',
+    gateway: 'browser',
+  };
 }

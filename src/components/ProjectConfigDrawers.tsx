@@ -1446,16 +1446,6 @@ export function ProjectDeployModal({
                     </>
                   )}
                 </button>
-                <a
-                  href={deployment.liveUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  aria-label="Open live URL in browser"
-                  className="min-h-[36px] px-2.5 rounded-lg bg-[#6D4AFF] hover:bg-[#5B35F5] text-white text-[12px] font-medium inline-flex items-center gap-1 shrink-0"
-                >
-                  <ExternalLink className="w-3.5 h-3.5" />
-                  <span>Open</span>
-                </a>
               </div>
             )}
           </div>

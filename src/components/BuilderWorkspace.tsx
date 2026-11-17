@@ -14,7 +14,6 @@ import {
   Database,
   Download,
   Eye,
-  ExternalLink,
   Film,
   Globe,
   HelpCircle,
@@ -1537,15 +1536,15 @@ export function BuilderWorkspace({
 
                   {/* Calm Replit-Style Step-by-Step Thinking & Blue-Checkmark Plan */}
                   {turn.planSteps && turn.planSteps.length > 0 && (
-                    <div className="rounded-2xl border border-black/[0.07] bg-[#FAFAFC] px-3.5 py-2.5 flex flex-col gap-2">
+                    <div className="rounded-2xl border border-black/[0.08] bg-[#F7F7FA] px-4 py-3 flex flex-col gap-2">
                       <div className="flex items-center justify-between gap-2">
-                        <span className="text-[12px] font-semibold uppercase tracking-[0.04em] text-[#52525B]">
-                          Architecture & Monetization Plan
+                        <span className="text-[11.5px] font-semibold uppercase tracking-[0.04em] text-[#52525B]">
+                          Real-Time Build Plan
                         </span>
                         <span className="text-[11.5px] font-medium text-[#0D5BFF] tabular-nums">
                           {turn.phase === 'understanding'
-                            ? `Thinking · Step ${turn.planSteps.length}`
-                            : `${turn.planSteps.length} steps`}
+                            ? `Planning · Step ${turn.planSteps.length}`
+                            : `${turn.planSteps.length} ${turn.planSteps.length === 1 ? 'step' : 'steps'}`}
                         </span>
                       </div>
                       <ul className="space-y-1.5 text-[13px] leading-snug">
@@ -1570,7 +1569,7 @@ export function BuilderWorkspace({
                                     : 'text-[#3F3F46]'
                                 }
                               >
-                                {isActivePlanStep ? `Thinking · ${step}` : step}
+                                {step}
                               </span>
                             </li>
                           );
@@ -1579,7 +1578,7 @@ export function BuilderWorkspace({
                     </div>
                   )}
 
-                  {/* Real-Time Replit-Style Module Checklist (Thinking -> Blue Checkmark -> Next Module) */}
+                  {/* Real-Time Replit-Style Live Coding & File Activity Card */}
                   {isBuildTurn &&
                     (turn.phase === 'building' ||
                       turn.phase === 'paused' ||
@@ -1600,7 +1599,7 @@ export function BuilderWorkspace({
                           : Math.min(94, 22 + Math.round((Math.min(bytes, 14000) / 14000) * 72));
 
                     return (
-                      <div className="rounded-2xl bg-[#F4F4F6] px-3.5 py-2.5 flex flex-col gap-2">
+                      <div className="rounded-2xl border border-black/[0.08] bg-[#F7F7FA] px-4 py-3 flex flex-col gap-2.5">
                         <div className="flex items-center justify-between gap-2">
                           <div className="flex items-center gap-2 min-w-0 flex-1">
                             {isTurnWorking ? (
@@ -1610,17 +1609,17 @@ export function BuilderWorkspace({
                             ) : (
                               <CheckCircle2 className="w-4 h-4 text-[#0D5BFF] shrink-0" />
                             )}
-                            <span className="text-[14px] font-medium text-[#111118] truncate">
+                            <span className="text-[13.5px] font-semibold text-[#111118] truncate">
                               {turn.files.length > 0
                                 ? turn.phase === 'complete'
-                                  ? `Built ${turn.files.length} ${turn.files.length === 1 ? 'module' : 'modules'}`
+                                  ? `Built ${turn.files.length} ${turn.files.length === 1 ? 'file' : 'files'}`
                                   : isPausedTurn
-                                    ? `Saved ${turn.files.length} ${turn.files.length === 1 ? 'module' : 'modules'} (paused)`
+                                    ? `Saved ${turn.files.length} ${turn.files.length === 1 ? 'file' : 'files'} (paused)`
                                     : `${turn.activeAction} ${formatBuildStepLabel(turn.activeFile)}`
                                 : turn.phaseLabel}
                             </span>
                             {turn.activeFile && isTurnWorking ? (
-                              <span className="bg-white rounded-lg px-2 py-0.5 text-[12px] font-mono text-[#18181B] truncate border border-black/[0.05]">
+                              <span className="bg-white rounded-md px-2 py-0.5 text-[11.5px] font-mono text-[#18181B] truncate border border-black/[0.06]">
                                 {turn.activeFile}
                               </span>
                             ) : null}
@@ -1636,7 +1635,7 @@ export function BuilderWorkspace({
                               <button
                                 type="button"
                                 onClick={toggleTurnExpanded}
-                                className="text-[13.5px] font-medium text-[#18181B] flex items-center gap-0.5 shrink-0 hover:opacity-75"
+                                className="text-[13px] font-medium text-[#18181B] flex items-center gap-0.5 shrink-0 hover:opacity-75"
                               >
                                 <span className="tabular-nums">
                                   All({turn.files.length})
@@ -1662,9 +1661,9 @@ export function BuilderWorkspace({
                           />
                         </div>
 
-                        {/* Live Blue-Checkmark Checklist + Alternating Thinking State */}
+                        {/* Live Blue-Checkmark File Stream List */}
                         {isExpanded && (turn.files.length > 0 || isTurnWorking) && (
-                          <ul className="pt-1.5 border-t border-black/[0.06] space-y-1.5 text-[13px]">
+                          <ul className="pt-2 border-t border-black/[0.06] space-y-1.5 text-[13px]">
                             {turn.files.map((filePath) => {
                               const isCurrentlyCoding =
                                 isTurnWorking && filePath === turn.activeFile;
@@ -1676,9 +1675,9 @@ export function BuilderWorkspace({
                                 >
                                   <div className="flex items-center gap-2 min-w-0">
                                     {isCurrentlyCoding ? (
-                                      <Loader2 className="w-4 h-4 animate-spin text-[#0D5BFF] shrink-0" />
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#0D5BFF] shrink-0" />
                                     ) : (
-                                      <CheckCircle2 className="w-4 h-4 text-[#0D5BFF] shrink-0" />
+                                      <CheckCircle2 className="w-3.5 h-3.5 text-[#0D5BFF] shrink-0" />
                                     )}
                                     <span
                                       className={`truncate font-medium ${
@@ -1688,8 +1687,8 @@ export function BuilderWorkspace({
                                       }`}
                                     >
                                       {isCurrentlyCoding
-                                        ? `Thinking & coding ${label}...`
-                                        : `Built ${label}`}
+                                        ? `Writing ${label}...`
+                                        : label}
                                     </span>
                                   </div>
                                   <span className="text-[11.5px] font-mono text-[#71717A] shrink-0 truncate max-w-[140px]">
@@ -1704,8 +1703,8 @@ export function BuilderWorkspace({
                                 <Loader2 className="w-3.5 h-3.5 animate-spin text-[#0D5BFF] shrink-0" />
                                 <span className="text-[12.5px] truncate">
                                   {turn.files.length === 0
-                                    ? 'Thinking & planning real-time architecture...'
-                                    : 'Thinking next module...'}
+                                    ? 'Writing live HTML, styles, and real-time database...'
+                                    : 'Streaming next code module...'}
                                 </span>
                               </li>
                             )}
@@ -1714,47 +1713,6 @@ export function BuilderWorkspace({
                       </div>
                     );
                   })()}
-
-                  {/* Structured Gemini Intent Router & Module Classifier Identifiers */}
-                  {((turn.classifiedModules && turn.classifiedModules.length > 0) ||
-                    (turn.classifiedFeatures && turn.classifiedFeatures.length > 0)) && (
-                    <div className="rounded-2xl border border-[#0D5BFF]/20 bg-[#F5F8FF] px-3.5 py-2.5 flex flex-col gap-1.5">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[11px] font-semibold uppercase tracking-[0.04em] text-[#0D5BFF]">
-                          Gemini Intent Router · Classified Modules
-                        </span>
-                        {turn.classifiedIntent && (
-                          <span className="text-[11px] font-mono font-semibold text-[#1E3A8A] bg-white px-2 py-0.5 rounded-full border border-[#0D5BFF]/20">
-                            {turn.classifiedIntent}
-                          </span>
-                        )}
-                      </div>
-                      {turn.classifiedModules && turn.classifiedModules.length > 0 && (
-                        <div className="flex flex-wrap gap-1.5">
-                          {turn.classifiedModules.map((modId) => (
-                            <span
-                              key={`${turn.id}-mod-${modId}`}
-                              className="px-2 py-0.5 rounded-lg bg-white border border-black/[0.08] text-[11px] font-mono text-[#18181B]"
-                            >
-                              {modId}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                      {turn.classifiedFeatures && turn.classifiedFeatures.length > 0 && (
-                        <div className="flex flex-wrap gap-1.5">
-                          {turn.classifiedFeatures.map((featId) => (
-                            <span
-                              key={`${turn.id}-feat-${featId}`}
-                              className="px-2 py-0.5 rounded-lg bg-[#EEF4FF] border border-[#0D5BFF]/20 text-[10.5px] font-mono text-[#0D5BFF]"
-                            >
-                              +{featId}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
 
                   {/* Live Streaming AI Response Prose (Raw code strictly excluded) */}
                   {turn.errorMessage ? (
@@ -1901,186 +1859,71 @@ export function BuilderWorkspace({
                     </div>
                   )}
 
-                  {/* Inline Build Status Card (Shown once building starts, strictly for Code & Build) */}
+                  {/* Clean Live App Link Card (Copy URL only — no Enabled AI / Open buttons) */}
                   {isBuildTurn &&
-                    !isPausedTurn &&
-                    (turn.phase === 'building' ||
-                      turn.phase === 'complete' ||
-                      turn.phase === 'error' ||
-                      turn.files.length > 0) && (
-                    <div className="rounded-[20px] border border-black/[0.07] overflow-hidden bg-[#FAFAFC]">
-                      <div className="bg-[#F2F2F6] px-4 py-3 flex items-center justify-between gap-3">
-                        <span className="font-display font-bold text-[15px] text-[#0B0B0F]">
-                          Enabled AI
-                        </span>
-                        <span
-                          className={`px-3.5 py-1 rounded-full text-[13px] font-medium text-white transition-colors duration-300 ${
-                            turn.phase === 'error'
-                              ? 'bg-red-500'
-                              : isTurnWorking
-                                ? 'bg-[#7A68F6]'
-                                : 'bg-[#BFB4FC]'
-                          }`}
-                        >
-                          {turn.phase === 'error'
-                            ? 'Needs attention'
-                            : isTurnWorking
-                              ? 'Building'
-                              : 'Auto-approved'}
-                        </span>
-                      </div>
-
-                      <div className="px-4 py-3.5 space-y-2.5 text-[14px] text-[#52525B]">
-                        <div className="space-y-1.5">
-                          <div className="flex items-center gap-2">
-                            {stepUnderstandingDone ? (
-                              <Check className="w-4 h-4 text-[#6D4AFF] shrink-0" />
-                            ) : (
-                              <Loader2 className="w-4 h-4 text-[#6D4AFF] animate-spin shrink-0" />
-                            )}
-                            <span
-                              className={
-                                stepUnderstandingDone
-                                  ? 'text-[#18181B] font-medium'
-                                  : 'text-[#52525B]'
-                              }
-                            >
-                              Understood {theme.label} requirements
-                            </span>
+                    stepBuildingDone &&
+                    Boolean(turn.previewHtml) &&
+                    turn.id === latestBuiltTurnId &&
+                    (deployment.liveUrl || deployment.livePublishing) && (
+                      <div className="rounded-2xl border border-black/[0.08] bg-[#F7F7FA] px-3.5 py-3 flex flex-col gap-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-1.5 text-[12.5px] font-semibold text-[#0B0B0F]">
+                            <Link2 className="w-3.5 h-3.5 text-[#6D4AFF] shrink-0" />
+                            <span>Live App Link</span>
                           </div>
-
-                          <div className="flex items-center gap-2">
-                            {turn.phase === 'error' ? (
-                              <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
-                            ) : stepBuildingDone ? (
-                              <Check className="w-4 h-4 text-[#6D4AFF] shrink-0" />
-                            ) : (
-                              <Loader2 className="w-4 h-4 text-[#6D4AFF] animate-spin shrink-0" />
-                            )}
-                            <span
-                              className={
-                                stepBuildingDone
-                                  ? 'text-[#18181B] font-medium'
-                                  : 'text-[#52525B]'
-                              }
-                            >
-                              {turn.phase === 'error'
-                                ? 'Build paused — retry message below'
-                                : stepBuildingDone
-                                  ? turn.files.length > 0
-                                    ? `Built ${turn.files.length} app ${turn.files.length === 1 ? 'part' : 'parts'}`
-                                    : 'Build complete'
-                                  : turn.files.length > 0
-                                    ? `Building ${turn.activeFile || 'app'}...`
-                                    : 'Building live app stream...'}
+                          {deployment.livePublishing ? (
+                            <span className="inline-flex items-center gap-1 text-[11.5px] text-[#71717A]">
+                              <Loader2 className="w-3 h-3 animate-spin text-[#6D4AFF]" />
+                              <span>Generating link...</span>
                             </span>
-                          </div>
+                          ) : deployment.version > 0 ? (
+                            <span className="text-[11.5px] font-medium text-emerald-700 tabular-nums">
+                              Live · v{deployment.version}
+                            </span>
+                          ) : null}
                         </div>
 
-                        <div className="pt-1 flex items-center justify-between gap-2">
-                          <button
-                            type="button"
-                            onClick={onOpenApps}
-                            className="text-[14px] font-medium text-[#6D4AFF] underline underline-offset-4 hover:opacity-80"
-                          >
-                            View in Apps
-                          </button>
-                          {stepBuildingDone && Boolean(turn.previewHtml) ? (
-                            <button
-                              type="button"
-                              onClick={() => onSetView('preview')}
-                              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-[#0B0B0F] text-white text-[12.5px] font-medium hover:bg-black/85 active:scale-95 transition-all"
-                            >
-                              <Eye className="w-3.5 h-3.5" />
-                              <span>Open Preview</span>
-                            </button>
-                          ) : (
-                            <span className="text-xs text-[#71717A]">
-                              {turn.phase === 'error'
-                                ? 'Tap send to retry'
-                                : isTurnWorking
-                                  ? 'Working live'
-                                  : 'Ready for next edit'}
-                            </span>
-                          )}
-                        </div>
-
-                        {stepBuildingDone &&
-                          Boolean(turn.previewHtml) &&
-                          turn.id === latestBuiltTurnId &&
-                          (deployment.liveUrl || deployment.livePublishing) && (
-                            <div className="mt-1.5 pt-3 border-t border-black/[0.06] flex flex-col gap-2">
-                              <div className="flex items-center justify-between gap-2">
-                                <div className="flex items-center gap-1.5 text-[12.5px] font-semibold text-[#0B0B0F]">
-                                  <Link2 className="w-3.5 h-3.5 text-[#6D4AFF] shrink-0" />
-                                  <span>Live App Link</span>
-                                </div>
-                                {deployment.livePublishing ? (
-                                  <span className="inline-flex items-center gap-1 text-[11.5px] text-[#71717A]">
-                                    <Loader2 className="w-3 h-3 animate-spin text-[#6D4AFF]" />
-                                    <span>Generating link...</span>
-                                  </span>
-                                ) : deployment.version > 0 ? (
-                                  <span className="text-[11.5px] font-medium text-emerald-700 tabular-nums">
-                                    Live · v{deployment.version}
-                                  </span>
-                                ) : null}
-                              </div>
-
-                              {deployment.liveUrl && (
-                                <div className="rounded-xl border border-black/[0.09] bg-white px-3 py-2 flex items-center gap-2.5">
-                                  {deployment.logoUrl && (
-                                    <img
-                                      src={deployment.logoUrl}
-                                      alt={`${projectTitle} icon`}
-                                      className="w-8 h-8 rounded-lg object-cover border border-black/10 shrink-0"
-                                    />
-                                  )}
-                                  <div className="min-w-0 flex-1">
-                                    <span className="block font-mono text-[12px] text-[#0B0B0F] truncate select-all">
-                                      {deployment.liveUrl}
-                                    </span>
-                                    {deployment.logoUrl && (
-                                      <span className="block text-[10.5px] text-[#71717A] truncate">
-                                        Custom app icon · Add to Home Screen ready
-                                      </span>
-                                    )}
-                                  </div>
-                                  <button
-                                    type="button"
-                                    onClick={() => void handleCopyLiveUrl()}
-                                    aria-label="Copy live app link"
-                                    className="min-h-[36px] px-2.5 rounded-lg border border-black/[0.1] bg-[#FAFAFC] hover:bg-black/[0.04] text-[12px] font-medium text-[#0B0B0F] inline-flex items-center gap-1 shrink-0 active:scale-95 transition-all"
-                                  >
-                                    {copiedLiveUrl ? (
-                                      <>
-                                        <Check className="w-3.5 h-3.5 text-emerald-600" />
-                                        <span>Copied</span>
-                                      </>
-                                    ) : (
-                                      <>
-                                        <Copy className="w-3.5 h-3.5" />
-                                        <span>Copy</span>
-                                      </>
-                                    )}
-                                  </button>
-                                  <a
-                                    href={deployment.liveUrl}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    aria-label="Open live app in new browser tab"
-                                    className="min-h-[36px] px-2.5 rounded-lg bg-[#6D4AFF] hover:bg-[#5B35F5] text-white text-[12px] font-medium inline-flex items-center gap-1 shrink-0 active:scale-95 transition-all"
-                                  >
-                                    <ExternalLink className="w-3.5 h-3.5" />
-                                    <span>Open</span>
-                                  </a>
-                                </div>
+                        {deployment.liveUrl && (
+                          <div className="rounded-xl border border-black/[0.09] bg-white px-3 py-2 flex items-center gap-2.5">
+                            {deployment.logoUrl && (
+                              <img
+                                src={deployment.logoUrl}
+                                alt={`${projectTitle} icon`}
+                                className="w-8 h-8 rounded-lg object-cover border border-black/10 shrink-0"
+                              />
+                            )}
+                            <div className="min-w-0 flex-1">
+                              <span className="block font-mono text-[12px] text-[#0B0B0F] truncate select-all">
+                                {deployment.liveUrl}
+                              </span>
+                              {deployment.logoUrl && (
+                                <span className="block text-[10.5px] text-[#71717A] truncate">
+                                  Custom app icon · Add to Home Screen ready
+                                </span>
                               )}
                             </div>
-                          )}
+                            <button
+                              type="button"
+                              onClick={() => void handleCopyLiveUrl()}
+                              aria-label="Copy live app link"
+                              className="min-h-[36px] px-3 rounded-lg border border-black/[0.1] bg-[#FAFAFC] hover:bg-black/[0.04] text-[12px] font-medium text-[#0B0B0F] inline-flex items-center gap-1.5 shrink-0 active:scale-95 transition-all"
+                            >
+                              {copiedLiveUrl ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                  <span>Copied</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3.5 h-3.5" />
+                                  <span>Copy</span>
+                                </>
+                              )}
+                            </button>
+                          </div>
+                        )}
                       </div>
-                    </div>
-                  )}
+                    )}
 
                   {/* Paused Build Card — Stops at 0 Credits OR Near Serverless Limit & Unlocks "Continue" */}
                   {isPausedTurn && (() => {
@@ -2338,11 +2181,11 @@ export function BuilderWorkspace({
                 />
                 <span className="text-[12.5px] font-medium text-[#18181B] truncate">
                   {activeModel?.name ??
-                    (selectedModel === 'auto::architect'
-                      ? 'AI Craft Architect (Smart Builder)'
+                    (selectedModel === 'auto::free-browser' || selectedModel === 'auto::architect'
+                      ? 'AI Craft Auto (Free · No Key)'
                       : modelsLoading
-                        ? 'Connecting AI...'
-                        : selectedModel || 'AI Craft Architect (Smart Builder)')}
+                        ? 'Connecting Free AI...'
+                        : selectedModel || 'AI Craft Auto (Free · No Key)')}
                 </span>
               </div>
 

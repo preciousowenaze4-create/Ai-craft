@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "updatedAt": "2026-11-17T19:16:17.206Z",
+  "users": {
+    "email:preciousddkid@gmail.com": {
+      "id": "9ae04f57-8d36-48aa-a892-9db05b8617a3",
+      "email": "preciousddkid@gmail.com",
+      "name": "Precious Ddkid",
+      "avatarUrl": "https://lh3.googleusercontent.com/a/ACg8ocJNMyMorxAEXCiHnzV_oMQlhULjQf5qGhnVNfBlGGWVix1FYW0=s96-c",
+      "provider": "email",
+      "isOwner": true,
+      "banned": false,
+      "verified": true,
+      "restricted": false,
+      "createdAt": "2026-11-14T08:46:51.012104Z",
+      "lastSignInAt": "2026-11-17T19:16:15.711Z",
+      "updatedAt": "2026-11-16T10:13:29.648Z"
+    },
+    "email:ddkidmon@gmail.com": {
+      "id": "ff5530fd-9702-44a1-9d15-f69f178ad5c8",
+      "email": "ddkidmon@gmail.com",
+      "name": "Ddkid Mon",
+      "avatarUrl": "https://lh3.googleusercontent.com/a/ACg8ocL1wTuHplOoTb7SrjA4R9HIB8ywyyBD8spEQ294zS_lIoLN=s96-c",
+      "provider": "google",
+      "isOwner": false,
+      "banned": false,
+      "verified": false,
+      "restricted": false,
+      "createdAt": "2026-11-14T12:44:11.715084Z",
+      "lastSignInAt": "2026-11-15T10:29:42.626401Z",
+      "updatedAt": "2026-11-16T10:14:47.044Z"
+    },
+    "email:preciousowenaze4@gmail.com": {
+      "id": "8bfafae4-8a43-470c-ac9a-d207ded52151",
+      "email": "preciousowenaze4@gmail.com",
+      "name": "Owenaze Precious",
+      "avatarUrl": "https://lh3.googleusercontent.com/a/ACg8ocKUXQ8q7gzeYu4l2u2-9sfQ-ChLx6CL8wvLpUvZUQgrR37MKhpd=s96-c",
+      "provider": "google",
+      "isOwner": false,
+      "banned": false,
+      "verified": false,
+      "restricted": false,
+      "createdAt": "2026-11-14T10:14:39.017316Z",
+      "lastSignInAt": "2026-11-14T12:26:47.165786Z",
+      "updatedAt": "2026-11-14T12:26:47.165786Z"
+    },
+    "email:ddkidsarah@gmail.com": {
+      "id": "683fd8b1-aca6-48b8-b59a-1ebe11d19eb3",
+      "email": "ddkidsarah@gmail.com",
+      "name": "Sarah Ddkid",
+      "avatarUrl": "https://lh3.googleusercontent.com/a/ACg8ocKHxESm8nJFw_mOBq3f4j70uBCzXlCop6Qk81Di1WsCZZWenA=s96-c",
+      "provider": "google",
+      "isOwner": false,
+      "banned": false,
+      "verified": false,
+      "restricted": false,
+      "createdAt": "2026-11-16T08:48:40.592353Z",
+      "lastSignInAt": "2026-11-16T10:15:10.897831Z",
+      "updatedAt": "2026-11-16T10:14:48.500Z"
+    },
+    "email:ddkidgod@gmail.com": {
+      "id": "f4f30bbc-791b-4706-b9d9-9fb4c854ee69",
+      "email": "ddkidgod@gmail.com",
+      "name": "ddkidgod",
+      "avatarUrl": null,
+      "provider": "email",
+      "isOwner": false,
+      "banned": false,
+      "verified": false,
+      "restricted": false,
+      "createdAt": "2026-11-16T10:21:59.274632Z",
+      "lastSignInAt": "2026-11-17T14:49:53.05264Z",
+      "updatedAt": "2026-11-16T10:21:59.970Z"
+    },
+    "email:preciousddkid208@gmail.com": {
+      "id": "8cb5a7cd-9299-48a0-bdfe-a13ece0ebc01",
+      "email": "preciousddkid208@gmail.com",
+      "name": "Ddkid Precious",
+      "avatarUrl": "https://lh3.googleusercontent.com/a/ACg8ocKrS3dDFEBer-Y7TZfGualAsHCOFajcKMcPkD6uoUL6k5B2YQ=s96-c",
+      "provider": "google",
+      "isOwner": false,
+      "banned": false,
+      "verified": false,
+      "restricted": false,
+      "createdAt": "2026-11-16T11:24:47.895888Z",
+      "lastSignInAt": "2026-11-16T11:24:47.921335Z",
+      "updatedAt": "2026-11-16T11:24:47.921335Z"
+    }
+  }
+}

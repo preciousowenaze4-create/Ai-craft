@@ -39,7 +39,7 @@ export function ModelSelectorPopover({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [gatewayFilter, setGatewayFilter] = useState<
-    'all' | 'auto' | 'gemini' | 'groq' | 'openrouter' | 'huggingface' | 'ngrok' | 'pollinations'
+    'all' | 'auto' | 'puter' | 'pollinations' | 'web-search'
   >('all');
   const [categoryFilter, setCategoryFilter] = useState<
     'all' | 'code' | 'image' | 'music' | 'video'
@@ -217,13 +217,13 @@ export function ModelSelectorPopover({
             <div className="px-2.5 pt-2.5 pb-2 border-b border-black/[0.08] flex flex-col gap-1.5">
               <div className="flex items-center justify-between gap-2 px-0.5">
                 <span className="font-display font-semibold text-[12.5px] text-[#0B0B0F] tracking-[-0.01em]">
-                  AI Craft Engine
+                  Free Browser AI
                 </span>
                 <div className="flex items-center gap-1.5">
                   <span className="text-[11px] text-[#52525B] tabular-nums">
                     {modelsLoading
                       ? 'Loading...'
-                      : `${filteredModels.length} active`}
+                      : `${filteredModels.length} free`}
                   </span>
                   <button
                     type="button"
@@ -239,28 +239,25 @@ export function ModelSelectorPopover({
                 </div>
               </div>
 
-              {availableGateways.length > 1 && models.length > 8 && (
+              {availableGateways.length > 1 && models.length > 4 && (
                 <div className="flex items-center gap-1 overflow-x-auto pb-0.5 text-[10.5px]">
                   {(
                     [
                       { id: 'all', label: 'All' },
                       ...(availableGateways.includes('auto')
-                        ? [{ id: 'auto', label: 'Architect' }]
+                        ? [{ id: 'auto', label: 'Auto' }]
                         : []),
-                      ...(availableGateways.includes('groq')
-                        ? [{ id: 'groq', label: 'Groq' }]
-                        : []),
-                      ...(availableGateways.includes('openrouter')
-                        ? [{ id: 'openrouter', label: 'OpenRouter' }]
-                        : []),
-                      ...(availableGateways.includes('huggingface')
-                        ? [{ id: 'huggingface', label: 'HuggingFace' }]
+                      ...(availableGateways.includes('puter')
+                        ? [{ id: 'puter', label: 'Puter AI' }]
                         : []),
                       ...(availableGateways.includes('pollinations')
-                        ? [{ id: 'pollinations', label: 'Built-in' }]
+                        ? [{ id: 'pollinations', label: 'No-Key Instant' }]
+                        : []),
+                      ...(availableGateways.includes('web-search')
+                        ? [{ id: 'web-search', label: 'Search' }]
                         : []),
                     ] as Array<{
-                      id: 'all' | 'auto' | 'groq' | 'openrouter' | 'huggingface' | 'pollinations';
+                      id: 'all' | 'auto' | 'puter' | 'pollinations' | 'web-search';
                       label: string;
                     }>
                   ).map((gwTab) => {
