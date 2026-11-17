@@ -223,9 +223,9 @@ export async function runLiveBrowserSearch(query: string): Promise<{
 
   const bingImagesTask = (async () => {
     try {
-      const bingUrl = `https://www.bing.com/images/search?q=${encodeURIComponent(
+      const bingUrl = `https://www.bing.com/images/async?q=${encodeURIComponent(
         cleanQuery
-      )}&form=HDRSC2&first=1`;
+      )}&async=content&first=1&count=12`;
       const res = await fetchWithTimeout(
         bingUrl,
         3200,
@@ -233,16 +233,23 @@ export async function runLiveBrowserSearch(query: string): Promise<{
       );
       if (!res.ok) return;
       const html = await res.text();
-      const matches = html.matchAll(/murl&quot;:&quot;(https:\/\/[^&]+?)&quot;/gi);
+      const matches = html.matchAll(/murl&quot;:&quot;(https:\/\/[^&"]+)&quot;/gi);
       let count = 0;
       for (const m of matches) {
         const imgUrl = m[1]
           ?.replace(/\\u002f/gi, '/')
           .replace(/\\u003a/gi, ':');
-        if (!imgUrl) continue;
+        if (
+          !imgUrl ||
+          /vecteezy\.com|shutterstock\.com|istockphoto\.com|dreamstime\.com|123rf\.com|freepik\.com\/premium/i.test(
+            imgUrl
+          )
+        ) {
+          continue;
+        }
         addImage(cleanQuery, imgUrl, 'Bing Web Images');
         count += 1;
-        if (count >= 6) break;
+        if (count >= 8) break;
       }
     } catch {
       // ignore timeout or network failure

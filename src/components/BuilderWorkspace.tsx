@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlertCircle,
   ArrowDown,
   ArrowUp,
   ArrowUpRight,
@@ -9,7 +8,6 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
-  ChevronRight,
   Copy,
   Database,
   Download,
@@ -57,31 +55,8 @@ import {
   ProjectSecretsModal,
 } from './ProjectConfigDrawers';
 import { ProviderLogo } from './ProviderLogo';
+import { ScreenStudioStrip } from './ScreenStudioStrip';
 import { VoiceInputButton } from './VoiceInputButton';
-
-function formatBuildStepLabel(filePath: string): string {
-  if (filePath === 'index.html') return 'Core app structure';
-  if (filePath === 'styles.css') return 'Design & layout styling';
-  if (filePath === 'app.js') return 'Real-time app logic';
-  if (filePath === 'database/schema.js') return 'Real-time database';
-  if (filePath === 'modules/monetization.js') return 'Monetization & billing';
-  if (filePath === 'components/header.html') return 'Header bar';
-  if (filePath === 'components/navigation.html') return 'Navigation';
-  if (filePath === 'components/canvas.html') return 'Interactive canvas';
-  if (filePath === 'components/form.html') return 'Interactive form';
-  if (filePath === 'components/footer.html') return 'Footer';
-
-  const slug = filePath
-    .replace(/^screens\//, '')
-    .replace(/^components\//, '')
-    .replace(/^modules\//, '')
-    .replace(/\.(?:html|js)$/i, '')
-    .replace(/[-_]+/g, ' ')
-    .trim();
-  if (!slug) return filePath;
-  const titled = slug.charAt(0).toUpperCase() + slug.slice(1);
-  return filePath.startsWith('screens/') ? `${titled} module` : titled;
-}
 
 function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
   const cleaned = raw
@@ -209,7 +184,6 @@ export function BuilderWorkspace({
   const [attachment, setAttachment] = useState<ProcessedAttachment | null>(null);
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);
   const [activeDrawer, setActiveDrawer] = useState<'secrets' | 'database' | 'deploy' | null>(null);
-  const [collapsedTurnIds, setCollapsedTurnIds] = useState<Record<string, boolean>>({});
   const [showHeaderActions, setShowHeaderActions] = useState(false);
   const [autoAllow, setAutoAllow] = useState(true);
   const [showScrollBottom, setShowScrollBottom] = useState(false);
@@ -1428,7 +1402,6 @@ export function BuilderWorkspace({
         >
           <div className="w-full max-w-[500px] md:max-w-[680px] lg:max-w-[840px] 2xl:max-w-[1000px] mx-auto flex flex-col gap-6 pb-4">
             {turns.map((turn) => {
-              const isExpanded = !collapsedTurnIds[turn.id];
               const isMediaTurn = turn.kind === 'media' || Boolean(turn.media);
               const isBuildTurn = turn.kind === 'build' && !isMediaTurn;
               const isTurnWorking =
@@ -1436,14 +1409,7 @@ export function BuilderWorkspace({
               const displayAiText = sanitizeDisplayProse(turn.aiText, isBuildTurn);
 
               const isPausedTurn = turn.phase === 'paused';
-              const stepUnderstandingDone = turn.phase !== 'understanding';
               const stepBuildingDone = turn.phase === 'complete';
-
-              const toggleTurnExpanded = () =>
-                setCollapsedTurnIds((prev) => ({
-                  ...prev,
-                  [turn.id]: !prev[turn.id],
-                }));
 
               const turnModelName =
                 turn.modelName ||
@@ -1505,17 +1471,6 @@ export function BuilderWorkspace({
                         )}
                       </div>
                     </div>
-
-                    {isBuildTurn && turn.phase !== 'understanding' && (
-                      <button
-                        type="button"
-                        onClick={toggleTurnExpanded}
-                        aria-label="Toggle build file details"
-                        className="p-1.5 rounded-full text-[#52525B] hover:bg-black/[0.04] shrink-0"
-                      >
-                        <MoreVertical className="w-4 h-4" />
-                      </button>
-                    )}
                   </div>
 
                   {/* Live Thought Timer Row */}
@@ -1578,141 +1533,26 @@ export function BuilderWorkspace({
                     </div>
                   )}
 
-                  {/* Real-Time Replit-Style Live Coding & File Activity Card */}
+                  {/* Live Horizontally Scrollable Multi-Screen Studio Canvas (Real-Time Screen Previews) */}
                   {isBuildTurn &&
                     (turn.phase === 'building' ||
                       turn.phase === 'paused' ||
                       turn.phase === 'complete' ||
-                      turn.files.length > 0) && (() => {
-                    const bytes = turn.bytesBuilt ?? turn.previewHtml?.length ?? 0;
-                    const kbLabel =
-                      bytes >= 1024
-                        ? `${(bytes / 1024).toFixed(1)} KB`
-                        : bytes > 0
-                          ? `${bytes} B`
-                          : '';
-                    const progressPct =
-                      turn.phase === 'complete'
-                        ? 100
-                        : turn.files.length === 0
-                          ? 14
-                          : Math.min(94, 22 + Math.round((Math.min(bytes, 14000) / 14000) * 72));
-
-                    return (
-                      <div className="rounded-2xl border border-black/[0.08] bg-[#F7F7FA] px-4 py-3 flex flex-col gap-2.5">
-                        <div className="flex items-center justify-between gap-2">
-                          <div className="flex items-center gap-2 min-w-0 flex-1">
-                            {isTurnWorking ? (
-                              <Loader2 className="w-4 h-4 animate-spin text-[#0D5BFF] shrink-0" />
-                            ) : isPausedTurn ? (
-                              <AlertCircle className="w-4 h-4 text-[#6D4AFF] shrink-0" />
-                            ) : (
-                              <CheckCircle2 className="w-4 h-4 text-[#0D5BFF] shrink-0" />
-                            )}
-                            <span className="text-[13.5px] font-semibold text-[#111118] truncate">
-                              {turn.files.length > 0
-                                ? turn.phase === 'complete'
-                                  ? `Built ${turn.files.length} ${turn.files.length === 1 ? 'file' : 'files'}`
-                                  : isPausedTurn
-                                    ? `Saved ${turn.files.length} ${turn.files.length === 1 ? 'file' : 'files'} (paused)`
-                                    : `${turn.activeAction} ${formatBuildStepLabel(turn.activeFile)}`
-                                : turn.phaseLabel}
-                            </span>
-                            {turn.activeFile && isTurnWorking ? (
-                              <span className="bg-white rounded-md px-2 py-0.5 text-[11.5px] font-mono text-[#18181B] truncate border border-black/[0.06]">
-                                {turn.activeFile}
-                              </span>
-                            ) : null}
-                          </div>
-
-                          <div className="flex items-center gap-2 shrink-0">
-                            {kbLabel && (
-                              <span className="text-[11.5px] font-mono text-[#71717A] tabular-nums">
-                                {kbLabel}
-                              </span>
-                            )}
-                            {turn.files.length > 0 && (
-                              <button
-                                type="button"
-                                onClick={toggleTurnExpanded}
-                                className="text-[13px] font-medium text-[#18181B] flex items-center gap-0.5 shrink-0 hover:opacity-75"
-                              >
-                                <span className="tabular-nums">
-                                  All({turn.files.length})
-                                </span>
-                                <ChevronRight
-                                  className={`w-4 h-4 transition-transform duration-150 ${
-                                    isExpanded ? 'rotate-90' : ''
-                                  }`}
-                                />
-                              </button>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* Real-Time Build Progress Bar */}
-                        <div className="h-1.5 w-full rounded-full bg-black/[0.07] overflow-hidden">
-                          <div
-                            className="h-full rounded-full transition-all duration-300 ease-out"
-                            style={{
-                              width: `${progressPct}%`,
-                              backgroundColor: '#0D5BFF',
-                            }}
-                          />
-                        </div>
-
-                        {/* Live Blue-Checkmark File Stream List */}
-                        {isExpanded && (turn.files.length > 0 || isTurnWorking) && (
-                          <ul className="pt-2 border-t border-black/[0.06] space-y-1.5 text-[13px]">
-                            {turn.files.map((filePath) => {
-                              const isCurrentlyCoding =
-                                isTurnWorking && filePath === turn.activeFile;
-                              const label = formatBuildStepLabel(filePath);
-                              return (
-                                <li
-                                  key={filePath}
-                                  className="flex items-center justify-between gap-2 py-0.5"
-                                >
-                                  <div className="flex items-center gap-2 min-w-0">
-                                    {isCurrentlyCoding ? (
-                                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#0D5BFF] shrink-0" />
-                                    ) : (
-                                      <CheckCircle2 className="w-3.5 h-3.5 text-[#0D5BFF] shrink-0" />
-                                    )}
-                                    <span
-                                      className={`truncate font-medium ${
-                                        isCurrentlyCoding
-                                          ? 'text-[#111118]'
-                                          : 'text-[#18181B]'
-                                      }`}
-                                    >
-                                      {isCurrentlyCoding
-                                        ? `Writing ${label}...`
-                                        : label}
-                                    </span>
-                                  </div>
-                                  <span className="text-[11.5px] font-mono text-[#71717A] shrink-0 truncate max-w-[140px]">
-                                    {filePath}
-                                  </span>
-                                </li>
-                              );
-                            })}
-
-                            {isTurnWorking && (
-                              <li className="flex items-center gap-2 py-0.5 text-[#52525B]">
-                                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#0D5BFF] shrink-0" />
-                                <span className="text-[12.5px] truncate">
-                                  {turn.files.length === 0
-                                    ? 'Writing live HTML, styles, and real-time database...'
-                                    : 'Streaming next code module...'}
-                                </span>
-                              </li>
-                            )}
-                          </ul>
-                        )}
-                      </div>
-                    );
-                  })()}
+                      Boolean(turn.previewHtml) ||
+                      turn.files.length > 0) && (
+                      <ScreenStudioStrip
+                        html={turn.previewHtml}
+                        mode={mode}
+                        isWorking={isTurnWorking}
+                        phaseLabel={turn.phaseLabel}
+                        plannedTotalCount={
+                          turn.planSteps && turn.planSteps.length >= 4
+                            ? turn.planSteps.length
+                            : 5
+                        }
+                        onOpenPreview={() => onSetView('preview')}
+                      />
+                    )}
 
                   {/* Live Streaming AI Response Prose (Raw code strictly excluded) */}
                   {turn.errorMessage ? (

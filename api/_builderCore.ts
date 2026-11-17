@@ -271,18 +271,23 @@ export async function runLiveBrowserSearch(query: string): Promise<{
 
   const bingImgTask = (async () => {
     try {
-      const bingUrl = `https://www.bing.com/images/search?q=${encodeURIComponent(
+      const bingUrl = `https://www.bing.com/images/async?q=${encodeURIComponent(
         cleanQuery
-      )}&form=HDRSC2&first=1`;
-      const res = await fetchWithTimeout(bingUrl, 2800, 'text/html,application/xhtml+xml');
+      )}&async=content&first=1&count=12`;
+      const res = await fetchWithTimeout(bingUrl, 3200, 'text/html,application/xhtml+xml');
       if (!res.ok) return;
       const html = await res.text();
       const matches = Array.from(
         html.matchAll(/murl&quot;:&quot;(https:\/\/[^&"]+)&quot;/g)
       );
-      for (const m of matches.slice(0, 6)) {
+      for (const m of matches.slice(0, 10)) {
         const rawUrl = m[1]?.replace(/\\u002f/gi, '/').trim();
-        if (rawUrl) {
+        if (
+          rawUrl &&
+          !/vecteezy\.com|shutterstock\.com|istockphoto\.com|dreamstime\.com|123rf\.com/i.test(
+            rawUrl
+          )
+        ) {
           addImage(cleanQuery, rawUrl, 'Web Image Search');
         }
       }
@@ -1398,15 +1403,15 @@ export function buildCraftSystemPrompt(params: {
     'STEP 0C (Custom Brand Logo Tag): Output one `[[LOGO: bg=#HEX, accent=#HEX, theme=#HEX, motif=play|chat|bag|music|camera|heart|bolt|star|wallet|map|flame|spark|letter, letters=XX]]` tailored specifically to the user\'s app & colors. NEVER output AI Craft\'s logo.',
     'PART 1 (Honest Architectural Summary): Write 2–3 calm, clear plain-text sentences summarizing ONLY the exact screens, real-time `window.AICraft.db` tables, interactive controls, and real searched content you built below. PROHIBITED IN PART 1: raw HTML/CSS/JS, markdown code fences (```), backticks, or the words "PART 1"/"PART 2"/"PART 3".',
     'PART 2 (Complete Self-Contained Real-Time App): Immediately output <<<AICRAFT_APP_HTML>>> followed by a COMPLETE, self-contained, runnable <!DOCTYPE html> application ending with <<<END_AICRAFT_APP_HTML>>>.',
-    'MANDATORY ANTI-BLANK-SCREEN & MULTI-DEVICE COMPLETENESS RULES FOR PART 2:',
-    `1. TARGET EXPERIENCE: Design a complete, immediately populated ${targetLabel}. Every main viewport, tab, button, form, modal, and interactive card MUST be visibly rendered and interactive on first load — ZERO empty black/white voids, ZERO blank middle panes!`,
+    'MANDATORY MULTI-SCREEN COMPLETENESS & ANTI-BLANK-SCREEN RULES FOR PART 2:',
+    `1. TARGET EXPERIENCE: Design a complete, immediately populated ${targetLabel}. NEVER stop after building only one screen or a shallow skeleton! Build 4 to 6 distinct, fully populated interactive screens using semantic containers: \`<section data-screen="<id>" data-screen-title="<Screen Name>">...</section>\` (for example: messaging apps -> \`chats\` ("Chats"), \`conversation\` ("Conversation"), \`message-info\` ("Message info"), \`new-chat\` ("New Chat"), \`profile\` ("Profile"); social feeds -> \`feed\` ("Feed"), \`discover\` ("Discover"), \`create\` ("Create"), \`inbox\` ("Inbox"), \`profile\` ("Profile"); clinic/business -> \`home\` ("Home"), \`catalog\` ("Services"), \`booking\` ("Book"), \`detail\` ("Details"), \`account\` ("Account")). Populate EVERY screen with full realistic markup, starter records, and working tap navigation!`,
     '2. ZERO FRAGILE EXTERNAL CDNs FOR STYLING OR ICONS: Write ALL layout, spacing, typography, cards, feeds, modals, and animations cleanly inside `<style>...</style>`. DO NOT depend on `cdn.tailwindcss.com`, `unpkg.com/lucide`, React/Babel `<script type="text/babel">`, or icon font CDNs — use PURE INLINE `<svg>` paths (`width="20" height="20" viewBox="0 0 24 24"`) on EVERY icon button so icons never disappear!',
     '3. ANDROID + IOS + LAPTOP/PC + TV VIEWPORT & BOTTOM CLEARANCE MATH: Use `html, body { margin: 0; padding: 0; height: 100dvh; width: 100%; overflow: hidden; }` for app shells with sticky headers/bottom bars, and center app content cleanly inside a responsive container (`width: 100%; max-width: 1120px; margin: 0 auto;` for desktop/laptop/TV views, keeping full width on phones). On Android (`html[data-platform="android"]`) give bottom navigation bars `padding-bottom: max(18px, calc(env(safe-area-inset-bottom, 0px) + 10px))` so Android system nav buttons NEVER overlap or sink into the bottom nav labels, while keeping iOS (`env(safe-area-inset-bottom)`) crisp and natural.',
     '4. CUSTOM BRAND HEAD TAGS & INLINE ICON: Inside `<head>`, include `<meta name="theme-color" content="#HEX" />`, `<meta name="background-color" content="#HEX" />`, `<meta name="aicraft-logo" data-bg="#HEX" data-accent="#HEX" data-theme="#HEX" data-motif="..." data-letters="XX" />`, and render `<svg id="aicraft-app-icon" viewBox="0 0 128 128" ...>` inside the header.',
-    '5. REAL-TIME STRUCTURED DATABASE (`window.AICraft.db`): Wire ALL core app data cleanly to `await window.AICraft.db.list(table)`, `insert(table, row)`, `update(table, id, patch)`, `remove(table, id)`. On startup inside `DOMContentLoaded`: seed 4–6 rich realistic starter items grounded in real-world details into `window.AICraft.db` ONLY if `list(table)` returns empty, render immediately to the DOM, and sync Supabase secrets if configured via `window.AICraft.findSecret(...)`.',
-    '6. WORKING DOMAIN FEATURES & REAL SEARCHED IMAGES: Use verified HTTPS image URLs returned by search results (with clean CSS gradient fallbacks on `onerror`) or inline SVG artwork. Build genuine interactive tabs, live search (`window.AICraft.search` + local filter), working create/booking/chat forms, and real state updates.',
+    '5. REAL-TIME STRUCTURED DATABASE (`window.AICraft.db`): Wire ALL core app data cleanly to `await window.AICraft.db.list(table)`, `insert(table, row)`, `update(table, id, patch)`, `remove(table, id)`. On startup inside `DOMContentLoaded`: seed 5–8 rich realistic starter items grounded in real-world details into `window.AICraft.db` ONLY if `list(table)` returns empty, render immediately to the DOM across every screen, and sync Supabase secrets if configured via `window.AICraft.findSecret(...)`.',
+    '6. WORKING DOMAIN FEATURES & REAL SEARCHED IMAGES: Use verified HTTPS image URLs returned by search results (with clean CSS gradient/initials fallbacks on `onerror`) or inline SVG artwork. Build genuine interactive screen navigation, live search (`window.AICraft.search` + local filter), working create/send/booking forms, live replies, and real state updates.',
     '7. ERROR-FREE VANILLA JAVASCRIPT: Write clean vanilla JS inside `<script>...</script>`, wrap initialization cleanly in `DOMContentLoaded` + `try/catch`, null-check DOM lookups, escape dynamic text safely, verify all braces/parentheses match cleanly, and ensure every clickable button works immediately on tap.',
-    '9. FINAL SILENT SELF-AUDIT: Before outputting `<<<END_AICRAFT_APP_HTML>>>`, verify mentally that <style> is complete, every tab has real markup + rendering logic, JS has zero syntax errors, and the primary viewport opens directly onto rich, active, interactive content.',
+    '8. FINAL VISUAL & CODE SELF-AUDIT BEFORE ENDING: Before outputting `<<<END_AICRAFT_APP_HTML>>>`, check every `<section data-screen>` screen — make sure none are empty, all navigation & buttons work, real avatars/photos load cleanly, and the first screen opens directly onto rich production UI.',
     'PART 3 (Next Suggested Upgrades): Immediately AFTER <<<END_AICRAFT_APP_HTML>>>, output:',
     '[[SUGGESTIONS]]',
     '<Short, specific, immediately tappable upgrade prompt 1>',

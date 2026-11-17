@@ -27,8 +27,10 @@ import { TopBar } from './components/TopBar';
 import { unlockSpeechSynthesis } from './hooks/useSpeechNarration';
 import {
   analyzeAttachmentVisualHints,
+  generateBrowserImageClient,
   streamRealTimeBrowserAi,
 } from './utils/browserAi';
+import { inspectBuiltAppCompleteness } from './utils/screenExtractor';
 import { buildProjectSecretHints } from './utils/secretHints';
 import {
   deriveSmartProjectTitle,
@@ -2140,8 +2142,44 @@ export default function App() {
           applyBillingSummary(prepared.billing);
         }
 
-        // 2. Direct Media Studio (Image / Music / Video) goes cleanly to /api/craft/stream
-        if (prepared.mediaKind || prepared.naturalMediaIntent) {
+        // 2. Direct Media Studio (Image / Music / Video)
+        const targetMediaKind = prepared.mediaKind || prepared.naturalMediaIntent;
+        if (targetMediaKind) {
+          if (targetMediaKind === 'image' && !options.forceChat) {
+            updateTurn(projectId, turnId, (t) => ({
+              ...t,
+              kind: 'media',
+              phase: 'building',
+              phaseLabel: 'Generating bespoke visual from description...',
+            }));
+            const directImg = await generateBrowserImageClient({
+              prompt: message,
+              modelId: modelToUse,
+              signal: controller.signal,
+            });
+            if (directImg) {
+              activeConnectionsRef.current.delete(turnId);
+              updateTurn(projectId, turnId, (t) => ({
+                ...t,
+                kind: 'media',
+                phase: 'complete',
+                phaseLabel: 'Image ready',
+                thoughtSeconds: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
+                aiText: `Generated image for "${message.slice(0, 120)}".`,
+                media: {
+                  kind: 'image',
+                  dataUrl: directImg.dataUrl,
+                  mimeType: directImg.mimeType,
+                  prompt: message,
+                  modelId: directImg.modelId,
+                  gateway: directImg.gateway,
+                },
+                modelId: directImg.modelId,
+                modelProvider: directImg.gateway,
+              }));
+              return;
+            }
+          }
           await runServerSseStream(visualHints);
           return;
         }
@@ -2153,9 +2191,92 @@ export default function App() {
           kind: prepared.initialRoute === 'build' ? 'build' : t.kind,
           phase: 'understanding',
           phaseLabel: hasSearchHits
-            ? 'Searched live web · Thinking step by step...'
+            ? 'Searched live web · Planning multi-screen architecture...'
             : 'Thinking step by step...',
         }));
+
+        const streamTurnCallbacks = {
+          onModelSelected: (info: { modelId: string; modelName: string; provider: string }) => {
+            updateTurn(projectId, turnId, (t) => ({
+              ...t,
+              modelId: info.modelId,
+              modelName: info.modelName,
+              modelProvider: info.provider,
+            }));
+          },
+          onReasoning: () => {
+            updateTurn(projectId, turnId, (t) =>
+              t.phase === 'understanding'
+                ? {
+                    ...t,
+                    phaseLabel: 'Checking real-time structure & design...',
+                  }
+                : t
+            );
+          },
+          onTitle: (title: string) => {
+            updateProjectTitle(projectId, title);
+          },
+          onPlanSteps: (steps: string[]) => {
+            updateTurn(projectId, turnId, (t) => ({
+              ...t,
+              planSteps: steps,
+            }));
+          },
+          onDbTables: (tables: IncomingSchemaTable[]) => {
+            setProjects((prev) =>
+              prev.map((p) =>
+                p.id === projectId
+                  ? {
+                      ...p,
+                      databaseConfig: mergeIncomingDbSchema(
+                        p.databaseConfig,
+                        tables
+                      ),
+                    }
+                  : p
+              )
+            );
+            window.dispatchEvent(
+              new CustomEvent('aicraft:db-updated', { detail: { projectId } })
+            );
+          },
+          onPhaseChange: (phase: 'understanding' | 'building', label: string) => {
+            updateTurn(projectId, turnId, (t) => ({
+              ...t,
+              kind: phase === 'building' ? 'build' : t.kind,
+              phase,
+              phaseLabel: label,
+            }));
+          },
+          onProseUpdate: (proseText: string) => {
+            updateTurn(projectId, turnId, (t) => ({
+              ...t,
+              aiText: proseText,
+            }));
+          },
+          onBuildProgress: (progress: {
+            files: string[];
+            activeAction: string;
+            activeFile: string;
+            bytesBuilt: number;
+            partialHtml?: string;
+          }) => {
+            updateTurn(projectId, turnId, (t) => ({
+              ...t,
+              kind: 'build',
+              phase: 'building',
+              phaseLabel: progress.partialHtml
+                ? `Drawing screens & wiring ${progress.activeFile}...`
+                : `Building ${progress.activeFile}...`,
+              files: progress.files,
+              activeAction: progress.activeAction,
+              activeFile: progress.activeFile,
+              bytesBuilt: progress.bytesBuilt,
+              previewHtml: progress.partialHtml || t.previewHtml,
+            }));
+          },
+        };
 
         let browserResult: Awaited<ReturnType<typeof streamRealTimeBrowserAi>> | null =
           null;
@@ -2169,77 +2290,7 @@ export default function App() {
             userPrompt: prepared.userPrompt,
             attachmentDataUrl: options.attachmentDataUrl,
             signal: controller.signal,
-            onModelSelected: (info) => {
-              updateTurn(projectId, turnId, (t) => ({
-                ...t,
-                modelId: info.modelId,
-                modelName: info.modelName,
-                modelProvider: info.provider,
-              }));
-            },
-            onReasoning: () => {
-              updateTurn(projectId, turnId, (t) =>
-                t.phase === 'understanding'
-                  ? {
-                      ...t,
-                      phaseLabel: 'Planning real-time architecture & database...',
-                    }
-                  : t
-              );
-            },
-            onTitle: (title) => {
-              updateProjectTitle(projectId, title);
-            },
-            onPlanSteps: (steps) => {
-              updateTurn(projectId, turnId, (t) => ({
-                ...t,
-                planSteps: steps,
-              }));
-            },
-            onDbTables: (tables) => {
-              setProjects((prev) =>
-                prev.map((p) =>
-                  p.id === projectId
-                    ? {
-                        ...p,
-                        databaseConfig: mergeIncomingDbSchema(
-                          p.databaseConfig,
-                          tables
-                        ),
-                      }
-                    : p
-                )
-              );
-              window.dispatchEvent(
-                new CustomEvent('aicraft:db-updated', { detail: { projectId } })
-              );
-            },
-            onPhaseChange: (phase, label) => {
-              updateTurn(projectId, turnId, (t) => ({
-                ...t,
-                kind: phase === 'building' ? 'build' : t.kind,
-                phase,
-                phaseLabel: label,
-              }));
-            },
-            onProseUpdate: (proseText) => {
-              updateTurn(projectId, turnId, (t) => ({
-                ...t,
-                aiText: proseText,
-              }));
-            },
-            onBuildProgress: (progress) => {
-              updateTurn(projectId, turnId, (t) => ({
-                ...t,
-                kind: 'build',
-                phase: 'building',
-                phaseLabel: `Building ${progress.activeFile}...`,
-                files: progress.files,
-                activeAction: progress.activeAction,
-                activeFile: progress.activeFile,
-                bytesBuilt: progress.bytesBuilt,
-              }));
-            },
+            ...streamTurnCallbacks,
           });
         } catch (err) {
           if ((err as Error)?.name === 'AbortError') {
@@ -2260,35 +2311,7 @@ export default function App() {
           throw new Error('Free browser AI did not return any output. Please retry.');
         }
 
-        // 4. Finalize & harden the streamed output on /api/route
-        const finalizeRes = await fetch('/api/route', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...getStoredAuthHeaders(),
-          },
-          body: JSON.stringify({
-            action: 'finalize',
-            rawOutput: browserResult.rawOutput,
-            message,
-            mode: targetMode,
-            previousHtml,
-            modelUsed: browserResult.modelUsed,
-            modelName: browserResult.modelName,
-            provider: browserResult.provider,
-            startedAt,
-          }),
-          signal: controller.signal,
-        });
-
-        if (!finalizeRes.ok) {
-          await handleHttpFailureResponse(
-            finalizeRes,
-            'Failed to finalize built app.'
-          );
-        }
-
-        const finalized = (await finalizeRes.json()) as {
+        type FinalizedPayload = {
           ok?: boolean;
           kind: TurnKind;
           title?: string;
@@ -2307,6 +2330,97 @@ export default function App() {
           modelName?: string;
           provider?: string;
         };
+
+        const runFinalizePass = async (
+          rawText: string,
+          meta: { modelUsed: string; modelName: string; provider: string }
+        ): Promise<FinalizedPayload> => {
+          const finalizeRes = await fetch('/api/route', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...getStoredAuthHeaders(),
+            },
+            body: JSON.stringify({
+              action: 'finalize',
+              rawOutput: rawText,
+              message,
+              mode: targetMode,
+              previousHtml,
+              modelUsed: meta.modelUsed,
+              modelName: meta.modelName,
+              provider: meta.provider,
+              startedAt,
+            }),
+            signal: controller.signal,
+          });
+          if (!finalizeRes.ok) {
+            await handleHttpFailureResponse(
+              finalizeRes,
+              'Failed to finalize built app.'
+            );
+          }
+          return (await finalizeRes.json()) as FinalizedPayload;
+        };
+
+        // 4. Finalize Pass 1
+        let finalized = await runFinalizePass(browserResult.rawOutput, browserResult);
+
+        // 5. Calm Self-Inspection & Expansion Pass 2:
+        //    Inspect what the AI actually built in Preview; if it rushed out only 1-2 screens or < 12 KB,
+        //    keep the initial screen(s) visible in ScreenStudioStrip while the AI inspects & completes all screens!
+        if (finalized.kind === 'build' && finalized.previewHtml) {
+          const audit = inspectBuiltAppCompleteness(finalized.previewHtml, message);
+          if (audit.needsExpansionPass && !controller.signal.aborted) {
+            updateTurn(projectId, turnId, (t) => ({
+              ...t,
+              kind: 'build',
+              phase: 'building',
+              phaseLabel: `Checking ${audit.screenCount || 1} built screen${
+                audit.screenCount === 1 ? '' : 's'
+              } · Adding remaining screens & layers...`,
+              previewHtml: finalized.previewHtml,
+              files: finalized.files.length > 0 ? finalized.files : t.files,
+            }));
+
+            try {
+              const expansionPrompt = [
+                `CURRENT BUILT PREVIEW HTML (${(finalized.previewHtml.length / 1024).toFixed(1)} KB):\n\`\`\`html\n${finalized.previewHtml.slice(0, 14000)}\n\`\`\``,
+                audit.critiquePrompt,
+              ].join('\n\n');
+
+              const pass2Result = await streamRealTimeBrowserAi({
+                modelId: browserResult.modelUsed || modelToUse || 'auto::free-browser',
+                systemPrompt: prepared.systemPrompt,
+                historyMessages: prepared.historyMessages,
+                userPrompt: expansionPrompt,
+                attachmentDataUrl: options.attachmentDataUrl,
+                signal: controller.signal,
+                ...streamTurnCallbacks,
+              });
+
+              if (pass2Result?.rawOutput?.trim()) {
+                const pass2Finalized = await runFinalizePass(
+                  pass2Result.rawOutput,
+                  pass2Result
+                );
+                if (
+                  pass2Finalized.kind === 'build' &&
+                  pass2Finalized.previewHtml &&
+                  pass2Finalized.previewHtml.length >= finalized.previewHtml.length * 0.85
+                ) {
+                  finalized = pass2Finalized;
+                  browserResult = pass2Result;
+                }
+              }
+            } catch (pass2Err) {
+              if ((pass2Err as Error)?.name === 'AbortError') {
+                throw pass2Err;
+              }
+              // Keep Pass 1 valid build cleanly if Pass 2 provider hit a temporary cooldown
+            }
+          }
+        }
 
         activeConnectionsRef.current.delete(turnId);
 

@@ -100,9 +100,15 @@ async function fetchVerifiedWebImageFallback(
   prompt: string
 ): Promise<GeneratedMediaResult | null> {
   try {
-    const searchData = await runLiveBrowserSearch(prompt);
+    const cleanQuery = prompt
+      .replace(
+        /^(?:please\s+)?(?:can you\s+)?(?:generate|create|make|draw|paint|render|design|show(?:\s+me)?|search(?:\s+for)?|find(?:\s+me)?)\s+(?:an?\s+|the\s+|some\s+)?(?:real\s+|realistic\s+|high\s+quality\s+|hd\s+)?(?:image|photo|picture|illustration|artwork|wallpaper|logo|icon)(?:\s+of|\s+for|\s+showing)?\s*/i,
+        ''
+      )
+      .trim() || prompt;
+    const searchData = await runLiveBrowserSearch(cleanQuery);
     const candidates = searchData.images.map((i) => i.imageUrl).filter(Boolean);
-    for (const url of candidates.slice(0, 6)) {
+    for (const url of candidates.slice(0, 8)) {
       const downloaded = await fetchImageBytesAsDataUrl(url, 4500);
       if (downloaded) {
         return {
@@ -1090,15 +1096,27 @@ export async function generateMediaAsset(params: {
     if (webImg) return webImg;
   }
 
-  const cooldownKey = buildCandidateCooldownKey('pollinations', '', 'sana');
-  if (!isGatewayCandidateCoolingDown(cooldownKey)) {
+  const imageModelCandidates = Array.from(
+    new Set([
+      parsed.gateway === 'pollinations' && parsed.upstreamModelId
+        ? parsed.upstreamModelId
+        : 'flux',
+      'flux',
+      'sana',
+    ])
+  );
+
+  for (const imgModel of imageModelCandidates) {
+    const cooldownKey = buildCandidateCooldownKey('pollinations', '', imgModel);
+    if (isGatewayCandidateCoolingDown(cooldownKey)) continue;
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 14000);
     try {
       const seed = crypto.randomInt(1, 10_000_000);
       const url = `${DEFAULT_POLLINATIONS_IMAGE_URL}/prompt/${encodeURIComponent(
         cleanPrompt
-      )}?model=sana&width=1024&height=1024&seed=${seed}&nologo=true`;
+      )}?model=${encodeURIComponent(imgModel)}&width=1024&height=1024&seed=${seed}&nologo=true`;
       const res = await fetch(url, {
         method: 'GET',
         signal: controller.signal,
@@ -1127,11 +1145,11 @@ export async function generateMediaAsset(params: {
         prompt: cleanPrompt,
         dataUrl: bufferToDataUrl(buf, contentType),
         mimeType: contentType,
-        modelId: 'pollinations::sana',
+        modelId: `pollinations::${imgModel}`,
         gateway: 'pollinations',
       };
     } catch {
-      // fall through cleanly to Google/Bing web image grounding
+      // try next free image model or web image grounding
     } finally {
       clearTimeout(timer);
     }

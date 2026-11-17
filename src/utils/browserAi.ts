@@ -1,3 +1,5 @@
+import { closePartialHtmlForLivePreview } from './screenExtractor';
+
 export interface BrowserVisualHints {
   dominantColor?: string;
   surfaceTheme?: 'dark' | 'light';
@@ -19,6 +21,7 @@ export interface RealTimeBuildProgress {
   activeAction: string;
   activeFile: string;
   bytesBuilt: number;
+  partialHtml?: string;
 }
 
 export interface StreamRealTimeBrowserAiParams {
@@ -61,6 +64,10 @@ interface PuterWindowGlobal {
         imageOrOptions?: string | Record<string, unknown>,
         options?: Record<string, unknown>
       ) => Promise<unknown>;
+      txt2img?: (
+        prompt: string,
+        testMode?: boolean
+      ) => Promise<HTMLImageElement | string | { src?: string }>;
     };
   };
 }
@@ -422,6 +429,7 @@ async function streamViaPuterClient(params: {
       {
         model: params.upstreamModelId,
         stream: true,
+        max_tokens: 16384,
       }
     );
   } else {
@@ -429,6 +437,7 @@ async function streamViaPuterClient(params: {
     streamOrResponse = await puter.ai.chat(messages, {
       model: params.upstreamModelId,
       stream: true,
+      max_tokens: 16384,
     });
   }
 
@@ -515,6 +524,7 @@ async function streamViaBrowserPollinations(params: {
       body: JSON.stringify({
         model: params.upstreamModelId || 'openai-fast',
         stream: true,
+        max_tokens: 16384,
         temperature: 0.45,
         messages: [
           { role: 'system', content: params.systemPrompt },
@@ -667,6 +677,8 @@ export async function streamRealTimeBrowserAi(
   let enteredBuildPhase = false;
   let lastEmitAt = 0;
   let lastBytesEmitted = 0;
+  let lastHtmlEmitAt = 0;
+  let lastScreenCloseCount = 0;
 
   const processLiveTokenUpdate = (force = false) => {
     const cleaned = stripReasoningTagsClient(rawAccumulated);
@@ -706,7 +718,7 @@ export async function streamRealTimeBrowserAi(
 
     if (!enteredBuildPhase) {
       enteredBuildPhase = true;
-      params.onPhaseChange?.('building', 'Writing real-time application code...');
+      params.onPhaseChange?.('building', 'Drawing live screens & wiring real-time logic...');
       const proseBeforeCode = sanitizeProseClient(cleaned);
       if (proseBeforeCode) {
         params.onProseUpdate?.(proseBeforeCode);
@@ -714,10 +726,24 @@ export async function streamRealTimeBrowserAi(
     }
 
     const htmlSlice = cleaned.slice(codeIdx);
-    if (force || now - lastEmitAt >= 150 || htmlSlice.length - lastBytesEmitted >= 280) {
+    const screenCloseCount = (htmlSlice.match(/<\/section>/gi) || []).length;
+    const shouldUpdatePreview =
+      force ||
+      screenCloseCount > lastScreenCloseCount ||
+      (now - lastHtmlEmitAt >= 900 && htmlSlice.length > 900);
+
+    if (force || now - lastEmitAt >= 180 || htmlSlice.length - lastBytesEmitted >= 280) {
       lastEmitAt = now;
       lastBytesEmitted = htmlSlice.length;
       const progress = extractClientBuildArtifacts(htmlSlice);
+      if (shouldUpdatePreview) {
+        lastHtmlEmitAt = now;
+        lastScreenCloseCount = screenCloseCount;
+        const partial = closePartialHtmlForLivePreview(htmlSlice);
+        if (partial && partial.length > 260) {
+          progress.partialHtml = partial;
+        }
+      }
       params.onBuildProgress?.(progress);
     }
   };
@@ -730,6 +756,8 @@ export async function streamRealTimeBrowserAi(
     enteredBuildPhase = false;
     lastEmitAt = 0;
     lastBytesEmitted = 0;
+    lastHtmlEmitAt = 0;
+    lastScreenCloseCount = 0;
   };
 
   const handleChunk = (contentDelta: string, reasoningDelta: string) => {
@@ -892,3 +920,107 @@ export async function streamRealTimeBrowserAi(
     ? lastError
     : new Error('Unable to reach free browser AI right now.');
 }
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      if (typeof reader.result === 'string') resolve(reader.result);
+      else reject(new Error('Failed to encode generated image.'));
+    };
+    reader.onerror = () => reject(new Error('Failed to read generated image.'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+export async function generateBrowserImageClient(params: {
+  prompt: string;
+  modelId?: string;
+  signal?: AbortSignal;
+}): Promise<{
+  dataUrl: string;
+  mimeType: string;
+  modelId: string;
+  gateway: 'puter' | 'pollinations';
+} | null> {
+  const cleanPrompt = params.prompt.trim().slice(0, 800);
+  if (!cleanPrompt) return null;
+
+  const puter = getPuterGlobal();
+  const puterReady = Boolean(puter?.ai?.txt2img);
+  const puterSignedIn = isPuterSignedInClient();
+
+  if (
+    puterReady &&
+    (puterSignedIn || params.modelId?.startsWith('puter::'))
+  ) {
+    try {
+      const imgRes = await puter!.ai!.txt2img!(cleanPrompt, false);
+      const src =
+        typeof imgRes === 'string'
+          ? imgRes
+          : imgRes && typeof imgRes === 'object' && 'src' in imgRes && typeof imgRes.src === 'string'
+            ? imgRes.src
+            : '';
+      if (src) {
+        if (src.startsWith('data:image/')) {
+          const mime = src.split(';')[0].replace(/^data:/, '') || 'image/png';
+          return {
+            dataUrl: src,
+            mimeType: mime,
+            modelId: 'puter::txt2img',
+            gateway: 'puter',
+          };
+        }
+        const fetched = await fetch(src, { signal: params.signal });
+        if (fetched.ok) {
+          const blob = await fetched.blob();
+          if (blob.type.startsWith('image/') && blob.size > 1024) {
+            return {
+              dataUrl: await blobToDataUrl(blob),
+              mimeType: blob.type,
+              modelId: 'puter::txt2img',
+              gateway: 'puter',
+            };
+          }
+        }
+      }
+    } catch {
+      // fall through to browser Pollinations
+    }
+  }
+
+  // Try browser-direct Pollinations from user's own browser IP (independent of server IP rate limit)
+  for (const modelParam of ['flux', 'sana']) {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 14000);
+    const onAbort = () => controller.abort();
+    params.signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      const seed = Math.floor(Math.random() * 9_000_000) + 1;
+      const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(
+        cleanPrompt
+      )}?model=${modelParam}&width=1024&height=1024&seed=${seed}&nologo=true`;
+      const res = await fetch(url, { signal: controller.signal });
+      if (res.ok) {
+        const blob = await res.blob();
+        if (blob.type.startsWith('image/') && blob.size > 1024) {
+          return {
+            dataUrl: await blobToDataUrl(blob),
+            mimeType: blob.type,
+            modelId: `pollinations::${modelParam}`,
+            gateway: 'pollinations',
+          };
+        }
+      }
+    } catch {
+      // fall through cleanly to server verified image search
+    } finally {
+      window.clearTimeout(timer);
+      params.signal?.removeEventListener('abort', onAbort);
+    }
+  }
+
+  return null;
+}
+
