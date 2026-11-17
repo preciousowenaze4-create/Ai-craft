@@ -29,8 +29,9 @@ export interface ProPlanOption {
   name: string;
   subtitle: string;
   priceText: string;
+  amountUsd: number;
   cadenceText: string;
-  dailyLimit: number;
+  dailyLimit: number | null;
   creditsToAdd: number;
   badgeText?: string;
 }
@@ -39,38 +40,42 @@ export const PRO_PLANS: ProPlanOption[] = [
   {
     id: 'starter',
     name: 'Starter',
-    subtitle: 'Max 1,500/day · 45,000 credits / 30d',
-    priceText: '₦25,000.00',
+    subtitle: '100,000 credits / month · No daily limit',
+    priceText: '$25.00',
+    amountUsd: 25,
     cadenceText: 'per month',
-    dailyLimit: 1500,
-    creditsToAdd: 45000,
+    dailyLimit: null,
+    creditsToAdd: 100000,
   },
   {
     id: 'plus',
     name: 'Plus',
-    subtitle: 'Max 3,500/day · 105,000 credits / 30d',
-    priceText: '₦48,000.00',
+    subtitle: '250,000 credits / month · No daily limit',
+    priceText: '$48.00',
+    amountUsd: 48,
     cadenceText: 'per month',
-    dailyLimit: 3500,
-    creditsToAdd: 105000,
+    dailyLimit: null,
+    creditsToAdd: 250000,
   },
   {
     id: 'studio',
     name: 'Studio',
-    subtitle: 'Max 6,000/day · 180,000 credits / 30d',
-    priceText: '₦70,000.00',
+    subtitle: '500,000 credits / month · No daily limit',
+    priceText: '$70.00',
+    amountUsd: 70,
     cadenceText: 'per month',
-    dailyLimit: 6000,
-    creditsToAdd: 180000,
+    dailyLimit: null,
+    creditsToAdd: 500000,
   },
   {
     id: 'annual',
     name: 'Annual',
-    subtitle: 'Max 8,000/day · 240,000/mo · 12 cycles',
-    priceText: '₦800,000.00',
+    subtitle: '1,000,000 credits / mo · 12 months',
+    priceText: '$600.00',
+    amountUsd: 600,
     cadenceText: 'per year',
-    dailyLimit: 8000,
-    creditsToAdd: 240000,
+    dailyLimit: null,
+    creditsToAdd: 1000000,
     badgeText: 'PRO YEARLY',
   },
 ];
@@ -155,6 +160,7 @@ export function ProUpgradeModal({
     text: string;
   } | null>(null);
   const [legalSheet, setLegalSheet] = useState<'terms' | 'privacy' | null>(null);
+  const [usdToNgnRate, setUsdToNgnRate] = useState<number | null>(null);
   const popupPollRef = useRef<number | null>(null);
 
   const selectedPlan =
@@ -174,7 +180,20 @@ export function ProUpgradeModal({
       setRestoring(false);
       setStatusNotice(null);
       setLegalSheet(null);
+      return;
     }
+    let cancelled = false;
+    void fetch('/api/payments/config', { cache: 'no-store' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { usdToNgnRate?: number } | null) => {
+        if (!cancelled && data && typeof data.usdToNgnRate === 'number' && data.usdToNgnRate > 0) {
+          setUsdToNgnRate(data.usdToNgnRate);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
   }, [open]);
 
   useEffect(() => {
@@ -649,8 +668,12 @@ export function ProUpgradeModal({
               </button>
 
               <div className="mt-1.5 flex flex-col items-center gap-0.5">
-                <p className="text-[10.5px] text-[#71717A] text-center">
-                  Auto-renews · Cancel anytime
+                <p className="text-[10.5px] text-[#71717A] text-center tabular-nums">
+                  {usdToNgnRate
+                    ? `Paystack bills in NGN: ~₦${Math.round(
+                        selectedPlan.amountUsd * usdToNgnRate
+                      ).toLocaleString()} for $${selectedPlan.amountUsd} · Cancel anytime`
+                    : `Paystack bills exact NGN equivalent of $${selectedPlan.amountUsd} · Cancel anytime`}
                 </p>
                 <div className="flex items-center justify-center gap-5 text-[10.5px] text-[#71717A]">
                   <button

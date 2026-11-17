@@ -62,6 +62,7 @@ export interface PaymentTransaction {
   reference: string;
   planId: 'starter' | 'plus' | 'studio' | 'annual';
   planName: string;
+  amountUsd?: number;
   amountNgn: number;
   amountKobo: number;
   creditsToAdd: number;
@@ -101,6 +102,13 @@ export interface ProjectSecret {
 export interface ProjectSecretHint {
   key: string;
   hint: string;
+}
+
+export interface SecretSaveResult {
+  ok: boolean;
+  syncedCloud: boolean;
+  syncedLiveApp: boolean;
+  message: string;
 }
 
 export interface ProjectDatabaseColumn {

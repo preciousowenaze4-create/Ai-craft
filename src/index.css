@@ -138,3 +138,7 @@ html[data-platform="android"] .pb-safe {
   }
 }
 
+.secret-masked {
+  -webkit-text-security: disc;
+  text-security: disc;
+}

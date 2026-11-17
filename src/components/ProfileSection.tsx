@@ -767,10 +767,14 @@ export function ProfileSection({
 
                       <div className="text-right shrink-0">
                         <p className="font-display font-bold text-[13px] text-[#0B0B0F] tabular-nums">
-                          ₦{tx.amountNgn.toLocaleString()}.00
+                          {typeof tx.amountUsd === 'number' && tx.amountUsd > 0
+                            ? `$${tx.amountUsd.toLocaleString()}.00`
+                            : `₦${tx.amountNgn.toLocaleString()}.00`}
                         </p>
-                        <p className="text-[10px] text-[#9CA3AF] font-mono truncate max-w-[100px]">
-                          {tx.reference.slice(-10)}
+                        <p className="text-[10px] text-[#9CA3AF] font-mono truncate max-w-[120px] tabular-nums">
+                          {typeof tx.amountUsd === 'number' && tx.amountUsd > 0 && tx.amountNgn > 0
+                            ? `₦${tx.amountNgn.toLocaleString()} · ${tx.reference.slice(-6)}`
+                            : tx.reference.slice(-10)}
                         </p>
                       </div>
                     </li>

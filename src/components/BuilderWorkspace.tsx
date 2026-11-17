@@ -44,6 +44,7 @@ import {
   ProjectDatabaseConfig,
   ProjectDeploymentConfig,
   ProjectSecret,
+  SecretSaveResult,
   WorkspaceView,
 } from '../types/craft';
 import { ProcessedAttachment, readAttachmentFile } from '../utils/attachment';
@@ -146,7 +147,7 @@ interface BuilderWorkspaceProps {
   onRetryModels: () => void;
   onSetView: (view: WorkspaceView) => void;
   onPublish: () => void;
-  onUpdateSecrets: (next: ProjectSecret[]) => void;
+  onUpdateSecrets: (next: ProjectSecret[]) => Promise<SecretSaveResult> | SecretSaveResult | void;
   onUpdateDatabase: (next: ProjectDatabaseConfig) => void;
   onDeployProject: (slug: string) => void;
   onBack: () => void;
@@ -2563,6 +2564,7 @@ export function BuilderWorkspace({
       {/* Per-Project Configuration Drawers */}
       <ProjectSecretsModal
         open={activeDrawer === 'secrets'}
+        mode={mode}
         projectTitle={projectTitle}
         secrets={secrets}
         onClose={() => setActiveDrawer(null)}
@@ -2571,6 +2573,7 @@ export function BuilderWorkspace({
 
       <ProjectDatabaseModal
         open={activeDrawer === 'database'}
+        mode={mode}
         projectId={projectId}
         projectTitle={projectTitle}
         hasBuiltApp={hasBuiltApp}

@@ -7,10 +7,14 @@ import zlib from 'node:zlib';
 import { createClient, type User as SupabaseUser } from '@supabase/supabase-js';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import {
+  BILLING_PLANS,
   buildPaymentCallbackHtml,
+  convertUsdToNgn,
   getPaymentSecretKey,
   getPlanConfig,
+  getUsdToNgnRate,
   initializeCheckoutSession,
+  isPaidAmountValidForPlan,
   listCustomerTransactions,
   resolvePlanFromMetadataOrAmount,
   verifyCheckoutTransaction,
@@ -1658,9 +1662,26 @@ async function startServer() {
 </html>`);
   });
 
-  app.get('/api/payments/config', (_req, res) => {
+  app.get('/api/payments/config', async (_req, res) => {
+    const usdToNgnRate = await getUsdToNgnRate();
+    const plans = Object.values(BILLING_PLANS).map((plan) => {
+      const conv = convertUsdToNgn(plan.amountUsd, usdToNgnRate);
+      return {
+        id: plan.id,
+        name: plan.name,
+        amountUsd: plan.amountUsd,
+        amountNgn: conv.amountNgn,
+        amountKobo: conv.amountKobo,
+        monthlyCredits: plan.monthlyCredits,
+        cadenceText: plan.cadenceText,
+      };
+    });
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ configured: Boolean(getPaymentSecretKey()) });
+    res.json({
+      configured: Boolean(getPaymentSecretKey()),
+      usdToNgnRate: Number(usdToNgnRate.toFixed(2)),
+      plans,
+    });
   });
 
   app.get(['/api/payments/callback', '/api/payments/callback/'], (_req, res) => {
@@ -1697,6 +1718,9 @@ async function startServer() {
     res.json({
       authorizationUrl: result.authorizationUrl,
       reference: result.reference,
+      amountUsd: result.amountUsd,
+      amountNgn: result.amountNgn,
+      usdToNgnRate: result.usdToNgnRate,
     });
   });
 
@@ -1738,7 +1762,10 @@ async function startServer() {
       });
 
       if (upgraded) {
-        billingSummary = serializeBillingSummary(upgraded);
+        billingSummary = serializeBillingSummary(
+          upgraded,
+          auth.user ? isOwnerEmail(auth.user.email) : false
+        );
       }
     }
 
@@ -1817,17 +1844,25 @@ async function startServer() {
         await upgradeUserAccountFromTransaction({ tx: verified.transaction });
       } else if (eventPayload.data.status === 'success') {
         const amountKobo = Number(eventPayload.data.amount || 0);
+        const liveRate = await getUsdToNgnRate();
         const plan = resolvePlanFromMetadataOrAmount(
           eventPayload.data.metadata,
-          amountKobo
+          amountKobo,
+          liveRate
         );
-        if (amountKobo >= plan.amountKobo) {
+        const isValid = await isPaidAmountValidForPlan({
+          plan,
+          amountKobo,
+          metadata: eventPayload.data.metadata,
+        });
+        if (isValid) {
           await upgradeUserAccountFromTransaction({
             tx: {
               id: String(eventPayload.data.id ?? reference),
               reference,
               planId: plan.id,
               planName: plan.name,
+              amountUsd: plan.amountUsd,
               amountNgn: Math.round(amountKobo / 100),
               amountKobo,
               creditsToAdd: plan.monthlyCredits,

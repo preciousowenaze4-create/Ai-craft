@@ -12,6 +12,7 @@ import {
   EyeOff,
   KeyRound,
   Lightbulb,
+  Loader2,
   Plus,
   RefreshCw,
   Rocket,
@@ -28,6 +29,7 @@ import {
   ProjectDatabaseTable,
   ProjectDeploymentConfig,
   ProjectSecret,
+  SecretSaveResult,
 } from '../types/craft';
 
 function slugifyProjectTitle(title: string): string {
@@ -217,6 +219,10 @@ interface DrawerShellProps {
   title: string;
   subtitle: string;
   icon: React.ReactNode;
+  mode?: BuildMode;
+  variant?: 'sheet' | 'sleek';
+  disableClose?: boolean;
+  bodyScrollable?: boolean;
   children: React.ReactNode;
 }
 
@@ -226,46 +232,126 @@ function DrawerShell({
   title,
   subtitle,
   icon,
+  mode = 'mobile',
+  variant = 'sheet',
+  disableClose = false,
+  bodyScrollable = true,
   children,
 }: DrawerShellProps) {
   useEffect(() => {
     if (!open) return;
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape' && !disableClose) onClose();
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [open, onClose]);
+  }, [open, onClose, disableClose]);
 
   if (!open) return null;
 
+  const theme = MODE_THEMES[mode];
+  const isMobileTheme = mode === 'mobile';
+  const isSleek = variant === 'sleek';
+
   return (
     <div
-      className="fixed inset-0 z-[70] flex items-end sm:items-center justify-center bg-black/45 backdrop-blur-[2px]"
-      onClick={onClose}
+      className={`fixed inset-0 z-[70] flex justify-center overflow-hidden ${
+        isSleek
+          ? 'items-end sm:items-center pt-20 pb-4 sm:py-8 px-4'
+          : 'items-end sm:items-center'
+      }`}
+      onClick={() => {
+        if (!disableClose) onClose();
+      }}
     >
+      {/* Luminous Home-style background with classical marble humans visible */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none fixed inset-0 bg-white/95 backdrop-blur-md"
+      />
+      <div
+        aria-hidden="true"
+        className="pointer-events-none fixed inset-x-0 top-0 h-[62dvh]"
+        style={{
+          background: isMobileTheme
+            ? 'radial-gradient(ellipse 90% 78% at 60% 18%, rgba(254, 240, 138, 0.72) 0%, rgba(254, 249, 195, 0.36) 46%, rgba(255, 255, 255, 0) 82%)'
+            : 'radial-gradient(ellipse 90% 78% at 40% 18%, rgba(245, 208, 254, 0.72) 0%, rgba(250, 232, 255, 0.36) 46%, rgba(255, 255, 255, 0) 82%)',
+        }}
+      />
+
+      {/* Home Background Human Sculptures Stage (clearly visible above & subtly framing the card) */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none fixed inset-x-0 top-0 flex justify-center overflow-hidden select-none"
+      >
+        <div className="relative w-full max-w-[440px] aspect-[750/488]">
+          {[140, 215, 295].map((size, idx) => (
+            <div
+              key={size}
+              className="animate-ring-breath absolute rounded-full border"
+              style={{
+                width: `${size}px`,
+                height: `${size}px`,
+                left: isMobileTheme ? '64%' : '36%',
+                top: '40%',
+                marginLeft: `-${size / 2}px`,
+                marginTop: `-${size / 2}px`,
+                borderColor: theme.ringColor,
+                animationDelay: `${idx * 0.55}s`,
+              }}
+            />
+          ))}
+          <div
+            className="w-full h-full overflow-hidden"
+            style={{
+              maskImage:
+                'linear-gradient(to bottom, transparent 0%, black 10%, black 80%, transparent 100%)',
+              WebkitMaskImage:
+                'linear-gradient(to bottom, transparent 0%, black 10%, black 80%, transparent 100%)',
+            }}
+          >
+            <img
+              src={theme.artworkSrc}
+              alt=""
+              draggable={false}
+              className="w-full h-auto max-w-none block opacity-95"
+              style={{
+                transform: 'translateY(-10%)',
+              }}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Foreground Dialog Card / Sheet */}
       <div
         role="dialog"
         aria-modal="true"
         aria-label={title}
         onClick={(e) => e.stopPropagation()}
-        className="w-full sm:max-w-[480px] max-h-[88dvh] bg-white rounded-t-3xl sm:rounded-3xl shadow-[0_-10px_40px_rgba(15,15,30,0.18)] sm:shadow-[0_24px_64px_rgba(15,15,30,0.22)] flex flex-col overflow-hidden pb-safe"
+        className={
+          isSleek
+            ? 'relative z-10 w-full max-w-[348px] h-[72dvh] min-h-[450px] max-h-[680px] bg-white/92 backdrop-blur-xl rounded-[26px] border border-black/[0.12] shadow-[0_24px_64px_rgba(15,15,30,0.18)] flex flex-col overflow-hidden pb-safe'
+            : 'relative z-10 w-full sm:max-w-[480px] max-h-[84dvh] bg-white/95 backdrop-blur-xl rounded-t-3xl sm:rounded-3xl border-t sm:border border-black/[0.1] shadow-[0_-10px_40px_rgba(15,15,30,0.14)] sm:shadow-[0_24px_64px_rgba(15,15,30,0.2)] flex flex-col overflow-hidden pb-safe'
+        }
       >
-        <div
-          aria-hidden="true"
-          className="w-10 h-1 rounded-full bg-black/15 mx-auto mt-2.5 sm:hidden shrink-0"
-        />
+        {!isSleek && (
+          <div
+            aria-hidden="true"
+            className="w-10 h-1 rounded-full bg-black/15 mx-auto mt-2.5 sm:hidden shrink-0"
+          />
+        )}
 
-        <div className="shrink-0 px-5 pt-3.5 pb-3 border-b border-black/[0.06] flex items-center justify-between gap-3">
+        <div className="shrink-0 px-4 pt-3.5 pb-3 border-b border-black/[0.1] flex items-center justify-between gap-2.5">
           <div className="flex items-center gap-2.5 min-w-0">
-            <div className="w-9 h-9 rounded-xl bg-[#F4F4F6] text-[#0B0B0F] flex items-center justify-center shrink-0">
+            <div className="w-9 h-9 rounded-xl bg-[#F4F4F6] text-[#0B0B0F] flex items-center justify-center shrink-0 border border-black/[0.06]">
               {icon}
             </div>
             <div className="min-w-0">
               <h2 className="font-display font-bold text-[16px] tracking-[-0.02em] text-[#0B0B0F] leading-tight">
                 {title}
               </h2>
-              <p className="text-[12px] text-[#71717A] truncate mt-0.5">
+              <p className="text-[12px] text-[#52525B] truncate mt-0.5">
                 {subtitle}
               </p>
             </div>
@@ -273,15 +359,20 @@ function DrawerShell({
 
           <button
             type="button"
+            disabled={disableClose}
             onClick={onClose}
             aria-label={`Close ${title}`}
-            className="min-w-[44px] min-h-[44px] -mr-2 rounded-full flex items-center justify-center text-[#52525B] hover:bg-black/[0.04] active:scale-95 transition-all shrink-0"
+            className="min-w-[44px] min-h-[44px] -mr-2 rounded-full flex items-center justify-center text-[#52525B] hover:bg-black/[0.05] disabled:opacity-40 active:scale-95 transition-all shrink-0"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">
+        <div
+          className={`flex-1 min-h-0 ${
+            bodyScrollable ? 'overflow-y-auto px-5 py-4' : 'flex flex-col overflow-hidden px-4 py-3.5'
+          }`}
+        >
           {children}
         </div>
       </div>
@@ -302,10 +393,11 @@ interface SecretDraftRow {
 
 interface ProjectSecretsModalProps {
   open: boolean;
+  mode?: BuildMode;
   projectTitle: string;
   secrets: ProjectSecret[];
   onClose: () => void;
-  onUpdateSecrets: (next: ProjectSecret[]) => void;
+  onUpdateSecrets: (next: ProjectSecret[]) => Promise<SecretSaveResult> | SecretSaveResult | void;
 }
 
 function makeBlankSecretRow(): SecretDraftRow {
@@ -319,6 +411,7 @@ function makeBlankSecretRow(): SecretDraftRow {
 
 export function ProjectSecretsModal({
   open,
+  mode = 'mobile',
   projectTitle,
   secrets,
   onClose,
@@ -330,6 +423,15 @@ export function ProjectSecretsModal({
   const [showShareInfo, setShowShareInfo] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const [justSaved, setJustSaved] = useState(false);
+
+  const supportsTextSecurity = useMemo(() => {
+    if (typeof window === 'undefined' || typeof CSS === 'undefined' || !CSS.supports) {
+      return true;
+    }
+    return CSS.supports('-webkit-text-security', 'disc') || CSS.supports('text-security', 'disc');
+  }, []);
 
   useEffect(() => {
     if (!open) {
@@ -337,6 +439,8 @@ export function ProjectSecretsModal({
       setFeedback(null);
       setErrorMsg(null);
       setCopiedId(null);
+      setIsSaving(false);
+      setJustSaved(false);
       return;
     }
     setRows(
@@ -352,16 +456,24 @@ export function ProjectSecretsModal({
     setRevealedIds({});
     setFeedback(null);
     setErrorMsg(null);
+    setJustSaved(false);
   }, [open, secrets]);
 
   useEffect(() => {
     if (!feedback) return;
-    const t = window.setTimeout(() => setFeedback(null), 2600);
+    const t = window.setTimeout(() => setFeedback(null), 3200);
     return () => window.clearTimeout(t);
   }, [feedback]);
 
+  useEffect(() => {
+    if (!justSaved) return;
+    const t = window.setTimeout(() => setJustSaved(false), 2000);
+    return () => window.clearTimeout(t);
+  }, [justSaved]);
+
   const handleRowChange = (id: string, field: 'key' | 'value', nextVal: string) => {
     setErrorMsg(null);
+    setJustSaved(false);
     setRows((prev) =>
       prev.map((row) =>
         row.id === id
@@ -376,12 +488,16 @@ export function ProjectSecretsModal({
   };
 
   const handleAddBlankRow = () => {
+    if (isSaving) return;
     setErrorMsg(null);
+    setJustSaved(false);
     setRows((prev) => [...prev, makeBlankSecretRow()]);
   };
 
   const handleDeleteRow = (id: string) => {
+    if (isSaving) return;
     setErrorMsg(null);
+    setJustSaved(false);
     setRows((prev) => {
       const remaining = prev.filter((r) => r.id !== id);
       return remaining.length > 0 ? remaining : [makeBlankSecretRow()];
@@ -399,8 +515,12 @@ export function ProjectSecretsModal({
     }
   };
 
-  const handleApplyChanges = () => {
+  const handleApplyChanges = async () => {
+    if (isSaving) return;
     setErrorMsg(null);
+    setFeedback(null);
+    setJustSaved(false);
+
     const cleanedRows: ProjectSecret[] = [];
     const seenKeys = new Set<string>();
 
@@ -434,174 +554,254 @@ export function ProjectSecretsModal({
       }
     }
 
-    onUpdateSecrets(cleanedRows);
-    setRows(cleanedRows.length > 0 ? cleanedRows : [makeBlankSecretRow()]);
-    setFeedback(
-      cleanedRows.length === 0
-        ? `Cleared all secrets for ${projectTitle}.`
-        : `Applied ${cleanedRows.length} ${cleanedRows.length === 1 ? 'secret' : 'secrets'} to ${projectTitle}.`
-    );
+    setIsSaving(true);
+    try {
+      const [saveResult] = await Promise.all([
+        Promise.resolve(onUpdateSecrets(cleanedRows)),
+        new Promise<void>((resolve) => window.setTimeout(resolve, 350)),
+      ]);
+
+      if (saveResult && saveResult.ok === false) {
+        setErrorMsg(saveResult.message || 'Unable to save secrets right now.');
+        return;
+      }
+
+      setRows(cleanedRows.length > 0 ? cleanedRows : [makeBlankSecretRow()]);
+      setJustSaved(true);
+
+      if (saveResult?.message) {
+        setFeedback(saveResult.message);
+      } else {
+        setFeedback(
+          cleanedRows.length === 0
+            ? `Cleared and saved all secrets for ${projectTitle}.`
+            : `Saved ${cleanedRows.length} ${cleanedRows.length === 1 ? 'secret' : 'secrets'} to ${projectTitle}.`
+        );
+      }
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error ? err.message : 'Unable to save changes. Please try again.'
+      );
+    } finally {
+      setIsSaving(false);
+    }
   };
+
+  const configuredCount = rows.filter((r) => r.key.trim() || r.value.trim()).length;
 
   return (
     <DrawerShell
       open={open}
       onClose={onClose}
+      mode={mode}
+      variant="sleek"
+      disableClose={isSaving}
+      bodyScrollable={false}
       title="Secrets"
-      subtitle={`Environment variables scoped to ${projectTitle}`}
+      subtitle={`Scoped to ${projectTitle}`}
       icon={<KeyRound className="w-[18px] h-[18px] text-[#6D4AFF]" />}
     >
-      <div className="flex flex-col gap-3.5">
-        {/* Inline Editable Secrets Rows */}
-        <div className="rounded-2xl border border-black/[0.09] bg-white overflow-hidden divide-y divide-black/[0.07]">
-          {rows.map((row) => {
+      <div className="flex-1 min-h-0 flex flex-col gap-3">
+        {/* Scrollable Sleek Vertical Keys Viewport */}
+        <div className="flex-1 min-h-[160px] overflow-y-auto overscroll-y-contain pr-1 flex flex-col gap-3">
+          {rows.map((row, idx) => {
             const isRevealed = Boolean(revealedIds[row.id]);
             const isCopied = copiedId === row.id;
             return (
               <div
                 key={row.id}
-                className="px-2.5 py-2.5 flex items-center gap-1.5 bg-white"
+                className="rounded-2xl border border-black/[0.12] bg-white px-3 pt-2.5 pb-3 flex flex-col gap-2 shadow-[0_2px_10px_rgba(11,11,15,0.04)]"
               >
-                <input
-                  type="text"
-                  value={row.key}
-                  onChange={(e) => handleRowChange(row.id, 'key', e.target.value)}
-                  placeholder="Secret name"
-                  aria-label="Secret name"
-                  autoCapitalize="characters"
-                  autoCorrect="off"
-                  spellCheck={false}
-                  className="w-[34%] min-w-[92px] h-10 px-2.5 rounded-xl border border-black/[0.11] bg-[#FAFAFC] font-mono text-[12px] font-medium text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
-                />
+                {/* Row Header: Secret Name + Action Controls */}
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={row.key}
+                    disabled={isSaving}
+                    onChange={(e) => handleRowChange(row.id, 'key', e.target.value)}
+                    placeholder={`SECRET_${idx + 1}_KEY`}
+                    aria-label="Secret name"
+                    autoCapitalize="characters"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    className="flex-1 min-w-0 h-10 px-2.5 rounded-xl border border-black/[0.12] bg-[#FAFAFC] font-mono text-[12px] font-semibold tracking-wide text-[#0B0B0F] placeholder:text-[#71717A] focus:outline-none focus:border-[#0B0B0F] focus:bg-white disabled:opacity-60"
+                  />
 
-                <input
-                  type={isRevealed ? 'text' : 'password'}
-                  value={row.value}
-                  onChange={(e) => handleRowChange(row.id, 'value', e.target.value)}
-                  placeholder="Secret value"
-                  aria-label="Secret value"
-                  autoCorrect="off"
-                  autoComplete="off"
-                  spellCheck={false}
-                  className="flex-1 min-w-0 h-10 px-2.5 rounded-xl border border-black/[0.11] bg-[#FAFAFC] font-mono text-[12px] text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
-                />
+                  <button
+                    type="button"
+                    disabled={isSaving}
+                    onClick={() =>
+                      setRevealedIds((prev) => ({
+                        ...prev,
+                        [row.id]: !prev[row.id],
+                      }))
+                    }
+                    aria-label={isRevealed ? 'Hide secret value' : 'Reveal secret value'}
+                    className="min-w-[40px] min-h-[40px] rounded-xl flex items-center justify-center text-[#3F3F46] hover:bg-black/[0.05] hover:text-[#0B0B0F] disabled:opacity-40 shrink-0 transition-colors"
+                  >
+                    {isRevealed ? (
+                      <EyeOff className="w-4 h-4" />
+                    ) : (
+                      <Eye className="w-4 h-4" />
+                    )}
+                  </button>
 
-                <button
-                  type="button"
-                  onClick={() =>
-                    setRevealedIds((prev) => ({
-                      ...prev,
-                      [row.id]: !prev[row.id],
-                    }))
-                  }
-                  aria-label={isRevealed ? 'Hide secret value' : 'Reveal secret value'}
-                  className="w-8 h-9 rounded-lg flex items-center justify-center text-[#52525B] hover:bg-black/[0.04] hover:text-[#0B0B0F] shrink-0 transition-colors"
-                >
-                  {isRevealed ? (
-                    <EyeOff className="w-4 h-4" />
+                  <button
+                    type="button"
+                    disabled={!row.value || isSaving}
+                    onClick={() => void handleCopyValue(row)}
+                    aria-label="Copy secret value"
+                    className="min-w-[40px] min-h-[40px] rounded-xl flex items-center justify-center text-[#3F3F46] hover:bg-black/[0.05] hover:text-[#0B0B0F] disabled:opacity-35 shrink-0 transition-colors"
+                  >
+                    {isCopied ? (
+                      <Check className="w-4 h-4 text-[#6D4AFF]" />
+                    ) : (
+                      <Copy className="w-4 h-4" />
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isSaving}
+                    onClick={() => handleDeleteRow(row.id)}
+                    aria-label="Delete secret row"
+                    className="min-w-[40px] min-h-[40px] rounded-xl flex items-center justify-center text-[#52525B] hover:bg-red-50 hover:text-red-600 disabled:opacity-40 shrink-0 transition-colors"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {/* Tall, Sleek Scrollable Key Paste Area + Bold Visible Black Line */}
+                <div className="flex flex-col">
+                  {supportsTextSecurity || isRevealed ? (
+                    <textarea
+                      rows={3}
+                      value={row.value}
+                      disabled={isSaving}
+                      onChange={(e) => handleRowChange(row.id, 'value', e.target.value)}
+                      placeholder="Paste API key or secret value..."
+                      aria-label="Secret value"
+                      autoCorrect="off"
+                      autoComplete="off"
+                      spellCheck={false}
+                      className={`w-full min-h-[84px] max-h-[126px] px-3 py-2.5 rounded-t-xl rounded-b-none border border-b-0 border-black/[0.12] bg-[#FAFAFC] font-mono text-[12px] leading-relaxed text-[#0B0B0F] placeholder:text-[#71717A] resize-none overflow-y-auto focus:outline-none focus:bg-white disabled:opacity-60 ${
+                        !isRevealed && row.value ? 'secret-masked' : ''
+                      }`}
+                    />
                   ) : (
-                    <Eye className="w-4 h-4" />
+                    <input
+                      type="password"
+                      value={row.value}
+                      disabled={isSaving}
+                      onChange={(e) => handleRowChange(row.id, 'value', e.target.value)}
+                      placeholder="Paste API key or secret value..."
+                      aria-label="Secret value"
+                      autoCorrect="off"
+                      autoComplete="off"
+                      spellCheck={false}
+                      className="w-full h-14 px-3 rounded-t-xl rounded-b-none border border-b-0 border-black/[0.12] bg-[#FAFAFC] font-mono text-[12.5px] text-[#0B0B0F] placeholder:text-[#71717A] focus:outline-none focus:bg-white disabled:opacity-60"
+                    />
                   )}
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => void handleCopyValue(row)}
-                  disabled={!row.value}
-                  aria-label="Copy secret value"
-                  className="w-8 h-9 rounded-lg flex items-center justify-center text-[#52525B] hover:bg-black/[0.04] hover:text-[#0B0B0F] disabled:opacity-35 shrink-0 transition-colors"
-                >
-                  {isCopied ? (
-                    <Check className="w-4 h-4 text-[#6D4AFF]" />
-                  ) : (
-                    <Copy className="w-4 h-4" />
-                  )}
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => handleDeleteRow(row.id)}
-                  aria-label="Remove secret row"
-                  className="w-8 h-9 rounded-lg flex items-center justify-center text-[#71717A] hover:bg-red-50 hover:text-red-600 shrink-0 transition-colors"
-                >
-                  <Trash2 className="w-4 h-4" />
-                </button>
+                  {/* Crisp high-contrast black line following the key box */}
+                  <div aria-hidden="true" className="h-[2.5px] w-full bg-[#0B0B0F] rounded-b-sm" />
+                </div>
               </div>
             );
           })}
         </div>
 
-        {/* + Add secret button on left */}
-        <div className="flex items-center justify-between gap-2">
-          <button
-            type="button"
-            onClick={handleAddBlankRow}
-            className="inline-flex items-center gap-1.5 h-10 px-4 rounded-xl border border-black/[0.11] bg-white hover:bg-[#F7F7FA] text-[13px] font-medium text-[#0B0B0F] active:scale-[0.98] transition-all"
-          >
-            <Plus className="w-4 h-4 text-[#6D4AFF]" />
-            <span>Add secret</span>
-          </button>
+        {/* Crisp Black Divider Rule Separating Keys Viewport & Actions */}
+        <div aria-hidden="true" className="shrink-0 h-[1.5px] w-full bg-[#0B0B0F]/85 rounded-full" />
 
-          <span className="text-[12px] text-[#71717A] tabular-nums">
-            {rows.filter((r) => r.key.trim() || r.value.trim()).length} configured
-          </span>
-        </div>
+        {/* Controls Footer (Always visible while scrolling keys above) */}
+        <div className="shrink-0 flex flex-col gap-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <button
+              type="button"
+              disabled={isSaving}
+              onClick={handleAddBlankRow}
+              className="inline-flex items-center gap-1.5 min-h-[44px] px-3.5 rounded-xl border border-black/[0.14] bg-white hover:bg-[#F7F7FA] text-[13px] font-medium text-[#0B0B0F] disabled:opacity-50 active:scale-[0.98] transition-all"
+            >
+              <Plus className="w-4 h-4 text-[#6D4AFF]" />
+              <span>Add secret</span>
+            </button>
 
-        {errorMsg && (
-          <p
-            role="alert"
-            className="px-3 py-2 rounded-xl bg-red-50 border border-red-200 text-red-700 text-[12.5px] font-medium"
-          >
-            {errorMsg}
-          </p>
-        )}
-
-        {feedback && (
-          <p
-            role="status"
-            className="px-3 py-2 rounded-xl bg-[#F3F0FF] text-[#5B21B6] text-[12.5px] font-medium"
-          >
-            {feedback}
-          </p>
-        )}
-
-        <div className="border-t border-black/[0.06]" />
-
-        {/* Info Banner matching reference */}
-        <div className="rounded-2xl border border-black/[0.09] bg-[#FAFAFC] px-3.5 py-3 flex flex-col gap-2">
-          <div className="flex items-start gap-2.5">
-            <Lightbulb className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
-            <p className="text-[12.5px] leading-snug text-[#18181B]">
-              How are secrets handled when sharing?{' '}
-              <button
-                type="button"
-                onClick={() => setShowShareInfo((v) => !v)}
-                className="font-semibold text-[#6D4AFF] hover:underline"
-              >
-                {showShareInfo ? 'Hide details' : 'Learn more'}
-              </button>
-            </p>
+            <span className="text-[12px] font-medium text-[#52525B] tabular-nums">
+              {configuredCount} configured
+            </span>
           </div>
-          {showShareInfo && (
-            <p className="pl-6 text-[12px] leading-relaxed text-[#52525B]">
-              Secrets stay isolated to <span className="font-medium text-[#0B0B0F]">{projectTitle}</span> and
-              are injected automatically at runtime via{' '}
-              <code className="font-mono text-[#3F3F46]">window.AICraft.getSecret(&quot;KEY&quot;)</code>,{' '}
-              <code className="font-mono text-[#3F3F46]">window.ENV</code>, and{' '}
-              <code className="font-mono text-[#3F3F46]">process.env</code>. Public share links never expose your raw secret values.
+
+          {errorMsg && (
+            <p
+              role="alert"
+              className="px-3 py-2 rounded-xl bg-red-50 border border-red-200 text-red-700 text-[12px] font-medium"
+            >
+              {errorMsg}
             </p>
           )}
-        </div>
 
-        {/* Apply changes primary brand button */}
-        <button
-          type="button"
-          onClick={handleApplyChanges}
-          className="w-full h-11 rounded-xl bg-[#6D4AFF] hover:bg-[#5B35F5] text-white text-[13.5px] font-semibold flex items-center justify-center gap-2 shadow-[0_4px_14px_rgba(109,74,255,0.26)] active:scale-[0.99] transition-all"
-        >
-          <Save className="w-4 h-4" />
-          <span>Apply changes</span>
-        </button>
+          {feedback && (
+            <p
+              role="status"
+              className="px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-[12px] font-medium flex items-center gap-1.5"
+            >
+              <Check className="w-3.5 h-3.5 shrink-0" />
+              <span>{feedback}</span>
+            </p>
+          )}
+
+          <div className="rounded-xl border border-black/[0.09] bg-[#FAFAFC] px-3 py-2 flex flex-col gap-1.5">
+            <div className="flex items-start gap-2">
+              <Lightbulb className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
+              <p className="text-[11.5px] leading-snug text-[#18181B]">
+                How are secrets handled when sharing?{' '}
+                <button
+                  type="button"
+                  onClick={() => setShowShareInfo((v) => !v)}
+                  className="font-semibold text-[#6D4AFF] hover:underline"
+                >
+                  {showShareInfo ? 'Hide details' : 'Learn more'}
+                </button>
+              </p>
+            </div>
+            {showShareInfo && (
+              <p className="pl-5 text-[11px] leading-relaxed text-[#52525B]">
+                Secrets stay isolated to <span className="font-medium text-[#0B0B0F]">{projectTitle}</span> and
+                inject automatically via{' '}
+                <code className="font-mono text-[#3F3F46]">window.AICraft.getSecret(&quot;KEY&quot;)</code>{' '}
+                without exposing private credentials on public links.
+              </p>
+            )}
+          </div>
+
+          <button
+            type="button"
+            disabled={isSaving}
+            onClick={() => void handleApplyChanges()}
+            className={`w-full min-h-[46px] rounded-xl text-white text-[13.5px] font-semibold flex items-center justify-center gap-2 transition-all active:scale-[0.99] disabled:cursor-wait ${
+              justSaved
+                ? 'bg-emerald-600 hover:bg-emerald-700 shadow-[0_4px_14px_rgba(5,150,105,0.28)]'
+                : 'bg-[#6D4AFF] hover:bg-[#5B35F5] disabled:bg-[#8B71FF] shadow-[0_4px_14px_rgba(109,74,255,0.28)]'
+            }`}
+          >
+            {isSaving ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Saving changes...</span>
+              </>
+            ) : justSaved ? (
+              <>
+                <Check className="w-4 h-4" />
+                <span>Changes saved</span>
+              </>
+            ) : (
+              <>
+                <Save className="w-4 h-4" />
+                <span>Apply changes</span>
+              </>
+            )}
+          </button>
+        </div>
       </div>
     </DrawerShell>
   );
@@ -613,6 +813,7 @@ export function ProjectSecretsModal({
 
 interface ProjectDatabaseModalProps {
   open: boolean;
+  mode?: BuildMode;
   projectId: string;
   projectTitle: string;
   hasBuiltApp: boolean;
@@ -624,6 +825,7 @@ interface ProjectDatabaseModalProps {
 
 export function ProjectDatabaseModal({
   open,
+  mode = 'mobile',
   projectId,
   projectTitle,
   hasBuiltApp,
@@ -821,6 +1023,7 @@ export function ProjectDatabaseModal({
     <DrawerShell
       open={open}
       onClose={onClose}
+      mode={mode}
       title="Database"
       subtitle={`Real-time structured storage · ${projectTitle}`}
       icon={<Database className="w-[18px] h-[18px] text-[#6D4AFF]" />}
@@ -1146,6 +1349,7 @@ export function ProjectDeployModal({
     <DrawerShell
       open={open}
       onClose={onClose}
+      mode={mode}
       title="Deploy"
       subtitle={`Launch & Export · ${projectTitle}`}
       icon={<Rocket className="w-[18px] h-[18px] text-[#6D4AFF]" />}

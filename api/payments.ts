@@ -8,9 +8,13 @@ import {
   upgradeUserAccountFromTransaction,
 } from './_billing.js';
 import {
+  BILLING_PLANS,
   buildPaymentCallbackHtml,
+  convertUsdToNgn,
   getPaymentSecretKey,
+  getUsdToNgnRate,
   initializeCheckoutSession,
+  isPaidAmountValidForPlan,
   listCustomerTransactions,
   resolvePlanFromMetadataOrAmount,
   verifyCheckoutTransaction,
@@ -35,8 +39,25 @@ export async function GET(request: Request): Promise<Response> {
   const route = getPaymentSubroute(request);
 
   if (route === 'config') {
+    const usdToNgnRate = await getUsdToNgnRate();
+    const plans = Object.values(BILLING_PLANS).map((plan) => {
+      const conv = convertUsdToNgn(plan.amountUsd, usdToNgnRate);
+      return {
+        id: plan.id,
+        name: plan.name,
+        amountUsd: plan.amountUsd,
+        amountNgn: conv.amountNgn,
+        amountKobo: conv.amountKobo,
+        monthlyCredits: plan.monthlyCredits,
+        cadenceText: plan.cadenceText,
+      };
+    });
     return Response.json(
-      { configured: Boolean(getPaymentSecretKey()) },
+      {
+        configured: Boolean(getPaymentSecretKey()),
+        usdToNgnRate: Number(usdToNgnRate.toFixed(2)),
+        plans,
+      },
       { headers: { 'Cache-Control': 'no-store' } }
     );
   }
@@ -139,17 +160,25 @@ export async function POST(request: Request): Promise<Response> {
         await upgradeUserAccountFromTransaction({ tx: verified.transaction });
       } else if (eventPayload.data.status === 'success') {
         const amountKobo = Number(eventPayload.data.amount || 0);
+        const liveRate = await getUsdToNgnRate();
         const plan = resolvePlanFromMetadataOrAmount(
           eventPayload.data.metadata,
-          amountKobo
+          amountKobo,
+          liveRate
         );
-        if (amountKobo >= plan.amountKobo) {
+        const isValid = await isPaidAmountValidForPlan({
+          plan,
+          amountKobo,
+          metadata: eventPayload.data.metadata,
+        });
+        if (isValid) {
           await upgradeUserAccountFromTransaction({
             tx: {
               id: String(eventPayload.data.id ?? reference),
               reference,
               planId: plan.id,
               planName: plan.name,
+              amountUsd: plan.amountUsd,
               amountNgn: Math.round(amountKobo / 100),
               amountKobo,
               creditsToAdd: plan.monthlyCredits,
@@ -193,6 +222,9 @@ export async function POST(request: Request): Promise<Response> {
       {
         authorizationUrl: result.authorizationUrl,
         reference: result.reference,
+        amountUsd: result.amountUsd,
+        amountNgn: result.amountNgn,
+        usdToNgnRate: result.usdToNgnRate,
       },
       { headers: { 'Cache-Control': 'no-store' } }
     );
@@ -225,7 +257,10 @@ export async function POST(request: Request): Promise<Response> {
       });
 
       if (upgraded) {
-        billingSummary = serializeBillingSummary(upgraded);
+        billingSummary = serializeBillingSummary(
+          upgraded,
+          auth.user ? isOwnerEmail(auth.user.email) : false
+        );
       }
     }
 

@@ -1122,13 +1122,14 @@ export default function App() {
         customAppId?: string;
         logo?: Record<string, string>;
         forceBump?: boolean;
+        secrets?: ProjectSecret[];
       }
-    ) => {
+    ): Promise<boolean> => {
       const trimmedHtml = html.trim();
-      if (!trimmedHtml) return;
+      if (!trimmedHtml) return false;
 
       const proj = projectsRef.current.find((p) => p.id === projectId);
-      if (!proj) return;
+      if (!proj) return false;
 
       const resolvedTitle =
         sanitizeSessionTitle(overrides?.title || '') ||
@@ -1172,7 +1173,7 @@ export default function App() {
       );
 
       const publicEnv: Record<string, string> = {};
-      for (const secret of proj.secrets ?? []) {
+      for (const secret of overrides?.secrets ?? proj.secrets ?? []) {
         if (secret.key && secret.value) {
           publicEnv[secret.key] = secret.value;
         }
@@ -1216,7 +1217,7 @@ export default function App() {
 
         if (res.status === 403 && (data.banned || data.code === 'ACCOUNT_BANNED')) {
           triggerBannedLockout(data.error);
-          return;
+          return false;
         }
         if (res.status === 403 && (data.restricted || data.code === 'ACCOUNT_RESTRICTED')) {
           setAuthUser((prev) => (prev ? { ...prev, restricted: true } : prev));
@@ -1264,6 +1265,7 @@ export default function App() {
               };
             })
           );
+          return true;
         } else {
           setProjects((prev) =>
             prev.map((p) =>
@@ -1272,6 +1274,7 @@ export default function App() {
                 : p
             )
           );
+          return false;
         }
       } catch {
         setProjects((prev) =>
@@ -1281,6 +1284,7 @@ export default function App() {
               : p
           )
         );
+        return false;
       }
     },
     [triggerBannedLockout]
@@ -2751,7 +2755,7 @@ export default function App() {
 
       setShowProUpgrade(false);
       setInlineNotice(
-        `AI Craft ${tx.planName} activated · ${tx.creditsToAdd.toLocaleString()} credits / 30 days`
+        `AI Craft ${tx.planName} activated · ${tx.creditsToAdd.toLocaleString()} credits / month`
       );
     },
     [applyBillingSummary, syncBillingFromServer]
@@ -3113,14 +3117,86 @@ export default function App() {
                 void publishProjectLive(activeProject.id, latestHtml);
               }
             }}
-            onUpdateSecrets={(nextSecrets) => {
-              setProjects((prev) =>
-                prev.map((proj) =>
-                  proj.id === activeProject.id
-                    ? { ...proj, secrets: nextSecrets }
-                    : proj
-                )
+            onUpdateSecrets={async (nextSecrets) => {
+              const targetId = activeProject.id;
+              const updatedProjects = projectsRef.current.map((proj) =>
+                proj.id === targetId ? { ...proj, secrets: nextSecrets } : proj
               );
+              projectsRef.current = updatedProjects;
+              setProjects(updatedProjects);
+              saveProjectsSafely(updatedProjects);
+
+              if (cloudSyncTimerRef.current !== null) {
+                window.clearTimeout(cloudSyncTimerRef.current);
+                cloudSyncTimerRef.current = null;
+              }
+
+              let syncedCloud = false;
+              const headers = getStoredAuthHeaders();
+              if (authUser && (headers.Authorization || headers['x-refresh-token'])) {
+                try {
+                  const compactProjects = updatedProjects.slice(0, 40).map((proj, idx) => ({
+                    ...proj,
+                    turns: proj.turns.map((turn) => ({
+                      ...turn,
+                      attachmentDataUrl: idx < 3 ? turn.attachmentDataUrl : null,
+                    })),
+                  }));
+                  const res = await fetch('/api/payments/sync', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      ...headers,
+                    },
+                    body: JSON.stringify({
+                      projects: compactProjects,
+                      projectViews,
+                      publishedProjects,
+                      profile: userProfile,
+                      updatedAt: new Date().toISOString(),
+                    }),
+                  });
+                  if (res.ok) {
+                    const syncJson = (await res.json().catch(() => ({}))) as {
+                      synced?: boolean;
+                    };
+                    syncedCloud = Boolean(syncJson.synced);
+                  }
+                } catch {
+                  syncedCloud = false;
+                }
+              }
+
+              let syncedLiveApp = false;
+              const latestHtml =
+                [...activeProject.turns]
+                  .reverse()
+                  .find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
+              const isAppPublished =
+                Boolean(publishedProjects[targetId]) ||
+                activeProject.deployment?.status === 'deployed';
+              if (latestHtml && isAppPublished) {
+                syncedLiveApp = await publishProjectLive(targetId, latestHtml, {
+                  secrets: nextSecrets,
+                });
+              }
+
+              const countLabel =
+                nextSecrets.length === 0
+                  ? 'Cleared secrets'
+                  : `Saved ${nextSecrets.length} ${nextSecrets.length === 1 ? 'secret' : 'secrets'}`;
+              const destParts = ['device'];
+              if (syncedCloud) destParts.push('cloud');
+              if (syncedLiveApp) destParts.push('live app');
+              const message = `${countLabel} (${destParts.join(' & ')})`;
+              setInlineNotice(message);
+
+              return {
+                ok: true,
+                syncedCloud,
+                syncedLiveApp,
+                message,
+              };
             }}
             onUpdateDatabase={(nextDb) => {
               setProjects((prev) =>
