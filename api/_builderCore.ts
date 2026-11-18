@@ -632,6 +632,147 @@ ${rawHtml}
   return assembleHtmlFromScatteredBlocks(cleanRaw);
 }
 
+/**
+ * Applies targeted <<<AICRAFT_PATCH>>> operations onto existing HTML cleanly
+ * without rebuilding or respoiling untouched screens, styles, handlers, or DB wiring.
+ */
+export function applySurgicalPatchesToHtml(
+  existingHtml: string,
+  rawOutput: string
+): { html: string; appliedCount: number; failedCount: number } {
+  const cleanRaw = stripReasoningTags(rawOutput);
+  if (!existingHtml.trim() || !/<<<\s*AICRAFT_PATCH\s*>>>/i.test(cleanRaw)) {
+    return { html: '', appliedCount: 0, failedCount: 0 };
+  }
+
+  let updated = existingHtml;
+  let appliedCount = 0;
+  let failedCount = 0;
+
+  const patchBlockRegex =
+    /<<<\s*AICRAFT_PATCH\s*>>>([\s\S]*?)(?:<<<\s*END_PATCH\s*>>>|<<<\s*END_AICRAFT_PATCH\s*>>>|$)/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = patchBlockRegex.exec(cleanRaw)) !== null) {
+    const block = match[1] || '';
+
+    // 1. SEARCH / REPLACE blocks
+    const srRegex =
+      /<<<\s*SEARCH\s*>>>\s*\n?([\s\S]*?)\n?<<<\s*REPLACE\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>|$)/gi;
+    let srMatch: RegExpExecArray | null;
+    while ((srMatch = srRegex.exec(block)) !== null) {
+      const searchStr = srMatch[1].replace(/\r\n/g, '\n');
+      const replaceStr = srMatch[2].replace(/\r\n/g, '\n');
+      if (!searchStr.trim()) continue;
+
+      if (updated.includes(searchStr)) {
+        updated = updated.replace(searchStr, replaceStr);
+        appliedCount += 1;
+        continue;
+      }
+
+      // Tolerant line-trimmed match when whitespace/indentation shifted slightly
+      const trimmedNeedle = searchStr.trim();
+      const idx = updated.indexOf(trimmedNeedle);
+      if (idx !== -1) {
+        updated =
+          updated.slice(0, idx) +
+          replaceStr.trim() +
+          updated.slice(idx + trimmedNeedle.length);
+        appliedCount += 1;
+        continue;
+      }
+
+      // Regex whitespace-normalized fallback match for short-to-medium anchors
+      const searchLines = trimmedNeedle
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (searchLines.length > 0 && searchLines.length <= 24) {
+        const escapedPattern = searchLines
+          .map((l) => l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+          .join('\\s+');
+        try {
+          const flexRe = new RegExp(escapedPattern);
+          if (flexRe.test(updated)) {
+            updated = updated.replace(flexRe, replaceStr.trim());
+            appliedCount += 1;
+            continue;
+          }
+        } catch {
+          // ignore invalid regex
+        }
+      }
+
+      failedCount += 1;
+    }
+
+    // 2. APPEND_CSS block
+    const cssMatch =
+      /<<<\s*APPEND_CSS\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>|$)/i.exec(
+        block
+      );
+    if (cssMatch?.[1]?.trim()) {
+      const cssSnippet = cssMatch[1].trim();
+      if (/<\/style>/i.test(updated)) {
+        const lastIdx = updated.toLowerCase().lastIndexOf('</style>');
+        updated = `${updated.slice(0, lastIdx)}\n${cssSnippet}\n${updated.slice(lastIdx)}`;
+      } else if (/<\/head>/i.test(updated)) {
+        updated = updated.replace(/<\/head>/i, `<style>\n${cssSnippet}\n</style>\n</head>`);
+      }
+      appliedCount += 1;
+    }
+
+    // 3. APPEND_SCREEN block
+    const screenMatch =
+      /<<<\s*APPEND_SCREEN\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>|$)/i.exec(
+        block
+      );
+    if (screenMatch?.[1]?.trim()) {
+      const screenSnippet = screenMatch[1].trim();
+      if (/<nav\b/i.test(updated)) {
+        const navIdx = updated.toLowerCase().lastIndexOf('<nav');
+        updated = `${updated.slice(0, navIdx)}${screenSnippet}\n${updated.slice(navIdx)}`;
+      } else if (/<script\b/i.test(updated)) {
+        const scriptIdx = updated.toLowerCase().indexOf('<script');
+        updated = `${updated.slice(0, scriptIdx)}${screenSnippet}\n${updated.slice(scriptIdx)}`;
+      } else if (/<\/body>/i.test(updated)) {
+        updated = updated.replace(/<\/body>/i, `${screenSnippet}\n</body>`);
+      }
+      appliedCount += 1;
+    }
+
+    // 4. APPEND_SCRIPT block
+    const jsMatch =
+      /<<<\s*APPEND_SCRIPT\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>|$)/i.exec(
+        block
+      );
+    if (jsMatch?.[1]?.trim()) {
+      const jsSnippet = jsMatch[1].trim();
+      if (/<\/script>/i.test(updated)) {
+        const lastIdx = updated.toLowerCase().lastIndexOf('</script>');
+        // Avoid injecting into aicraft safety script if present
+        const beforeSafety = updated.indexOf('data-aicraft-safety-js');
+        const targetCloseIdx =
+          beforeSafety !== -1
+            ? updated.toLowerCase().lastIndexOf('</script>', beforeSafety)
+            : lastIdx;
+        const idx = targetCloseIdx !== -1 ? targetCloseIdx : lastIdx;
+        updated = `${updated.slice(0, idx)}\n${jsSnippet}\n${updated.slice(idx)}`;
+      } else if (/<\/body>/i.test(updated)) {
+        updated = updated.replace(/<\/body>/i, `<script>\n${jsSnippet}\n</script>\n</body>`);
+      }
+      appliedCount += 1;
+    }
+  }
+
+  return {
+    html: appliedCount > 0 ? updated : '',
+    appliedCount,
+    failedCount,
+  };
+}
+
 export function finalizePartialPreviewHtml(raw: string): string {
   let html = extractPreviewHtmlFromRaw(raw);
   if (!html) return '';
@@ -886,6 +1027,19 @@ export function extractPreviewStructureSummary(previousHtml: string): string {
   const items = extractLiveBuildArtifacts(previousHtml).map(
     (a) => `${a.action} ${a.path}`
   );
+  const screenMatches = Array.from(
+    previousHtml.matchAll(
+      /<(section|div|main|article)\b[^>]*\b(?:data-screen|data-view|data-page|data-tab)=["']([^"']{1,48})["']([^>]*)>/gi
+    )
+  )
+    .slice(0, 12)
+    .map((m) => {
+      const titleMatch = /\b(?:data-screen-title|data-title|aria-label)=["']([^"']{1,48})["']/i.exec(
+        m[0]
+      );
+      return titleMatch ? `${m[2]} ("${titleMatch[1]}")` : m[2];
+    });
+
   const idMatches = Array.from(
     previousHtml.matchAll(
       /<(header|nav|main|section|aside|footer|div|form)\b[^>]*\bid=["']([^"']{1,40})["'][^>]*>/gi
@@ -893,6 +1047,20 @@ export function extractPreviewStructureSummary(previousHtml: string): string {
   )
     .slice(0, 18)
     .map((m) => `<${m[1].toLowerCase()} id="${m[2]}">`);
+
+  const cssVars = Array.from(previousHtml.matchAll(/--([a-zA-Z0-9_-]{2,28})\s*:/g))
+    .slice(0, 14)
+    .map((m) => `--${m[1]}`);
+
+  const dbTables = extractDbSchemaFromHtml(previousHtml).map(
+    (t) => `${t.name}(${t.columns.map((c) => c.name).join(', ')})`
+  );
+
+  const fnMatches = Array.from(
+    previousHtml.matchAll(/\bfunction\s+([a-zA-Z_$][a-zA-Z0-9_$]{1,36})\s*\(/g)
+  )
+    .slice(0, 14)
+    .map((m) => `${m[1]}()`);
 
   const titleMatch = /<title\b[^>]*>([^<]{1,60})<\/title>/i.exec(previousHtml);
   const themeMatch =
@@ -908,6 +1076,10 @@ export function extractPreviewStructureSummary(previousHtml: string): string {
     titleMatch ? `Current app title: "${titleMatch[1].trim()}".` : '',
     themeMatch ? `Current browser theme-color: ${themeMatch[1].trim()}.` : '',
     logoMatch ? `Current app logo meta: ${logoMatch[0]}.` : '',
+    screenMatches.length > 0 ? `Existing screens: ${screenMatches.join(', ')}.` : '',
+    cssVars.length > 0 ? `Existing CSS variables: ${Array.from(new Set(cssVars)).join(', ')}.` : '',
+    dbTables.length > 0 ? `Existing window.AICraft.db tables: ${dbTables.join('; ')}.` : '',
+    fnMatches.length > 0 ? `Existing JS functions: ${Array.from(new Set(fnMatches)).join(', ')}.` : '',
     items.length > 0 ? `Existing artifacts: ${items.join(', ')}.` : '',
     idMatches.length > 0
       ? `Existing DOM sections/IDs: ${idMatches.join(', ')}.`
@@ -1110,7 +1282,12 @@ export function stripTagMarkers(text: string): string {
     .replace(
       /\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi,
       ''
-    );
+    )
+    .replace(
+      /\[\[\s*(?:INTENT|MODE|MEDIA_PROMPT|TITLE|LOGO|PLAN|DB_SCHEMA|SUGGESTIONS|\/SUGGESTIONS)[^\]]*$/gi,
+      ''
+    )
+    .replace(/\[$/g, '');
 }
 
 export function sanitizeBuildProse(text: string): string {
@@ -1119,6 +1296,8 @@ export function sanitizeBuildProse(text: string): string {
     .replace(/```(?:html|htm|css|javascript|js|tsx|ts)?[\s\S]*/gi, '')
     .replace(/<<<\s*AICRAFT_APP_HTML\s*>>>[\s\S]*/gi, '')
     .replace(/<<<\s*END_AICRAFT_APP_HTML\s*>>>[\s\S]*/gi, '')
+    .replace(/<<<\s*AICRAFT_PATCH\s*>>>[\s\S]*/gi, '')
+    .replace(/<<<\s*(?:SEARCH|REPLACE|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>[\s\S]*/gi, '')
     .replace(/<!doctype\s+html[\s\S]*/gi, '')
     .replace(/<html\b[\s\S]*/gi, '')
     .replace(/^\s*(?:PART\s*[123]\s*[:\-–]?)\s*/gim, '')
@@ -1389,7 +1568,11 @@ export function buildCraftSystemPrompt(params: {
   const buildRulesBlock = [
     'CALM REPLIT-STYLE STEP-BY-STEP ENGINEERING DISCIPLINE — NEVER RUSH, NEVER STUB, NEVER LIE:',
     '- Slow down and think structurally like a senior Replit full-stack engineer before writing code. Build cleanly section by section so every route, button, form, database table, and screen works together.',
-    '- SURGICAL EDIT & SCREENSHOT PRESERVATION RULE (CRITICAL WHEN EDITING AN EXISTING APP): When existing Preview HTML or an attached screenshot is provided, read the existing code/DOM carefully and ONLY remove, cut, restyle, or modify the exact element/screen the user pointed out! Keep all untouched screens, styling, working JavaScript handlers, and database data intact — NEVER wipe the existing app or replace it with a bare shell.',
+    '- SURGICAL LAYER EDIT & CROSS-AI CONTINUATION RULE (CRITICAL WHEN AN APP ALREADY EXISTS):',
+    '  * Regardless of which AI built the earlier turn, YOU are continuing THAT EXACT codebase right from where it stopped!',
+    '  * NEVER rebuild or overwrite the whole app from scratch when the user asks to add, edit, fix, restyle, or remove a specific feature/screen unless they explicitly ask for a brand-new redesign.',
+    '  * For targeted edits or feature additions on an existing complete app, PREFER outputting fast surgical patch blocks inside `<<<AICRAFT_PATCH>>>...<<<END_PATCH>>>` (with exact `<<<SEARCH>>>...<<<REPLACE>>>...`, `<<<APPEND_CSS>>>`, `<<<APPEND_SCREEN>>>`, or `<<<APPEND_SCRIPT>>>`) so untouched screens, styles, buttons, and `window.AICraft.db` tables remain 100% intact!',
+    '  * When resuming from a stopped/paused incomplete build (`[[CONTINUE_BUILD]]`) OR when restructuring the full shell, preserve ALL existing screens, styles, DB tables, and working handlers cleanly inside `<<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>`.',
     '- STRICT HONESTY & NO UNSOLICITED "OPEN" BUTTONS: NEVER claim in your explanation that you built a feature unless that exact screen, button, handler, and DOM content is genuinely implemented and working inside PART 2. Never add an "Open" banner or external "Open" launcher button inside the app unless the user explicitly asks for one.',
     '- REAL-WORLD GROUNDING (ZERO GENERIC PLACEHOLDERS): Use real verified facts, services, names, departments, and real HTTPS photos from `Live Browser & Web Search Results` when available (with clean `onerror` CSS gradient fallbacks). Never output dummy placeholders like "Item 1", "Feature A", or "Lorem ipsum".',
     titleRuleForBuild,
@@ -1401,8 +1584,10 @@ export function buildCraftSystemPrompt(params: {
     '  5) `[[PLAN: Built-in actions, search & monetization — ...]]`',
     'STEP 0B (Real-Time Database Schema Lines): Output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Every interactive app must have real domain tables (e.g., clinic app -> `appointments`, `doctors`, `patients`, `services`; chat app -> `conversations`, `messages`, `contacts`; social feed -> `posts`, `comments`, `creator_profiles`).',
     'STEP 0C (Custom Brand Logo Tag): Output one `[[LOGO: bg=#HEX, accent=#HEX, theme=#HEX, motif=play|chat|bag|music|camera|heart|bolt|star|wallet|map|flame|spark|letter, letters=XX]]` tailored specifically to the user\'s app & colors. NEVER output AI Craft\'s logo.',
-    'PART 1 (Honest Architectural Summary): Write 2–3 calm, clear plain-text sentences summarizing ONLY the exact screens, real-time `window.AICraft.db` tables, interactive controls, and real searched content you built below. PROHIBITED IN PART 1: raw HTML/CSS/JS, markdown code fences (```), backticks, or the words "PART 1"/"PART 2"/"PART 3".',
-    'PART 2 (Complete Self-Contained Real-Time App): Immediately output <<<AICRAFT_APP_HTML>>> followed by a COMPLETE, self-contained, runnable <!DOCTYPE html> application ending with <<<END_AICRAFT_APP_HTML>>>.',
+    'PART 1 (Honest Architectural Summary): Write 2–3 calm, clear plain-text sentences summarizing ONLY the exact screens, real-time `window.AICraft.db` tables, interactive controls, and real searched content you built or patched below. PROHIBITED IN PART 1: raw HTML/CSS/JS, markdown code fences (```), backticks, or the words "PART 1"/"PART 2"/"PART 3".',
+    'PART 2 (Complete Real-Time App OR Surgical Patch): Output EITHER:',
+    '  - (A) Full app build: `<<<AICRAFT_APP_HTML>>>` ...complete `<!DOCTYPE html>`... `<<<END_AICRAFT_APP_HTML>>>`',
+    '  - (B) Surgical addition/edit on an existing app: `<<<AICRAFT_PATCH>>>` with exact `<<<SEARCH>>>...<<<REPLACE>>>...`, `<<<APPEND_CSS>>>`, `<<<APPEND_SCREEN>>>`, and/or `<<<APPEND_SCRIPT>>>` ending with `<<<END_PATCH>>>`',
     'MANDATORY MULTI-SCREEN COMPLETENESS & ANTI-BLANK-SCREEN RULES FOR PART 2:',
     `1. TARGET EXPERIENCE: Design a complete, immediately populated ${targetLabel}. NEVER stop after building only one screen or a shallow skeleton! Build 4 to 6 distinct, fully populated interactive screens using semantic containers: \`<section data-screen="<id>" data-screen-title="<Screen Name>">...</section>\` (for example: messaging apps -> \`chats\` ("Chats"), \`conversation\` ("Conversation"), \`message-info\` ("Message info"), \`new-chat\` ("New Chat"), \`profile\` ("Profile"); social feeds -> \`feed\` ("Feed"), \`discover\` ("Discover"), \`create\` ("Create"), \`inbox\` ("Inbox"), \`profile\` ("Profile"); clinic/business -> \`home\` ("Home"), \`catalog\` ("Services"), \`booking\` ("Book"), \`detail\` ("Details"), \`account\` ("Account")). Populate EVERY screen with full realistic markup, starter records, and working tap navigation!`,
     '2. ZERO FRAGILE EXTERNAL CDNs FOR STYLING OR ICONS: Write ALL layout, spacing, typography, cards, feeds, modals, and animations cleanly inside `<style>...</style>`. DO NOT depend on `cdn.tailwindcss.com`, `unpkg.com/lucide`, React/Babel `<script type="text/babel">`, or icon font CDNs — use PURE INLINE `<svg>` paths (`width="20" height="20" viewBox="0 0 24 24"`) on EVERY icon button so icons never disappear!',
@@ -1411,8 +1596,8 @@ export function buildCraftSystemPrompt(params: {
     '5. REAL-TIME STRUCTURED DATABASE (`window.AICraft.db`): Wire ALL core app data cleanly to `await window.AICraft.db.list(table)`, `insert(table, row)`, `update(table, id, patch)`, `remove(table, id)`. On startup inside `DOMContentLoaded`: seed 5–8 rich realistic starter items grounded in real-world details into `window.AICraft.db` ONLY if `list(table)` returns empty, render immediately to the DOM across every screen, and sync Supabase secrets if configured via `window.AICraft.findSecret(...)`.',
     '6. WORKING DOMAIN FEATURES & REAL SEARCHED IMAGES: Use verified HTTPS image URLs returned by search results (with clean CSS gradient/initials fallbacks on `onerror`) or inline SVG artwork. Build genuine interactive screen navigation, live search (`window.AICraft.search` + local filter), working create/send/booking forms, live replies, and real state updates.',
     '7. ERROR-FREE VANILLA JAVASCRIPT: Write clean vanilla JS inside `<script>...</script>`, wrap initialization cleanly in `DOMContentLoaded` + `try/catch`, null-check DOM lookups, escape dynamic text safely, verify all braces/parentheses match cleanly, and ensure every clickable button works immediately on tap.',
-    '8. FINAL VISUAL & CODE SELF-AUDIT BEFORE ENDING: Before outputting `<<<END_AICRAFT_APP_HTML>>>`, check every `<section data-screen>` screen — make sure none are empty, all navigation & buttons work, real avatars/photos load cleanly, and the first screen opens directly onto rich production UI.',
-    'PART 3 (Next Suggested Upgrades): Immediately AFTER <<<END_AICRAFT_APP_HTML>>>, output:',
+    '8. FINAL VISUAL & CODE SELF-AUDIT BEFORE ENDING: Before outputting `<<<END_AICRAFT_APP_HTML>>>` or `<<<END_PATCH>>>`, check every `<section data-screen>` screen — make sure none are empty, all navigation & buttons work, real avatars/photos load cleanly, and the first screen opens directly onto rich production UI.',
+    'PART 3 (Next Suggested Upgrades): Immediately AFTER <<<END_AICRAFT_APP_HTML>>> or <<<END_PATCH>>>, output:',
     '[[SUGGESTIONS]]',
     '<Short, specific, immediately tappable upgrade prompt 1>',
     '<Short, specific, immediately tappable upgrade prompt 2>',

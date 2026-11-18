@@ -139,11 +139,9 @@ export function PromptComposer({
           />
           <span className="text-[12.5px] font-medium text-[#18181B] truncate">
             {activeModel?.name ??
-              (selectedModel === 'auto::free-browser' || selectedModel === 'auto::architect'
-                ? 'AI Craft Auto (Free · No Key)'
-                : modelsLoading
-                  ? 'Connecting Free AI...'
-                  : selectedModel || 'AI Craft Auto (Free · No Key)')}
+              (modelsLoading
+                ? 'Connecting Vision & Code AI...'
+                : 'Gemini 2.5 Flash (Vision · Fast)')}
           </span>
         </div>
 

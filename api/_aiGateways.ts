@@ -1,6 +1,5 @@
 import {
   cleanEnvKey,
-  isTextToSpeechModel,
   type FreeModelCategory,
   type KeylessGatewayStatus,
   type NormalizedOpenRouterModel,
@@ -8,6 +7,9 @@ import {
 
 export type AiGatewayId =
   | 'auto'
+  | 'gemini'
+  | 'groq'
+  | 'openrouter'
   | 'puter'
   | 'pollinations'
   | 'browser'
@@ -42,161 +44,235 @@ export interface GatewayExecutionCandidate {
   cooldownKey: string;
 }
 
-export const ARCHITECT_MODEL_ID = 'auto::free-browser';
-export const DEFAULT_POLLINATIONS_TEXT_URL = 'https://text.pollinations.ai';
-export const DEFAULT_POLLINATIONS_IMAGE_URL = 'https://image.pollinations.ai';
+export const SERVER_GEMINI_MODEL_ID = 'gemini::gemini-4-hydrogen';
+export const SERVER_GROQ_MODEL_ID = 'groq::llama-3.3-70b-versatile';
+export const SERVER_OPENROUTER_MODEL_ID = 'openrouter::qwen/qwen3-coder:free';
+export const DEFAULT_BUILDER_MODEL_ID = 'puter::gemini-2.5-flash';
+export const SECONDARY_BUILDER_MODEL_ID = 'puter::claude-sonnet-4-6';
 export const PUTER_BROWSER_SCRIPT_URL = 'https://js.puter.com/v2/';
 
-export const ARCHITECT_PUBLIC_MODEL: UnifiedAiModel = {
-  id: ARCHITECT_MODEL_ID,
-  upstreamModelId: ARCHITECT_MODEL_ID,
-  gateway: 'auto',
-  name: 'AI Craft Auto (Free · No Key)',
-  provider: 'aicraft',
-  contextLength: 1048576,
-  isFree: true,
-  tierLabel: 'No Key · Instant',
-  capabilities: ['Code', 'Build', 'Search', 'Vision'],
-  category: 'router',
-};
+export function getServerFreeAiKeys(): {
+  geminiKey: string;
+  groqKey: string;
+  openrouterKey: string;
+} {
+  return {
+    geminiKey: (process.env.GEMINI_API_KEY || process.env.GOOGLE_AI_KEY || '').trim(),
+    groqKey: (process.env.GROQ_API_KEY || '').trim(),
+    openrouterKey: (process.env.OPENROUTER_API_KEY || '').trim(),
+  };
+}
 
+export function hasServerFreeAiKey(): boolean {
+  const keys = getServerFreeAiKeys();
+  return Boolean(keys.geminiKey || keys.groqKey || keys.openrouterKey);
+}
+
+/**
+ * Only two verified, full-context Vision + Real-Time Coding builders at a time:
+ * - When a free server-side key (GEMINI_API_KEY / GROQ_API_KEY / OPENROUTER_API_KEY) is present,
+ *   requests stream server-side with ZERO user sign-in and ZERO third-party subscription popups.
+ * - Otherwise, falls back to Puter's lightweight Gemini 2.5 Flash first, plus Claude Sonnet 4.6.
+ */
 export const PUTER_BROWSER_MODELS: UnifiedAiModel[] = [
-  {
-    id: 'puter::claude-sonnet-4',
-    upstreamModelId: 'claude-sonnet-4',
-    gateway: 'puter',
-    name: 'Claude Sonnet 4 (Browser Free)',
-    provider: 'anthropic',
-    contextLength: 200000,
-    isFree: true,
-    tierLabel: 'Browser Free',
-    capabilities: ['Code', 'Vision', 'Build'],
-    category: 'code',
-  },
-  {
-    id: 'puter::gpt-4o',
-    upstreamModelId: 'gpt-4o',
-    gateway: 'puter',
-    name: 'GPT-4o (Browser Vision · Free)',
-    provider: 'openai',
-    contextLength: 128000,
-    isFree: true,
-    tierLabel: 'Browser Free',
-    capabilities: ['Vision', 'Code', 'Build'],
-    category: 'code',
-  },
   {
     id: 'puter::gemini-2.5-flash',
     upstreamModelId: 'gemini-2.5-flash',
     gateway: 'puter',
-    name: 'Gemini 2.5 Flash (Browser Free)',
+    name: 'Gemini 2.5 Flash (Vision · Fast)',
     provider: 'google',
+    contextLength: 1048576,
+    isFree: true,
+    tierLabel: 'Free · Fast',
+    capabilities: ['Vision', 'Screenshots', 'Code', 'Fast'],
+    category: 'code',
+  },
+  {
+    id: 'puter::claude-sonnet-4-6',
+    upstreamModelId: 'claude-sonnet-4-6',
+    gateway: 'puter',
+    name: 'Claude Sonnet 4.6 (Vision · Builder)',
+    provider: 'anthropic',
     contextLength: 1000000,
     isFree: true,
-    tierLabel: 'Browser Free',
-    capabilities: ['Vision', 'Code', 'Fast'],
-    category: 'code',
-  },
-  {
-    id: 'puter::deepseek-chat',
-    upstreamModelId: 'deepseek-chat',
-    gateway: 'puter',
-    name: 'DeepSeek V3 (Browser Free)',
-    provider: 'deepseek',
-    contextLength: 128000,
-    isFree: true,
-    tierLabel: 'Browser Free',
-    capabilities: ['Code', 'Build'],
-    category: 'code',
-  },
-  {
-    id: 'puter::deepseek-reasoner',
-    upstreamModelId: 'deepseek-reasoner',
-    gateway: 'puter',
-    name: 'DeepSeek R1 Reasoner (Free)',
-    provider: 'deepseek',
-    contextLength: 128000,
-    isFree: true,
-    tierLabel: 'Browser Free',
-    capabilities: ['Reasoning', 'Code'],
-    category: 'code',
-  },
-  {
-    id: 'puter::meta-llama/llama-3.3-70b-instruct',
-    upstreamModelId: 'meta-llama/llama-3.3-70b-instruct',
-    gateway: 'puter',
-    name: 'Llama 3.3 70B (Browser Free)',
-    provider: 'meta',
-    contextLength: 128000,
-    isFree: true,
-    tierLabel: 'Browser Free',
-    capabilities: ['Code', 'Build'],
-    category: 'code',
-  },
-  {
-    id: 'puter::qwen/qwen-2.5-coder-32b-instruct',
-    upstreamModelId: 'qwen/qwen-2.5-coder-32b-instruct',
-    gateway: 'puter',
-    name: 'Qwen 2.5 Coder 32B (Free)',
-    provider: 'qwen',
-    contextLength: 128000,
-    isFree: true,
-    tierLabel: 'Browser Free',
-    capabilities: ['Code', 'Build'],
+    tierLabel: 'Free · Pro',
+    capabilities: ['Vision', 'Screenshots', 'Code', 'DB'],
     category: 'code',
   },
 ];
 
-export const POLLINATIONS_FALLBACK_MODELS: UnifiedAiModel[] = [
-  {
-    id: 'pollinations::openai-fast',
-    upstreamModelId: 'openai-fast',
-    gateway: 'pollinations',
-    name: 'GPT-OSS 20B Reasoning (No Login)',
-    provider: 'pollinations',
-    contextLength: 128000,
-    isFree: true,
-    tierLabel: 'Zero Login',
-    capabilities: ['Code', 'Build', 'Reasoning'],
-    category: 'code',
-  },
-  {
-    id: 'pollinations::sana',
-    upstreamModelId: 'sana',
-    gateway: 'pollinations',
-    name: 'Sana Image Studio (Free · No Key)',
-    provider: 'pollinations',
-    contextLength: 0,
-    isFree: true,
-    tierLabel: 'Zero Login',
-    capabilities: ['Image'],
-    category: 'image',
-  },
-  {
-    id: 'web-search::images',
-    upstreamModelId: 'google-image-search',
-    gateway: 'web-search',
-    name: 'Google Image Search Studio (Free)',
-    provider: 'web-search',
-    contextLength: 0,
-    isFree: true,
-    tierLabel: 'Live Web',
-    capabilities: ['Image', 'Search'],
-    category: 'image',
-  },
-  {
-    id: 'pollinations::music-composer',
-    upstreamModelId: 'music-composer',
-    gateway: 'pollinations',
-    name: 'AI Craft Music Studio (Free)',
-    provider: 'pollinations',
-    contextLength: 0,
-    isFree: true,
-    tierLabel: 'Zero Login',
-    capabilities: ['Music'],
-    category: 'music',
-  },
+const GROQ_PREFERRED_MODELS = [
+  'meta-llama/llama-4-maverick-17b-128e-instruct',
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+  'openai/gpt-oss-120b',
+  'llama-3.3-70b-versatile',
+  'qwen/qwen3-32b',
+  'llama-3.1-8b-instant',
 ];
+
+let cachedGroqModelCheck: {
+  keyHash: string;
+  checkedAt: number;
+  usable: boolean;
+  bestModelId: string;
+  visionModelId: string;
+} | null = null;
+
+export async function resolveUsableGroqModels(
+  forceRefresh = false
+): Promise<{ usable: boolean; bestModelId: string; visionModelId: string }> {
+  const groqKey = getServerFreeAiKeys().groqKey;
+  if (!groqKey) {
+    return { usable: false, bestModelId: '', visionModelId: '' };
+  }
+  const keyHash = `${groqKey.slice(0, 6)}:${groqKey.slice(-4)}`;
+  if (
+    !forceRefresh &&
+    cachedGroqModelCheck &&
+    cachedGroqModelCheck.keyHash === keyHash &&
+    Date.now() - cachedGroqModelCheck.checkedAt < 10 * 60_000
+  ) {
+    return {
+      usable: cachedGroqModelCheck.usable,
+      bestModelId: cachedGroqModelCheck.bestModelId,
+      visionModelId: cachedGroqModelCheck.visionModelId,
+    };
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4500);
+    const resp = await fetch('https://api.groq.com/openai/v1/models', {
+      headers: { Authorization: `Bearer ${groqKey}` },
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timer));
+
+    if (!resp.ok) {
+      cachedGroqModelCheck = {
+        keyHash,
+        checkedAt: Date.now(),
+        usable: false,
+        bestModelId: '',
+        visionModelId: '',
+      };
+      return { usable: false, bestModelId: '', visionModelId: '' };
+    }
+
+    const json = (await resp.json()) as {
+      data?: Array<{ id?: string; active?: boolean }>;
+    };
+    const allIds = (Array.isArray(json.data) ? json.data : [])
+      .filter((m) => m && typeof m.id === 'string' && m.active !== false)
+      .map((m) => String(m.id))
+      .filter(
+        (id) =>
+          !/whisper|playai|tts|guard|prompt-guard|distil-whisper|safeguard/i.test(id)
+      );
+
+    if (allIds.length === 0) {
+      cachedGroqModelCheck = {
+        keyHash,
+        checkedAt: Date.now(),
+        usable: false,
+        bestModelId: '',
+        visionModelId: '',
+      };
+      return { usable: false, bestModelId: '', visionModelId: '' };
+    }
+
+    const bestModelId =
+      GROQ_PREFERRED_MODELS.find((pref) => allIds.includes(pref)) || allIds[0];
+    const visionModelId =
+      allIds.find((id) => /llama-4|vision/i.test(id)) || '';
+
+    cachedGroqModelCheck = {
+      keyHash,
+      checkedAt: Date.now(),
+      usable: true,
+      bestModelId,
+      visionModelId,
+    };
+    return { usable: true, bestModelId, visionModelId };
+  } catch {
+    return {
+      usable: false,
+      bestModelId: '',
+      visionModelId: '',
+    };
+  }
+}
+
+export function getActiveTwoBuilderModels(options?: {
+  groqModelId?: string;
+  groqUsable?: boolean;
+}): UnifiedAiModel[] {
+  const { geminiKey, groqKey, openrouterKey } = getServerFreeAiKeys();
+  const list: UnifiedAiModel[] = [];
+
+  if (geminiKey) {
+    list.push({
+      id: SERVER_GEMINI_MODEL_ID,
+      upstreamModelId: 'gemini-4-hydrogen',
+      gateway: 'gemini',
+      name: 'Gemini Flash (Vision · Free Server)',
+      provider: 'google',
+      contextLength: 1048576,
+      isFree: true,
+      tierLabel: 'Free · No Login',
+      capabilities: ['Vision', 'Screenshots', 'Code', 'DB'],
+      category: 'code',
+    });
+  }
+
+  const useGroq = Boolean(
+    groqKey && (options ? options.groqUsable !== false && options.groqModelId : false)
+  );
+  if (useGroq && options?.groqModelId) {
+    const isVision = /llama-4|vision/i.test(options.groqModelId);
+    list.push({
+      id: `groq::${options.groqModelId}`,
+      upstreamModelId: options.groqModelId,
+      gateway: 'groq',
+      name: isVision
+        ? 'Llama 4 Vision (Fast · Free Server)'
+        : `${options.groqModelId.split('/').pop()} (Free Server)`,
+      provider: 'groq',
+      contextLength: 131072,
+      isFree: true,
+      tierLabel: 'Free · Instant',
+      capabilities: isVision
+        ? ['Vision', 'Screenshots', 'Code', 'DB']
+        : ['Code', 'DB', 'Fast'],
+      category: 'code',
+    });
+  } else if (openrouterKey) {
+    list.push({
+      id: SERVER_OPENROUTER_MODEL_ID,
+      upstreamModelId: 'qwen/qwen3-coder:free',
+      gateway: 'openrouter',
+      name: 'Qwen3 Coder (Free Server)',
+      provider: 'openrouter',
+      contextLength: 262144,
+      isFree: true,
+      tierLabel: 'Free · Server',
+      capabilities: ['Code', 'DB'],
+      category: 'code',
+    });
+  }
+
+  for (const puterModel of PUTER_BROWSER_MODELS) {
+    if (list.length >= 2) break;
+    list.push(puterModel);
+  }
+
+  return list.slice(0, 2);
+}
+
+export const ARCHITECT_PUBLIC_MODEL: UnifiedAiModel = PUTER_BROWSER_MODELS[0];
+export const ARCHITECT_MODEL_ID = DEFAULT_BUILDER_MODEL_ID;
+export const DEFAULT_POLLINATIONS_TEXT_URL = 'https://text.pollinations.ai';
+export const DEFAULT_POLLINATIONS_IMAGE_URL = 'https://image.pollinations.ai';
+export const POLLINATIONS_FALLBACK_MODELS: UnifiedAiModel[] = [];
 
 const endpointCooldowns = new Map<string, number>();
 
@@ -226,106 +302,44 @@ export function isGatewayCandidateCoolingDown(cooldownKey: string): boolean {
 }
 
 export function getGatewayOrder(): AiGatewayId[] {
-  return ['auto', 'puter', 'pollinations', 'web-search', 'browser'];
+  return hasServerFreeAiKey() ? ['gemini', 'groq', 'openrouter', 'puter'] : ['puter'];
 }
 
 export function parseGatewayModelIdentifier(
-  modelId?: string,
-  explicitGateway?: string
-): { gateway?: AiGatewayId; upstreamModelId: string } {
+  modelId?: string
+): { gateway: AiGatewayId; upstreamModelId: string } {
   const raw = typeof modelId === 'string' ? modelId.trim() : '';
-  const gw = typeof explicitGateway === 'string' ? explicitGateway.trim().toLowerCase() : '';
 
-  if (!raw || raw === 'auto::free-browser' || raw === 'auto::architect') {
-    return { gateway: 'auto', upstreamModelId: ARCHITECT_MODEL_ID };
+  if (raw === SERVER_GEMINI_MODEL_ID || raw === 'gemini-4-hydrogen') {
+    return { gateway: 'gemini', upstreamModelId: 'gemini-4-hydrogen' };
   }
-  if (raw.startsWith('puter::')) {
-    return { gateway: 'puter', upstreamModelId: raw.slice('puter::'.length) };
+  if (raw === SERVER_GROQ_MODEL_ID || raw.startsWith('groq::')) {
+    return {
+      gateway: 'groq',
+      upstreamModelId: raw.replace(/^groq::/, '') || 'llama-3.3-70b-versatile',
+    };
   }
-  if (raw.startsWith('pollinations::')) {
-    return { gateway: 'pollinations', upstreamModelId: raw.slice('pollinations::'.length) };
+  if (raw === SERVER_OPENROUTER_MODEL_ID || raw.startsWith('openrouter::')) {
+    return {
+      gateway: 'openrouter',
+      upstreamModelId: raw.replace(/^openrouter::/, '') || 'qwen/qwen3-coder:free',
+    };
   }
-  if (raw.startsWith('web-search::')) {
-    return { gateway: 'web-search', upstreamModelId: raw.slice('web-search::'.length) };
-  }
-  if (raw.startsWith('browser::')) {
-    return { gateway: 'browser', upstreamModelId: raw.slice('browser::'.length) };
+  if (
+    raw === SECONDARY_BUILDER_MODEL_ID ||
+    raw === 'claude-sonnet-4-6'
+  ) {
+    return { gateway: 'puter', upstreamModelId: 'claude-sonnet-4-6' };
   }
 
-  if (gw === 'puter' || gw === 'pollinations' || gw === 'web-search' || gw === 'browser' || gw === 'auto') {
-    return { gateway: gw, upstreamModelId: raw };
-  }
-
-  return { upstreamModelId: raw };
+  return { gateway: 'puter', upstreamModelId: 'gemini-2.5-flash' };
 }
 
-export function classifyGatewayModelCapabilities(modelId: string): {
+export function classifyGatewayModelCapabilities(): {
   capabilities: string[];
   category: FreeModelCategory;
 } {
-  const lower = modelId.toLowerCase();
-  if (/sana|flux|image|photo|draw/.test(lower)) {
-    return { capabilities: ['Image'], category: 'image' };
-  }
-  if (/music|audio|song|composer|beat/.test(lower)) {
-    return { capabilities: ['Music'], category: 'music' };
-  }
-  if (/video|wan|hunyuan/.test(lower)) {
-    return { capabilities: ['Video'], category: 'video' };
-  }
-  return { capabilities: ['Code', 'Build'], category: 'code' };
-}
-
-export async function fetchPollinationsCatalog(): Promise<UnifiedAiModel[]> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 2500);
-  try {
-    const res = await fetch(`${DEFAULT_POLLINATIONS_TEXT_URL}/models`, {
-      method: 'GET',
-      signal: controller.signal,
-    });
-    if (!res.ok) return [...POLLINATIONS_FALLBACK_MODELS];
-    const json = (await res.json()) as Array<{
-      name?: string;
-      description?: string;
-      tier?: string;
-    }>;
-    if (!Array.isArray(json) || json.length === 0) {
-      return [...POLLINATIONS_FALLBACK_MODELS];
-    }
-    const textModels: UnifiedAiModel[] = [];
-    for (const entry of json) {
-      const name = typeof entry?.name === 'string' ? entry.name.trim() : '';
-      if (!name || isTextToSpeechModel(name)) continue;
-      if (entry.tier && entry.tier !== 'anonymous') continue;
-      textModels.push({
-        id: `pollinations::${name}`,
-        upstreamModelId: name,
-        gateway: 'pollinations',
-        name:
-          name === 'openai-fast'
-            ? 'GPT-OSS 20B Reasoning (No Login)'
-            : `${name} (Free · No Login)`,
-        provider: 'pollinations',
-        contextLength: 128000,
-        isFree: true,
-        tierLabel: 'Zero Login',
-        capabilities: ['Code', 'Build', 'Reasoning'],
-        category: 'code',
-      });
-    }
-    if (textModels.length === 0) {
-      return [...POLLINATIONS_FALLBACK_MODELS];
-    }
-    return [
-      ...textModels,
-      ...POLLINATIONS_FALLBACK_MODELS.filter((m) => m.category !== 'code'),
-    ];
-  } catch {
-    return [...POLLINATIONS_FALLBACK_MODELS];
-  } finally {
-    clearTimeout(timer);
-  }
+  return { capabilities: ['Vision', 'Screenshots', 'Code'], category: 'code' };
 }
 
 export async function fetchAllGatewayModels(
@@ -336,135 +350,74 @@ export async function fetchAllGatewayModels(
   gateways: GatewayStatusSummary[];
   pollinationsConfigured: boolean;
   puterConfigured: boolean;
+  serverFreeAiReady: boolean;
 }> {
-  const pollinationsModels = await fetchPollinationsCatalog().catch(() => [
-    ...POLLINATIONS_FALLBACK_MODELS,
-  ]);
-
-  const models: UnifiedAiModel[] = [
-    ARCHITECT_PUBLIC_MODEL,
-    ...pollinationsModels.filter((m) => m.category === 'code'),
-    ...PUTER_BROWSER_MODELS,
-    ...pollinationsModels.filter((m) => m.category !== 'code'),
-  ];
-
-  // Deduplicate by ID preserving priority order
-  const deduped: UnifiedAiModel[] = [];
-  const seen = new Set<string>();
-  for (const m of models) {
-    if (seen.has(m.id)) continue;
-    seen.add(m.id);
-    deduped.push(m);
-  }
-
+  const groqCheck = await resolveUsableGroqModels(_forceRefresh);
+  const activeModels = getActiveTwoBuilderModels({
+    groqUsable: groqCheck.usable,
+    groqModelId: groqCheck.bestModelId,
+  });
+  const serverModels = activeModels.filter((m) => m.gateway !== 'puter');
+  const serverReady = serverModels.length > 0;
   const gateways: GatewayStatusSummary[] = [
-    {
-      id: 'auto',
-      label: 'Free Browser Smart Auto',
-      baseUrl: DEFAULT_POLLINATIONS_TEXT_URL,
-      configured: true,
-      keyCount: 0,
-      modelCount: 1,
-      defaultModel: ARCHITECT_MODEL_ID,
-    },
-    {
-      id: 'pollinations',
-      label: 'Pollinations Keyless AI',
-      baseUrl: DEFAULT_POLLINATIONS_TEXT_URL,
-      configured: true,
-      keyCount: 0,
-      modelCount: pollinationsModels.length,
-      defaultModel: 'openai-fast',
-    },
+    ...(serverReady
+      ? [
+          {
+            id: 'gemini' as AiGatewayId,
+            label: 'Free Server Vision & Code',
+            baseUrl: 'https://generativelanguage.googleapis.com',
+            configured: true,
+            keyCount: 1,
+            modelCount: serverModels.length,
+            defaultModel: serverModels[0]?.upstreamModelId || 'gemini-4-hydrogen',
+          },
+        ]
+      : []),
     {
       id: 'puter',
-      label: 'Puter.js Browser AI',
+      label: 'Puter Vision & Code',
       baseUrl: PUTER_BROWSER_SCRIPT_URL,
       configured: true,
       keyCount: 0,
-      modelCount: PUTER_BROWSER_MODELS.length,
-      defaultModel: 'claude-sonnet-4',
-    },
-    {
-      id: 'web-search',
-      label: 'Live Web & Image Search',
-      baseUrl: 'https://www.bing.com',
-      configured: true,
-      keyCount: 0,
-      modelCount: 1,
-      defaultModel: 'google-image-search',
+      modelCount: activeModels.filter((m) => m.gateway === 'puter').length,
+      defaultModel: 'gemini-2.5-flash',
     },
   ];
 
   return {
-    models: deduped,
+    models: activeModels,
     gateways,
-    pollinationsConfigured: true,
+    pollinationsConfigured: false,
     puterConfigured: true,
+    serverFreeAiReady: serverReady,
   };
 }
 
 export function buildGatewayExecutionPlan(params: {
   requestedModel?: string;
   requestedGateway?: string;
-  pollinationsCatalog?: UnifiedAiModel[];
 }): {
   pollinationsCandidates: GatewayExecutionCandidate[];
   requestedMediaKind: 'image' | 'music' | 'video' | null;
   requestedModelLabel: string;
 } {
-  const polList =
-    params.pollinationsCatalog && params.pollinationsCatalog.length > 0
-      ? params.pollinationsCatalog
-      : POLLINATIONS_FALLBACK_MODELS;
-
-  const parsed = parseGatewayModelIdentifier(
-    params.requestedModel,
-    params.requestedGateway
-  );
-
-  const allKnown = [
-    ARCHITECT_PUBLIC_MODEL,
-    ...PUTER_BROWSER_MODELS,
-    ...polList,
-    ...POLLINATIONS_FALLBACK_MODELS,
-  ];
-  const matched = allKnown.find(
-    (m) => m.id === params.requestedModel || m.upstreamModelId === parsed.upstreamModelId
-  );
-
-  let requestedMediaKind: 'image' | 'music' | 'video' | null = null;
-  if (matched?.category === 'image') requestedMediaKind = 'image';
-  else if (matched?.category === 'music') requestedMediaKind = 'music';
-  else if (matched?.category === 'video') requestedMediaKind = 'video';
-  else if (parsed.upstreamModelId && parsed.gateway !== 'auto') {
-    const cap = classifyGatewayModelCapabilities(parsed.upstreamModelId);
-    if (cap.category === 'image' || cap.category === 'music' || cap.category === 'video') {
-      requestedMediaKind = cap.category;
-    }
-  }
-
-  const pollinationsCandidates: GatewayExecutionCandidate[] = polList
-    .filter((m) => m.category === 'code' || m.gateway === 'pollinations')
-    .filter((m) => m.category !== 'image' && m.category !== 'music' && m.category !== 'video')
-    .map((m) => ({
-      gateway: 'pollinations' as const,
-      gatewayLabel: 'Pollinations Public AI',
-      baseUrl: DEFAULT_POLLINATIONS_TEXT_URL,
-      apiKey: '',
-      publicModelId: m.id,
-      upstreamModelId: m.upstreamModelId,
-      modelName: m.name,
-      provider: m.provider,
-      cooldownKey: buildCandidateCooldownKey('pollinations', '', m.upstreamModelId),
-    }));
+  const activeModels = getActiveTwoBuilderModels();
+  const parsed = parseGatewayModelIdentifier(params.requestedModel);
+  const matched =
+    activeModels.find(
+      (m) => m.id === params.requestedModel || m.upstreamModelId === parsed.upstreamModelId
+    ) ??
+    PUTER_BROWSER_MODELS.find(
+      (m) => m.id === params.requestedModel || m.upstreamModelId === parsed.upstreamModelId
+    ) ??
+    activeModels[0];
 
   const requestedModelLabel =
-    matched?.name || cleanEnvKey(params.requestedModel, []) || ARCHITECT_PUBLIC_MODEL.name;
+    matched?.name || cleanEnvKey(params.requestedModel, []) || activeModels[0].name;
 
   return {
-    pollinationsCandidates,
-    requestedMediaKind,
+    pollinationsCandidates: [],
+    requestedMediaKind: null,
     requestedModelLabel,
   };
 }

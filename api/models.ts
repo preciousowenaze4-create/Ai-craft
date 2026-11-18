@@ -1,8 +1,7 @@
 import {
-  ARCHITECT_PUBLIC_MODEL,
-  POLLINATIONS_FALLBACK_MODELS,
-  PUTER_BROWSER_MODELS,
   fetchAllGatewayModels,
+  getActiveTwoBuilderModels,
+  hasServerFreeAiKey,
 } from './_aiGateways.js';
 
 export async function GET(request: Request): Promise<Response> {
@@ -17,9 +16,10 @@ export async function GET(request: Request): Promise<Response> {
       {
         models: result.models,
         gateways: result.gateways,
-        pollinationsConfigured: result.pollinationsConfigured,
-        puterConfigured: result.puterConfigured,
-        keyless: true,
+        pollinationsConfigured: false,
+        puterConfigured: true,
+        serverFreeAiReady: result.serverFreeAiReady,
+        keyless: !result.serverFreeAiReady,
         freeOnly: true,
       },
       {
@@ -29,19 +29,13 @@ export async function GET(request: Request): Promise<Response> {
       }
     );
   } catch {
-    const fallbackModels = [
-      ARCHITECT_PUBLIC_MODEL,
-      ...POLLINATIONS_FALLBACK_MODELS.filter((m) => m.category === 'code'),
-      ...PUTER_BROWSER_MODELS,
-      ...POLLINATIONS_FALLBACK_MODELS.filter((m) => m.category !== 'code'),
-    ];
-
     return Response.json(
       {
-        models: fallbackModels,
-        pollinationsConfigured: true,
+        models: getActiveTwoBuilderModels(),
+        pollinationsConfigured: false,
         puterConfigured: true,
-        keyless: true,
+        serverFreeAiReady: hasServerFreeAiKey(),
+        keyless: !hasServerFreeAiKey(),
         freeOnly: true,
       },
       {

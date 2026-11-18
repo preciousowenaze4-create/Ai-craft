@@ -219,12 +219,109 @@ function buildIsolatedScreenHtml(
 </script>`
     : '';
 
+  const cardBridgeShim = safeBase.includes('data-aicraft-card-shim')
+    ? ''
+    : `<script data-aicraft-card-shim="1">
+(function(){
+  function installCardStorageShim(propName) {
+    var needsShim = false;
+    try {
+      var probe = window[propName];
+      probe.setItem('__p__', '1');
+      probe.removeItem('__p__');
+    } catch (e) { needsShim = true; }
+    if (!needsShim) return;
+    var storeObj = {};
+    var shim = {
+      getItem: function(k){ var sk = String(k); return Object.prototype.hasOwnProperty.call(storeObj, sk) ? storeObj[sk] : null; },
+      setItem: function(k, v){ storeObj[String(k)] = String(v); },
+      removeItem: function(k){ delete storeObj[String(k)]; },
+      clear: function(){ Object.keys(storeObj).forEach(function(k){ delete storeObj[k]; }); },
+      key: function(idx){ var keys = Object.keys(storeObj); return typeof idx === 'number' && idx >= 0 && idx < keys.length ? keys[idx] : null; },
+      get length(){ return Object.keys(storeObj).length; }
+    };
+    try { Object.defineProperty(window, propName, { configurable: true, enumerable: true, get: function(){ return shim; } }); } catch (e) {}
+  }
+  installCardStorageShim('localStorage');
+  installCardStorageShim('sessionStorage');
+  window.addEventListener('submit', function(ev) {
+    if (ev.defaultPrevented) return;
+    var form = ev.target;
+    var action = form && form.getAttribute ? String(form.getAttribute('action') || '').trim() : '';
+    if (!action || action === '#' || !/^https?:\\/\\//i.test(action)) ev.preventDefault();
+  }, false);
+  if (window.AICraft && window.AICraft.db) return;
+  var memStore = {};
+  function tblKey(t){ return 'aicraft_card_' + String(t || 'items').toLowerCase().replace(/[^a-z0-9_]+/g, '_'); }
+  function readRows(t){
+    var k = tblKey(t);
+    if (Array.isArray(memStore[k])) return memStore[k].slice();
+    try {
+      var raw = window.localStorage.getItem(k);
+      var parsed = raw ? JSON.parse(raw) : [];
+      memStore[k] = Array.isArray(parsed) ? parsed : [];
+    } catch (e) { memStore[k] = []; }
+    return memStore[k].slice();
+  }
+  function writeRows(t, rows){
+    var k = tblKey(t);
+    memStore[k] = Array.isArray(rows) ? rows : [];
+    try { window.localStorage.setItem(k, JSON.stringify(memStore[k])); } catch (e) {}
+    return memStore[k];
+  }
+  window.__AICRAFT_ENV__ = window.__AICRAFT_ENV__ || {};
+  window.ENV = window.ENV || {};
+  window.AICraft = {
+    env: window.__AICRAFT_ENV__,
+    secretKeys: [],
+    getSecret: function(k){ return window.__AICRAFT_ENV__[k]; },
+    hasSecret: function(k){ return Boolean(window.__AICRAFT_ENV__[k]); },
+    findSecret: function(){ return undefined; },
+    search: function(q){ return Promise.resolve({ query: q || '', results: [], images: [] }); },
+    ask: function(){ return Promise.resolve(''); },
+    generateImage: function(){ return Promise.resolve(''); },
+    generateMusic: function(){ return Promise.resolve(''); },
+    db: {
+      meta: { enabled: true, tables: [] },
+      list: function(t){ return Promise.resolve(readRows(t)); },
+      insert: function(t, row){
+        var rows = readRows(t);
+        var item = Object.assign({ id: 'rec_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), created_at: new Date().toISOString() }, row || {});
+        rows.unshift(item);
+        writeRows(t, rows);
+        return Promise.resolve(item);
+      },
+      update: function(t, id, patch){
+        var updated = null;
+        var rows = readRows(t).map(function(r){ if (r && r.id === id) { updated = Object.assign({}, r, patch || {}); return updated; } return r; });
+        writeRows(t, rows);
+        return Promise.resolve(updated);
+      },
+      remove: function(t, id){
+        writeRows(t, readRows(t).filter(function(r){ return !r || r.id !== id; }));
+        return Promise.resolve(true);
+      },
+      clear: function(t){ writeRows(t, []); return Promise.resolve(true); },
+      subscribe: function(t, fn){ if (typeof fn === 'function') { try { fn(readRows(t)); } catch(e){} } return function(){}; }
+    }
+  };
+})();
+</script>`;
+
   const cardPolishStyle = `<style data-aicraft-card-style="1">
 ${viewportHintStyle}
 ::-webkit-scrollbar { width: 0; height: 0; }
 </style>`;
 
   let out = safeBase;
+  if (cardBridgeShim) {
+    if (/<head\b[^>]*>/i.test(out)) {
+      out = out.replace(/<head\b[^>]*>/i, (m) => `${m}\n${cardBridgeShim}`);
+    } else {
+      out = `${cardBridgeShim}\n${out}`;
+    }
+  }
+
   if (/<\/head>/i.test(out)) {
     out = out.replace(/<\/head>/i, `${cardPolishStyle}\n</head>`);
   } else {
@@ -240,6 +337,65 @@ ${viewportHintStyle}
   }
 
   return out;
+}
+
+export function applySurgicalPatchesToHtmlClient(
+  existingHtml: string,
+  rawOutput: string
+): string {
+  if (!existingHtml.trim() || !/<<<\s*AICRAFT_PATCH\s*>>>/i.test(rawOutput)) {
+    return '';
+  }
+  let updated = existingHtml;
+  let applied = 0;
+
+  const patchBlocks = rawOutput.split(/<<<\s*AICRAFT_PATCH\s*>>>/i).slice(1);
+  for (const rawBlock of patchBlocks) {
+    const block = rawBlock.replace(/<<<\s*(?:END_PATCH|END_AICRAFT_PATCH)\s*>>>[\s\S]*$/i, '');
+    const srRegex =
+      /<<<\s*SEARCH\s*>>>\s*\n?([\s\S]*?)\n?<<<\s*REPLACE\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT)\s*>>>|$)/gi;
+    let m: RegExpExecArray | null;
+    while ((m = srRegex.exec(block)) !== null) {
+      const s = m[1].replace(/\r\n/g, '\n');
+      const r = m[2].replace(/\r\n/g, '\n');
+      if (s.trim() && updated.includes(s)) {
+        updated = updated.replace(s, r);
+        applied += 1;
+      } else if (s.trim() && updated.includes(s.trim())) {
+        updated = updated.replace(s.trim(), r.trim());
+        applied += 1;
+      }
+    }
+
+    const cssMatch = /<<<\s*APPEND_CSS\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT)\s*>>>|$)/i.exec(block);
+    if (cssMatch?.[1]?.trim() && /<\/style>/i.test(updated)) {
+      const idx = updated.toLowerCase().lastIndexOf('</style>');
+      updated = `${updated.slice(0, idx)}\n${cssMatch[1].trim()}\n${updated.slice(idx)}`;
+      applied += 1;
+    }
+
+    const screenMatch = /<<<\s*APPEND_SCREEN\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT)\s*>>>|$)/i.exec(block);
+    if (screenMatch?.[1]?.trim() && /<\/body>/i.test(updated)) {
+      const anchorIdx = /<nav\b/i.test(updated)
+        ? updated.toLowerCase().lastIndexOf('<nav')
+        : /<script\b/i.test(updated)
+          ? updated.toLowerCase().indexOf('<script')
+          : updated.toLowerCase().lastIndexOf('</body>');
+      if (anchorIdx !== -1) {
+        updated = `${updated.slice(0, anchorIdx)}${screenMatch[1].trim()}\n${updated.slice(anchorIdx)}`;
+        applied += 1;
+      }
+    }
+
+    const jsMatch = /<<<\s*APPEND_SCRIPT\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT)\s*>>>|$)/i.exec(block);
+    if (jsMatch?.[1]?.trim() && /<\/script>/i.test(updated)) {
+      const idx = updated.toLowerCase().lastIndexOf('</script>');
+      updated = `${updated.slice(0, idx)}\n${jsMatch[1].trim()}\n${updated.slice(idx)}`;
+      applied += 1;
+    }
+  }
+
+  return applied > 0 ? updated : '';
 }
 
 export function extractRenderableScreensFromHtml(

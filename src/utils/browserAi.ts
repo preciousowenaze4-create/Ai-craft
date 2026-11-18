@@ -1,4 +1,7 @@
-import { closePartialHtmlForLivePreview } from './screenExtractor';
+import {
+  applySurgicalPatchesToHtmlClient,
+  closePartialHtmlForLivePreview,
+} from './screenExtractor';
 
 export interface BrowserVisualHints {
   dominantColor?: string;
@@ -29,6 +32,7 @@ export interface StreamRealTimeBrowserAiParams {
   systemPrompt: string;
   historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
   userPrompt: string;
+  previousHtml?: string;
   attachmentDataUrl?: string | null;
   signal?: AbortSignal;
   onModelSelected?: (info: {
@@ -64,10 +68,6 @@ interface PuterWindowGlobal {
         imageOrOptions?: string | Record<string, unknown>,
         options?: Record<string, unknown>
       ) => Promise<unknown>;
-      txt2img?: (
-        prompt: string,
-        testMode?: boolean
-      ) => Promise<HTMLImageElement | string | { src?: string }>;
     };
   };
 }
@@ -193,6 +193,7 @@ export function stripReasoningTagsClient(raw: string): string {
 export function findCodeStartIndex(raw: string): number {
   const patterns = [
     /<<<\s*AICRAFT_APP_HTML\s*>>>/i,
+    /<<<\s*AICRAFT_PATCH\s*>>>/i,
     /```\s*html/i,
     /<!doctype\s+html/i,
     /<html\b/i,
@@ -355,6 +356,79 @@ export function isPuterSignedInClient(): boolean {
   }
 }
 
+export async function signInPuterClient(): Promise<boolean> {
+  const puter = getPuterGlobal();
+  if (!puter?.auth?.signIn) return false;
+  try {
+    await puter.auth.signIn();
+    return isPuterSignedInClient();
+  } catch {
+    return isPuterSignedInClient();
+  }
+}
+
+function formatBrowserAiError(
+  err: unknown,
+  fallback = 'Unable to reach free browser AI right now.'
+): string {
+  if (err instanceof Error && err.message.trim()) {
+    return err.message.trim();
+  }
+  if (typeof err === 'string' && err.trim()) {
+    return err.trim();
+  }
+  if (err && typeof err === 'object') {
+    const obj = err as {
+      message?: unknown;
+      msg?: unknown;
+      error?: unknown;
+      code?: unknown;
+    };
+    if (typeof obj.message === 'string' && obj.message.trim()) {
+      return obj.message.trim();
+    }
+    if (typeof obj.msg === 'string' && obj.msg.trim()) {
+      return obj.msg.trim();
+    }
+    if (typeof obj.error === 'string' && obj.error.trim()) {
+      return obj.error.trim();
+    }
+    if (obj.error && typeof obj.error === 'object') {
+      const inner = obj.error as { message?: unknown; msg?: unknown; code?: unknown };
+      if (typeof inner.message === 'string' && inner.message.trim()) {
+        return inner.message.trim();
+      }
+      if (typeof inner.msg === 'string' && inner.msg.trim()) {
+        return inner.msg.trim();
+      }
+      if (typeof inner.code === 'string' && inner.code.trim()) {
+        return `AI provider error (${inner.code.trim()})`;
+      }
+    }
+    if (typeof obj.code === 'string' && obj.code.trim()) {
+      return `AI provider error (${obj.code.trim()})`;
+    }
+  }
+  return fallback;
+}
+
+export function normalizeBuilderModelId(rawId?: string | null): string {
+  const trimmed = (rawId || '').trim();
+  if (trimmed === 'gemini::gemini-4-hydrogen' || trimmed === 'gemini-4-hydrogen') {
+    return 'gemini::gemini-4-hydrogen';
+  }
+  if (trimmed.startsWith('groq::')) {
+    return trimmed;
+  }
+  if (trimmed.startsWith('openrouter::')) {
+    return trimmed;
+  }
+  if (trimmed === 'puter::claude-sonnet-4-6' || trimmed === 'claude-sonnet-4-6') {
+    return 'puter::claude-sonnet-4-6';
+  }
+  return 'puter::gemini-2.5-flash';
+}
+
 function extractChunkTextFromPuterPart(part: unknown): {
   content: string;
   reasoning: string;
@@ -395,7 +469,7 @@ function extractChunkTextFromPuterPart(part: unknown): {
 }
 
 async function streamViaPuterClient(params: {
-  upstreamModelId: string;
+  upstreamModelId: 'claude-sonnet-4-6' | 'gemini-2.5-flash';
   modelName: string;
   systemPrompt: string;
   historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -406,7 +480,16 @@ async function streamViaPuterClient(params: {
 }): Promise<string> {
   const puter = getPuterGlobal();
   if (!puter?.ai?.chat) {
-    throw new Error('Puter browser AI SDK is not loaded yet.');
+    throw new Error('Free Puter AI SDK is loading — please try again in a moment.');
+  }
+
+  if (!isPuterSignedInClient()) {
+    const signedIn = await signInPuterClient();
+    if (!signedIn) {
+      throw new Error(
+        'Please complete the 1-tap free Puter sign-in to unlock real screenshot vision & uninterrupted building.'
+      );
+    }
   }
 
   const messages: Array<Record<string, unknown>> = [
@@ -474,201 +557,11 @@ async function streamViaPuterClient(params: {
   return accumulated;
 }
 
-async function streamViaBrowserPollinations(params: {
-  upstreamModelId: string;
-  systemPrompt: string;
-  historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
-  userPrompt: string;
-  attachmentDataUrl?: string | null;
-  signal?: AbortSignal;
-  onChunk: (contentDelta: string, reasoningDelta: string) => void;
-}): Promise<string> {
-  const controller = new AbortController();
-  let timedOutReason = '';
-
-  const forwardAbort = () => {
-    if (!controller.signal.aborted) controller.abort();
-  };
-  if (params.signal) {
-    if (params.signal.aborted) forwardAbort();
-    else params.signal.addEventListener('abort', forwardAbort, { once: true });
-  }
-
-  let watchdog: number | null = null;
-  const resetWatchdog = (ms: number, reason: string) => {
-    if (watchdog !== null) window.clearTimeout(watchdog);
-    watchdog = window.setTimeout(() => {
-      timedOutReason = reason;
-      if (!controller.signal.aborted) controller.abort();
-    }, ms);
-  };
-
-  resetWatchdog(20_000, 'Free Browser AI timed out before responding.');
-
-  const userContent: unknown =
-    params.attachmentDataUrl && params.attachmentDataUrl.startsWith('data:image/')
-      ? [
-          { type: 'image_url', image_url: { url: params.attachmentDataUrl } },
-          { type: 'text', text: params.userPrompt },
-        ]
-      : params.userPrompt;
-
-  let fullContent = '';
-
-  try {
-    const response = await fetch('https://text.pollinations.ai/openai', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: params.upstreamModelId || 'openai-fast',
-        stream: true,
-        max_tokens: 16384,
-        temperature: 0.45,
-        messages: [
-          { role: 'system', content: params.systemPrompt },
-          ...params.historyMessages,
-          { role: 'user', content: userContent },
-        ],
-      }),
-      signal: controller.signal,
-    });
-
-    if (!response.ok || !response.body) {
-      let errMsg = `Pollinations returned status ${response.status}`;
-      try {
-        const errJson = (await response.json()) as {
-          error?: { message?: string } | string;
-          message?: string;
-        };
-        if (typeof errJson?.error === 'object' && errJson.error?.message) {
-          errMsg = errJson.error.message;
-        } else if (typeof errJson?.error === 'string') {
-          errMsg = errJson.error;
-        } else if (errJson?.message) {
-          errMsg = errJson.message;
-        }
-      } catch {
-        // ignore parse error
-      }
-      const err = new Error(errMsg) as Error & { status?: number };
-      err.status = response.status;
-      throw err;
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    resetWatchdog(25_000, 'Free Browser AI stream stalled mid-response.');
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-
-      resetWatchdog(25_000, 'Free Browser AI stream stalled mid-response.');
-      buffer += decoder.decode(value, { stream: true });
-
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() ?? '';
-
-      for (const rawLine of lines) {
-        const trimmedLine = rawLine.trim();
-        if (!trimmedLine || trimmedLine.startsWith(':')) continue;
-
-        const subFrames = trimmedLine.includes('}data:')
-          ? trimmedLine.split(/(?=data:\s*)/)
-          : [trimmedLine];
-
-        for (const frame of subFrames) {
-          const line = frame.trim();
-          if (!line.startsWith('data:')) continue;
-          const data = line.slice(5).trim();
-          if (!data || data === '[DONE]') continue;
-
-          try {
-            const parsed = JSON.parse(data) as {
-              error?: { message?: string };
-              choices?: Array<{
-                delta?: {
-                  reasoning?: string;
-                  reasoning_content?: string;
-                  content?: string | Array<{ type?: string; text?: string }>;
-                };
-              }>;
-            };
-            if (parsed?.error?.message) {
-              throw new Error(parsed.error.message);
-            }
-            const delta = parsed?.choices?.[0]?.delta;
-            const reasoningPart = delta?.reasoning || delta?.reasoning_content || '';
-            let contentPart = '';
-            if (typeof delta?.content === 'string') {
-              contentPart = delta.content;
-            } else if (Array.isArray(delta?.content)) {
-              for (const part of delta.content) {
-                if (typeof part?.text === 'string') contentPart += part.text;
-              }
-            }
-            if (contentPart || reasoningPart) {
-              fullContent += contentPart;
-              params.onChunk(contentPart, reasoningPart);
-            }
-          } catch (innerErr) {
-            if (innerErr instanceof SyntaxError) continue;
-            throw innerErr;
-          }
-        }
-      }
-    }
-
-    if (buffer.trim().startsWith('data:')) {
-      const tailFrames = buffer.trim().split(/(?=data:\s*)/);
-      for (const frame of tailFrames) {
-        const data = frame.trim().slice(5).trim();
-        if (!data || data === '[DONE]') continue;
-        try {
-          const parsed = JSON.parse(data) as {
-            choices?: Array<{ delta?: { content?: string } }>;
-          };
-          const contentPart = parsed?.choices?.[0]?.delta?.content || '';
-          if (contentPart) {
-            fullContent += contentPart;
-            params.onChunk(contentPart, '');
-          }
-        } catch {
-          // ignore incomplete tail
-        }
-      }
-    }
-
-    if (!fullContent.trim()) {
-      throw new Error('Pollinations stream completed without generating output.');
-    }
-
-    return fullContent;
-  } catch (err) {
-    if (timedOutReason) {
-      throw new Error(timedOutReason);
-    }
-    throw err;
-  } finally {
-    if (watchdog !== null) window.clearTimeout(watchdog);
-    if (params.signal) {
-      params.signal.removeEventListener('abort', forwardAbort);
-    }
-  }
-}
-
 export async function streamRealTimeBrowserAi(
   params: StreamRealTimeBrowserAiParams
 ): Promise<StreamRealTimeBrowserAiResult> {
-  const requestedModel = (params.modelId || 'auto::free-browser').trim();
-  const isExplicitPuter = requestedModel.startsWith('puter::');
-  const isExplicitPollinations = requestedModel.startsWith('pollinations::');
-  const puterReady = Boolean(getPuterGlobal()?.ai?.chat);
-  const puterSignedIn = isPuterSignedInClient();
+  const normalizedSelected = normalizeBuilderModelId(params.modelId);
+  const previousHtml = typeof params.previousHtml === 'string' ? params.previousHtml : '';
 
   let rawAccumulated = '';
   let lastTitle = '';
@@ -716,9 +609,16 @@ export async function streamRealTimeBrowserAi(
       return;
     }
 
+    const isPatchMode = /<<<\s*AICRAFT_PATCH\s*>>>/i.test(cleaned) && Boolean(previousHtml.trim());
+
     if (!enteredBuildPhase) {
       enteredBuildPhase = true;
-      params.onPhaseChange?.('building', 'Drawing live screens & wiring real-time logic...');
+      params.onPhaseChange?.(
+        'building',
+        isPatchMode
+          ? 'Applying surgical edits cleanly to existing layers...'
+          : 'Drawing live screens & wiring real-time database...'
+      );
       const proseBeforeCode = sanitizeProseClient(cleaned);
       if (proseBeforeCode) {
         params.onProseUpdate?.(proseBeforeCode);
@@ -729,17 +629,29 @@ export async function streamRealTimeBrowserAi(
     const screenCloseCount = (htmlSlice.match(/<\/section>/gi) || []).length;
     const shouldUpdatePreview =
       force ||
+      isPatchMode ||
       screenCloseCount > lastScreenCloseCount ||
       (now - lastHtmlEmitAt >= 900 && htmlSlice.length > 900);
 
     if (force || now - lastEmitAt >= 180 || htmlSlice.length - lastBytesEmitted >= 280) {
       lastEmitAt = now;
       lastBytesEmitted = htmlSlice.length;
-      const progress = extractClientBuildArtifacts(htmlSlice);
+
+      let effectiveHtml = htmlSlice;
+      if (isPatchMode) {
+        const patched = applySurgicalPatchesToHtmlClient(previousHtml, cleaned);
+        if (patched) effectiveHtml = patched;
+      }
+
+      const progress = extractClientBuildArtifacts(effectiveHtml);
       if (shouldUpdatePreview) {
         lastHtmlEmitAt = now;
         lastScreenCloseCount = screenCloseCount;
-        const partial = closePartialHtmlForLivePreview(htmlSlice);
+        const partial = isPatchMode
+          ? effectiveHtml !== htmlSlice
+            ? effectiveHtml
+            : undefined
+          : closePartialHtmlForLivePreview(htmlSlice);
         if (partial && partial.length > 260) {
           progress.partialHtml = partial;
         }
@@ -770,95 +682,31 @@ export async function streamRealTimeBrowserAi(
     }
   };
 
-  // Build ordered real-time browser provider attempts (zero hardcoded templates)
-  type Attempt =
-    | {
-        kind: 'puter';
-        upstreamModelId: string;
-        publicModelId: string;
-        modelName: string;
-        provider: string;
-      }
-    | {
-        kind: 'pollinations';
-        upstreamModelId: string;
-        publicModelId: string;
-        modelName: string;
-        provider: string;
-      };
+  const TWO_REAL_BUILDERS: Array<{
+    upstreamModelId: 'gemini-2.5-flash' | 'claude-sonnet-4-6';
+    publicModelId: string;
+    modelName: string;
+    provider: string;
+  }> = [
+    {
+      upstreamModelId: 'gemini-2.5-flash',
+      publicModelId: 'puter::gemini-2.5-flash',
+      modelName: 'Gemini 2.5 Flash (Vision · Fast)',
+      provider: 'google',
+    },
+    {
+      upstreamModelId: 'claude-sonnet-4-6',
+      publicModelId: 'puter::claude-sonnet-4-6',
+      modelName: 'Claude Sonnet 4.6 (Vision · Builder)',
+      provider: 'anthropic',
+    },
+  ];
 
-  const attempts: Attempt[] = [];
-  if (isExplicitPuter) {
-    const upstreamId = requestedModel.slice('puter::'.length) || 'claude-sonnet-4';
-    const puterProvider = upstreamId.includes('claude')
-      ? 'anthropic'
-      : upstreamId.includes('gpt')
-        ? 'openai'
-        : upstreamId.includes('gemini')
-          ? 'google'
-          : upstreamId.includes('deepseek')
-            ? 'deepseek'
-            : 'puter';
-    attempts.push({
-      kind: 'puter',
-      upstreamModelId: upstreamId,
-      publicModelId: requestedModel,
-      modelName: `${upstreamId} (Browser Free)`,
-      provider: puterProvider,
-    });
-    attempts.push({
-      kind: 'pollinations',
-      upstreamModelId: 'openai-fast',
-      publicModelId: 'pollinations::openai-fast',
-      modelName: 'GPT-OSS 20B Reasoning (No Login)',
-      provider: 'pollinations',
-    });
-  } else if (isExplicitPollinations) {
-    const upstreamId = requestedModel.slice('pollinations::'.length) || 'openai-fast';
-    attempts.push({
-      kind: 'pollinations',
-      upstreamModelId: upstreamId,
-      publicModelId: requestedModel,
-      modelName:
-        upstreamId === 'openai-fast'
-          ? 'GPT-OSS 20B Reasoning (No Login)'
-          : `${upstreamId} (Free · No Login)`,
-      provider: 'pollinations',
-    });
-    if (puterReady && puterSignedIn) {
-      attempts.push({
-        kind: 'puter',
-        upstreamModelId: 'claude-sonnet-4',
-        publicModelId: 'puter::claude-sonnet-4',
-        modelName: 'Claude Sonnet 4 (Browser Free)',
-        provider: 'anthropic',
-      });
-    }
-  } else {
-    // Auto Free Browser mode:
-    // Prefer signed-in Puter frontier models when authenticated (especially for screenshot vision),
-    // otherwise start with zero-login browser-direct Pollinations SSE, with Puter failover if signed in.
-    if (puterReady && puterSignedIn) {
-      const autoPuterModel = params.attachmentDataUrl ? 'gpt-4o' : 'claude-sonnet-4';
-      attempts.push({
-        kind: 'puter',
-        upstreamModelId: autoPuterModel,
-        publicModelId: `puter::${autoPuterModel}`,
-        modelName:
-          autoPuterModel === 'gpt-4o'
-            ? 'GPT-4o (Browser Vision · Free)'
-            : 'Claude Sonnet 4 (Browser Free)',
-        provider: autoPuterModel === 'gpt-4o' ? 'openai' : 'anthropic',
-      });
-    }
-    attempts.push({
-      kind: 'pollinations',
-      upstreamModelId: 'openai-fast',
-      publicModelId: 'pollinations::openai-fast',
-      modelName: 'GPT-OSS 20B Reasoning (No Login)',
-      provider: 'pollinations',
-    });
-  }
+  // Put user's chosen builder first (lightweight Gemini 2.5 Flash default, Claude Sonnet 4.6 when selected)
+  const attempts =
+    normalizedSelected === 'puter::claude-sonnet-4-6'
+      ? [TWO_REAL_BUILDERS[1], TWO_REAL_BUILDERS[0]]
+      : [TWO_REAL_BUILDERS[0], TWO_REAL_BUILDERS[1]];
 
   let lastError: unknown = null;
 
@@ -877,27 +725,16 @@ export async function streamRealTimeBrowserAi(
     });
 
     try {
-      const rawOutput =
-        attempt.kind === 'puter'
-          ? await streamViaPuterClient({
-              upstreamModelId: attempt.upstreamModelId,
-              modelName: attempt.modelName,
-              systemPrompt: params.systemPrompt,
-              historyMessages: params.historyMessages,
-              userPrompt: params.userPrompt,
-              attachmentDataUrl: params.attachmentDataUrl,
-              signal: params.signal,
-              onChunk: handleChunk,
-            })
-          : await streamViaBrowserPollinations({
-              upstreamModelId: attempt.upstreamModelId,
-              systemPrompt: params.systemPrompt,
-              historyMessages: params.historyMessages,
-              userPrompt: params.userPrompt,
-              attachmentDataUrl: params.attachmentDataUrl,
-              signal: params.signal,
-              onChunk: handleChunk,
-            });
+      const rawOutput = await streamViaPuterClient({
+        upstreamModelId: attempt.upstreamModelId,
+        modelName: attempt.modelName,
+        systemPrompt: params.systemPrompt,
+        historyMessages: params.historyMessages,
+        userPrompt: params.userPrompt,
+        attachmentDataUrl: params.attachmentDataUrl,
+        signal: params.signal,
+        onChunk: handleChunk,
+      });
 
       rawAccumulated = rawOutput;
       processLiveTokenUpdate(true);
@@ -912,115 +749,20 @@ export async function streamRealTimeBrowserAi(
       if ((err as Error)?.name === 'AbortError') {
         throw err;
       }
-      lastError = err;
-    }
-  }
-
-  throw lastError instanceof Error
-    ? lastError
-    : new Error('Unable to reach free browser AI right now.');
-}
-
-function blobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      if (typeof reader.result === 'string') resolve(reader.result);
-      else reject(new Error('Failed to encode generated image.'));
-    };
-    reader.onerror = () => reject(new Error('Failed to read generated image.'));
-    reader.readAsDataURL(blob);
-  });
-}
-
-export async function generateBrowserImageClient(params: {
-  prompt: string;
-  modelId?: string;
-  signal?: AbortSignal;
-}): Promise<{
-  dataUrl: string;
-  mimeType: string;
-  modelId: string;
-  gateway: 'puter' | 'pollinations';
-} | null> {
-  const cleanPrompt = params.prompt.trim().slice(0, 800);
-  if (!cleanPrompt) return null;
-
-  const puter = getPuterGlobal();
-  const puterReady = Boolean(puter?.ai?.txt2img);
-  const puterSignedIn = isPuterSignedInClient();
-
-  if (
-    puterReady &&
-    (puterSignedIn || params.modelId?.startsWith('puter::'))
-  ) {
-    try {
-      const imgRes = await puter!.ai!.txt2img!(cleanPrompt, false);
-      const src =
-        typeof imgRes === 'string'
-          ? imgRes
-          : imgRes && typeof imgRes === 'object' && 'src' in imgRes && typeof imgRes.src === 'string'
-            ? imgRes.src
-            : '';
-      if (src) {
-        if (src.startsWith('data:image/')) {
-          const mime = src.split(';')[0].replace(/^data:/, '') || 'image/png';
-          return {
-            dataUrl: src,
-            mimeType: mime,
-            modelId: 'puter::txt2img',
-            gateway: 'puter',
-          };
-        }
-        const fetched = await fetch(src, { signal: params.signal });
-        if (fetched.ok) {
-          const blob = await fetched.blob();
-          if (blob.type.startsWith('image/') && blob.size > 1024) {
-            return {
-              dataUrl: await blobToDataUrl(blob),
-              mimeType: blob.type,
-              modelId: 'puter::txt2img',
-              gateway: 'puter',
-            };
-          }
-        }
+      const errMsg = formatBrowserAiError(err);
+      if (/insufficient|funding|balance|credit|subscribe|payment|402|quota/i.test(errMsg)) {
+        throw new Error(
+          'Your Puter browser trial allowance has finished for this Puter account. Switch to a free server-backed builder or try another account.'
+        );
       }
-    } catch {
-      // fall through to browser Pollinations
-    }
-  }
-
-  // Try browser-direct Pollinations from user's own browser IP (independent of server IP rate limit)
-  for (const modelParam of ['flux', 'sana']) {
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 14000);
-    const onAbort = () => controller.abort();
-    params.signal?.addEventListener('abort', onAbort, { once: true });
-    try {
-      const seed = Math.floor(Math.random() * 9_000_000) + 1;
-      const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(
-        cleanPrompt
-      )}?model=${modelParam}&width=1024&height=1024&seed=${seed}&nologo=true`;
-      const res = await fetch(url, { signal: controller.signal });
-      if (res.ok) {
-        const blob = await res.blob();
-        if (blob.type.startsWith('image/') && blob.size > 1024) {
-          return {
-            dataUrl: await blobToDataUrl(blob),
-            mimeType: blob.type,
-            modelId: `pollinations::${modelParam}`,
-            gateway: 'pollinations',
-          };
-        }
+      if (/1-tap free puter sign-in|auth|sign|cancel|closed/i.test(errMsg)) {
+        throw new Error(errMsg);
       }
-    } catch {
-      // fall through cleanly to server verified image search
-    } finally {
-      window.clearTimeout(timer);
-      params.signal?.removeEventListener('abort', onAbort);
+      lastError = new Error(errMsg);
     }
   }
 
-  return null;
+  throw new Error(
+    formatBrowserAiError(lastError, 'Unable to reach free Vision & Code AI right now.')
+  );
 }
-

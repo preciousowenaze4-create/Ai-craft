@@ -25,6 +25,7 @@ import {
   Paperclip,
   Rocket,
   ShieldAlert,
+  Square,
   Volume2,
   X,
 } from 'lucide-react';
@@ -73,6 +74,8 @@ function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
     .replace(/```[\s\S]*?```/g, '')
     .replace(/```[\s\S]*/g, '')
     .replace(/<<<\s*AICRAFT_APP_HTML\s*>>>[\s\S]*/gi, '')
+    .replace(/<<<\s*AICRAFT_PATCH\s*>>>[\s\S]*/gi, '')
+    .replace(/<<<\s*(?:SEARCH|REPLACE|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>[\s\S]*/gi, '')
     .replace(/<!doctype\s+html[\s\S]*/gi, '')
     .replace(/<html\b[\s\S]*/gi, '')
     .replace(/<(?:style|script)\b[\s\S]*/gi, '')
@@ -127,6 +130,7 @@ interface BuilderWorkspaceProps {
   onBack: () => void;
   onSendFollowUp: (message: string, options: ComposerOptions) => void;
   onContinueTurn: (turn: BuilderTurn) => void;
+  onStopGeneration?: () => void;
   onCheckCanUseAi?: () => boolean;
   onPaymentRequired?: (billing?: BillingSummary | null, errorMessage?: string) => void;
   onOpenApps: () => void;
@@ -167,6 +171,7 @@ export function BuilderWorkspace({
   onBack,
   onSendFollowUp,
   onContinueTurn,
+  onStopGeneration,
   onCheckCanUseAi,
   onPaymentRequired,
   onOpenApps,
@@ -326,15 +331,27 @@ export function BuilderWorkspace({
       if (s.key) envMap[s.key] = s.value;
     }
     const dbPrefix = `aicraft_db_${projectId}_`;
+    const kvPrefix = `aicraft_kv_${projectId}_`;
     const initialDbMap: Record<string, unknown[]> = {};
+    const initialKvMap: Record<string, string> = {};
     try {
+      let kvBytes = 0;
       for (let i = 0; i < window.localStorage.length; i += 1) {
         const key = window.localStorage.key(i);
-        if (!key || !key.startsWith(dbPrefix)) continue;
-        const tblName = key.slice(dbPrefix.length);
-        const raw = window.localStorage.getItem(key);
-        const parsed = raw ? (JSON.parse(raw) as unknown) : [];
-        initialDbMap[tblName] = Array.isArray(parsed) ? parsed : [];
+        if (!key) continue;
+        if (key.startsWith(dbPrefix)) {
+          const tblName = key.slice(dbPrefix.length);
+          const raw = window.localStorage.getItem(key);
+          const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+          initialDbMap[tblName] = Array.isArray(parsed) ? parsed : [];
+        } else if (key.startsWith(kvPrefix) && kvBytes < 350000) {
+          const kName = key.slice(kvPrefix.length);
+          const rawVal = window.localStorage.getItem(key);
+          if (typeof rawVal === 'string') {
+            kvBytes += rawVal.length;
+            initialKvMap[kName] = rawVal;
+          }
+        }
       }
     } catch {
       // ignore storage read error
@@ -342,6 +359,7 @@ export function BuilderWorkspace({
 
     const safeEnvJson = JSON.stringify(envMap).replace(/</g, '\\u003c');
     const safeInitialDbJson = JSON.stringify(initialDbMap).replace(/</g, '\\u003c');
+    const safeInitialKvJson = JSON.stringify(initialKvMap).replace(/</g, '\\u003c');
     const safeDbPrefix = JSON.stringify(dbPrefix).replace(/</g, '\\u003c');
     const safeDbMeta = JSON.stringify({
       enabled: databaseConfigRef.current.enabled,
@@ -352,8 +370,79 @@ export function BuilderWorkspace({
 (function(){
   var envMap = ${safeEnvJson};
   var dbCache = ${safeInitialDbJson};
+  var kvCache = ${safeInitialKvJson};
+  var sessionKvCache = {};
   var dbPrefix = ${safeDbPrefix};
   var dbMeta = ${safeDbMeta};
+
+  // Prevent DOMException: SecurityError when generated code accesses localStorage/sessionStorage inside sandboxed srcDoc iframe
+  function installSafeStorage(propName, storeObj, syncToParent) {
+    var needsShim = false;
+    try {
+      var probe = window[propName];
+      var probeKey = '__aicraft_probe__';
+      probe.setItem(probeKey, '1');
+      probe.removeItem(probeKey);
+    } catch (e) {
+      needsShim = true;
+    }
+    if (!needsShim) return;
+    function postKv(op, key, value) {
+      if (!syncToParent) return;
+      try {
+        window.parent.postMessage({ type: 'aicraft:kv', op: op, key: key, value: value }, '*');
+      } catch (e) {}
+    }
+    var shim = {
+      getItem: function(k) {
+        var sk = String(k);
+        return Object.prototype.hasOwnProperty.call(storeObj, sk) ? storeObj[sk] : null;
+      },
+      setItem: function(k, v) {
+        var sk = String(k);
+        var sv = String(v);
+        storeObj[sk] = sv;
+        postKv('set', sk, sv);
+      },
+      removeItem: function(k) {
+        var sk = String(k);
+        delete storeObj[sk];
+        postKv('remove', sk);
+      },
+      clear: function() {
+        Object.keys(storeObj).forEach(function(k) { delete storeObj[k]; });
+        postKv('clear');
+      },
+      key: function(idx) {
+        var keys = Object.keys(storeObj);
+        return typeof idx === 'number' && idx >= 0 && idx < keys.length ? keys[idx] : null;
+      },
+      get length() {
+        return Object.keys(storeObj).length;
+      }
+    };
+    try {
+      Object.defineProperty(window, propName, {
+        configurable: true,
+        enumerable: true,
+        get: function() { return shim; }
+      });
+    } catch (e) {}
+  }
+  installSafeStorage('localStorage', kvCache, true);
+  installSafeStorage('sessionStorage', sessionKvCache, false);
+
+  // Guard unprevented internal form submissions inside srcDoc so forms never reload/blank the preview
+  window.addEventListener('submit', function(ev) {
+    if (ev.defaultPrevented) return;
+    var form = ev.target;
+    if (!form || !form.getAttribute) return;
+    var action = String(form.getAttribute('action') || '').trim();
+    if (!action || action === '#' || !/^https?:\\/\\//i.test(action)) {
+      ev.preventDefault();
+    }
+  }, false);
+
   window.__AICRAFT_ENV__ = envMap;
   window.ENV = Object.assign({}, window.ENV || {}, envMap);
   window.process = window.process || {};
@@ -480,15 +569,16 @@ export function BuilderWorkspace({
       }
     });
   }
+  function notifyParentDb(op, payload) {
+    try {
+      window.parent.postMessage(Object.assign({ type: 'aicraft:db', id: 'db_' + Date.now(), op: op }, payload), '*');
+    } catch (e) {}
+  }
   var dbApi = {
     meta: dbMeta,
     list: function(table) {
       var t = cleanTable(table);
-      var cached = readTable(t);
-      return sendDbOp('list', { table: t }, cached).then(function(rows) {
-        if (Array.isArray(rows)) dbCache[t] = rows;
-        return Array.isArray(rows) ? rows : cached;
-      });
+      return Promise.resolve(readTable(t));
     },
     insert: function(table, row) {
       var t = cleanTable(table);
@@ -497,7 +587,8 @@ export function BuilderWorkspace({
       rows.unshift(item);
       writeTable(t, rows);
       notifyDbSubscribers(t);
-      return sendDbOp('insert', { table: t, row: item }, item);
+      notifyParentDb('insert', { table: t, row: item });
+      return Promise.resolve(item);
     },
     update: function(table, id, patch) {
       var t = cleanTable(table);
@@ -508,20 +599,23 @@ export function BuilderWorkspace({
       });
       writeTable(t, rows);
       notifyDbSubscribers(t);
-      return sendDbOp('update', { table: t, rowId: id, patch: patch || {} }, updated);
+      notifyParentDb('update', { table: t, rowId: id, patch: patch || {} });
+      return Promise.resolve(updated);
     },
     remove: function(table, id) {
       var t = cleanTable(table);
       var rows = readTable(t).filter(function(r) { return !r || r.id !== id; });
       writeTable(t, rows);
       notifyDbSubscribers(t);
-      return sendDbOp('remove', { table: t, rowId: id }, true);
+      notifyParentDb('remove', { table: t, rowId: id });
+      return Promise.resolve(true);
     },
     clear: function(table) {
       var t = cleanTable(table);
       writeTable(t, []);
       notifyDbSubscribers(t);
-      return sendDbOp('clear', { table: t }, true);
+      notifyParentDb('clear', { table: t });
+      return Promise.resolve(true);
     },
     subscribe: function(table, listener) {
       var t = cleanTable(table);
@@ -535,27 +629,42 @@ export function BuilderWorkspace({
     }
   };
   var runtimeErrorShown = false;
-  window.addEventListener('error', function(errEvent) {
+  function showRuntimeFixBar(errMsg) {
     if (runtimeErrorShown) return;
+    var msgText = String(errMsg || '').trim();
+    if (!msgText || /^Script error\.?$/i.test(msgText) || /ResizeObserver loop/i.test(msgText)) return;
     setTimeout(function() {
       if (runtimeErrorShown || !document.body) return;
-      var visibleText = (document.body.innerText || '').trim();
-      if (visibleText.length >= 24) return;
       runtimeErrorShown = true;
       var bar = document.createElement('div');
-      bar.style.cssText = 'position:fixed;bottom:16px;left:16px;right:16px;z-index:99999;background:#111827;color:#F9FAFB;border:1px solid rgba(255,255,255,0.16);border-radius:14px;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:system-ui,sans-serif;font-size:13px;box-shadow:0 12px 32px rgba(0,0,0,0.45);';
+      bar.style.cssText = 'position:fixed;bottom:16px;left:16px;right:16px;z-index:99999;background:#111827;color:#F9FAFB;border:1px solid rgba(255,255,255,0.16);border-radius:14px;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;gap:8px;font-family:system-ui,sans-serif;font-size:12px;box-shadow:0 12px 32px rgba(0,0,0,0.45);';
       var msg = document.createElement('span');
-      msg.textContent = 'App script hit an error: ' + String((errEvent && errEvent.message) || 'Unknown runtime error').slice(0, 90);
+      msg.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      msg.textContent = 'App script error: ' + msgText.slice(0, 90);
       var btn = document.createElement('button');
       btn.textContent = 'Auto-Fix';
-      btn.style.cssText = 'background:#4F46E5;color:#fff;border:0;border-radius:8px;padding:6px 12px;font-weight:600;cursor:pointer;flex-shrink:0;';
+      btn.style.cssText = 'background:#4F46E5;color:#fff;border:0;border-radius:8px;padding:6px 11px;font-weight:600;cursor:pointer;flex-shrink:0;';
       btn.onclick = function() {
-        window.parent.postMessage({ type: 'aicraft:edit', instruction: 'Fix this runtime error cleanly while preserving all app screens: ' + String((errEvent && errEvent.message) || 'script error') }, '*');
+        window.parent.postMessage({ type: 'aicraft:edit', instruction: 'Fix this runtime error cleanly so every button, tab, form, and screen works without refreshing: ' + msgText }, '*');
       };
+      var closeBtn = document.createElement('button');
+      closeBtn.textContent = '×';
+      closeBtn.setAttribute('aria-label', 'Dismiss');
+      closeBtn.style.cssText = 'background:transparent;color:#9CA3AF;border:0;font-size:16px;line-height:1;padding:2px 6px;cursor:pointer;flex-shrink:0;';
+      closeBtn.onclick = function() { bar.remove(); };
       bar.appendChild(msg);
       bar.appendChild(btn);
+      bar.appendChild(closeBtn);
       document.body.appendChild(bar);
-    }, 650);
+    }, 350);
+  }
+  window.addEventListener('error', function(errEvent) {
+    showRuntimeFixBar((errEvent && errEvent.message) || '');
+  });
+  window.addEventListener('unhandledrejection', function(rejEvent) {
+    var r = rejEvent && rejEvent.reason;
+    var text = r && r.message ? r.message : (typeof r === 'string' ? r : '');
+    showRuntimeFixBar(text);
   });
   function ask(prompt) {
     return new Promise(function(resolve, reject) {
@@ -691,8 +800,10 @@ export function BuilderWorkspace({
         | {
             type?: string;
             id?: string;
-            op?: 'list' | 'insert' | 'update' | 'remove' | 'clear';
+            op?: 'list' | 'insert' | 'update' | 'remove' | 'clear' | 'set';
             table?: string;
+            key?: string;
+            value?: string;
             row?: Record<string, unknown>;
             rowId?: string;
             patch?: Record<string, unknown>;
@@ -702,6 +813,27 @@ export function BuilderWorkspace({
           }
         | undefined;
       if (!data?.type) return;
+
+      if (data.type === 'aicraft:kv' && data.op) {
+        const kvPrefix = `aicraft_kv_${projectId}_`;
+        try {
+          if (data.op === 'set' && typeof data.key === 'string') {
+            window.localStorage.setItem(`${kvPrefix}${data.key}`, String(data.value ?? ''));
+          } else if (data.op === 'remove' && typeof data.key === 'string') {
+            window.localStorage.removeItem(`${kvPrefix}${data.key}`);
+          } else if (data.op === 'clear') {
+            const keysToDelete: string[] = [];
+            for (let i = 0; i < window.localStorage.length; i += 1) {
+              const k = window.localStorage.key(i);
+              if (k && k.startsWith(kvPrefix)) keysToDelete.push(k);
+            }
+            keysToDelete.forEach((k) => window.localStorage.removeItem(k));
+          }
+        } catch {
+          // ignore storage quota errors
+        }
+        return;
+      }
 
       if (data.type === 'aicraft:edit' && data.instruction?.trim()) {
         onSetView('chat');
@@ -2021,11 +2153,9 @@ export function BuilderWorkspace({
                 />
                 <span className="text-[12.5px] font-medium text-[#18181B] truncate">
                   {activeModel?.name ??
-                    (selectedModel === 'auto::free-browser' || selectedModel === 'auto::architect'
-                      ? 'AI Craft Auto (Free · No Key)'
-                      : modelsLoading
-                        ? 'Connecting Free AI...'
-                        : selectedModel || 'AI Craft Auto (Free · No Key)')}
+                    (modelsLoading
+                      ? 'Connecting Vision & Code AI...'
+                      : 'Claude Sonnet 4.6 (Vision · Builder)')}
                 </span>
               </div>
 
@@ -2072,15 +2202,9 @@ export function BuilderWorkspace({
                       ? 'Listening... speak now'
                       : isVoiceTranscribing
                         ? 'Transcribing speech...'
-                        : activeModel?.category === 'video'
-                          ? 'Describe the video scene to generate...'
-                          : activeModel?.category === 'music'
-                            ? 'Describe the song, beat, or vibe to compose...'
-                            : activeModel?.category === 'image'
-                              ? 'Describe the image you want to generate...'
-                              : mode === 'mobile'
-                                ? 'Ask or describe your mobile app...'
-                                : 'Ask or describe your web app...'
+                        : mode === 'mobile'
+                          ? 'Ask, attach screenshot, or add a feature...'
+                          : 'Ask, attach screenshot, or update your web app...'
                 }
                 rows={2}
                 aria-label={
@@ -2217,28 +2341,36 @@ export function BuilderWorkspace({
                 </button>
               </div>
 
-              {/* Right: Send Button */}
-              <button
-                type="button"
-                onClick={handleSubmit}
-                disabled={isRestricted || !hasContent || isStreaming}
-                aria-label={isRestricted ? 'Chat restricted' : 'Send message to AI Craft'}
-                style={{
-                  backgroundColor:
-                    !isRestricted && hasContent && !isStreaming
-                      ? theme.sendActiveBg
-                      : isRestricted
-                        ? '#D4D4D8'
-                        : '#BEB5F9',
-                }}
-                className="w-9 h-9 rounded-full shrink-0 flex items-center justify-center text-white transition-all duration-200 active:scale-95 disabled:cursor-not-allowed"
-              >
-                {isStreaming ? (
-                  <Loader2 className="w-[17px] h-[17px] animate-spin" />
-                ) : (
+              {/* Right: Send OR Stop Button */}
+              {isStreaming && onStopGeneration ? (
+                <button
+                  type="button"
+                  onClick={onStopGeneration}
+                  aria-label="Stop building and save progress"
+                  title="Stop here & save progress"
+                  className="w-9 h-9 rounded-full shrink-0 flex items-center justify-center bg-[#0B0B0F] hover:bg-black/85 text-white transition-all duration-150 active:scale-95"
+                >
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleSubmit}
+                  disabled={isRestricted || !hasContent || isStreaming}
+                  aria-label={isRestricted ? 'Chat restricted' : 'Send message to AI Craft'}
+                  style={{
+                    backgroundColor:
+                      !isRestricted && hasContent && !isStreaming
+                        ? theme.sendActiveBg
+                        : isRestricted
+                          ? '#D4D4D8'
+                          : '#BEB5F9',
+                  }}
+                  className="w-9 h-9 rounded-full shrink-0 flex items-center justify-center text-white transition-all duration-200 active:scale-95 disabled:cursor-not-allowed"
+                >
                   <ArrowUp className="w-[18px] h-[18px] stroke-[2.4]" />
-                )}
-              </button>
+                </button>
+              )}
             </div>
           </div>
         </div>

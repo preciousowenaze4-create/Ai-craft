@@ -59,13 +59,10 @@ const PORT = Number(process.env.PORT || 3000);
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 import {
-  ARCHITECT_PUBLIC_MODEL,
-  POLLINATIONS_FALLBACK_MODELS,
-  PUTER_BROWSER_MODELS,
   buildGatewayExecutionPlan,
   fetchAllGatewayModels,
-  fetchPollinationsCatalog,
-  type UnifiedAiModel,
+  getActiveTwoBuilderModels,
+  hasServerFreeAiKey,
 } from './api/_aiGateways.js';
 import {
   generateMediaAsset,
@@ -87,6 +84,7 @@ import {
   extractLiveBuildArtifacts,
   extractPlanStepsFromRaw,
   extractSessionTitleFromRaw,
+  finalizePartialPreviewHtml,
   findCodeStart,
   runLiveBrowserSearch,
   sanitizeBuildProse,
@@ -95,11 +93,11 @@ import {
 import {
   finalizeRealtimeOutput,
   prepareRealtimePrompt,
-  streamPollinationsRealTime,
+  streamServerFreeAiRealTime,
   type VisualHintsSpec,
 } from './api/_realtimeEngine.js';
 
-let cachedPollinationsModels: UnifiedAiModel[] = [];
+
 
 function getSupabaseConfig(): { url: string; anonKey: string; serviceRoleKey: string } {
   const urlCandidates = [
@@ -1937,28 +1935,23 @@ async function startServer() {
     try {
       const forceRefresh = req.query.refresh === '1';
       const result = await fetchAllGatewayModels(referer, forceRefresh);
-      cachedPollinationsModels = result.models.filter((m) => m.gateway === 'pollinations');
 
       res.json({
         models: result.models,
         gateways: result.gateways,
-        pollinationsConfigured: result.pollinationsConfigured,
-        puterConfigured: result.puterConfigured,
-        keyless: true,
+        pollinationsConfigured: false,
+        puterConfigured: true,
+        serverFreeAiReady: result.serverFreeAiReady,
+        keyless: !result.serverFreeAiReady,
         freeOnly: true,
       });
     } catch {
-      const fallbackModels = [
-        ARCHITECT_PUBLIC_MODEL,
-        ...POLLINATIONS_FALLBACK_MODELS.filter((m) => m.category === 'code'),
-        ...PUTER_BROWSER_MODELS,
-        ...POLLINATIONS_FALLBACK_MODELS.filter((m) => m.category !== 'code'),
-      ];
       res.status(200).json({
-        models: fallbackModels,
-        pollinationsConfigured: true,
+        models: getActiveTwoBuilderModels(),
+        pollinationsConfigured: false,
         puterConfigured: true,
-        keyless: true,
+        serverFreeAiReady: hasServerFreeAiKey(),
+        keyless: !hasServerFreeAiKey(),
         freeOnly: true,
       });
     }
@@ -2266,10 +2259,15 @@ async function startServer() {
       }
 
       let rawOutput = '';
-      await streamPollinationsRealTime({
+      const streamRes = await streamServerFreeAiRealTime({
+        requestedModel: typeof body.model === 'string' ? body.model : undefined,
         systemPrompt: prepared.systemPrompt,
         historyMessages: prepared.historyMessages,
         userPrompt: prepared.userPrompt,
+        attachmentDataUrl:
+          typeof (body.attachmentDataUrl ?? opts.attachmentDataUrl) === 'string'
+            ? String(body.attachmentDataUrl ?? opts.attachmentDataUrl)
+            : null,
         onContentChunk: (chunk) => {
           rawOutput += chunk;
         },
@@ -2280,9 +2278,9 @@ async function startServer() {
         message,
         mode,
         previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
-        modelUsed: body.model || 'pollinations::openai-fast',
-        modelName: prepared.requestedModelLabel,
-        provider: 'pollinations',
+        modelUsed: streamRes.modelUsed,
+        modelName: streamRes.modelName,
+        provider: streamRes.provider,
       });
 
       res.setHeader('Cache-Control', 'no-store');
@@ -2585,10 +2583,10 @@ async function startServer() {
       sendEvent({
         type: 'meta',
         kind: prepared.naturalMediaIntent ? 'media' : 'chat',
-        modelId: requestedModel || 'pollinations::openai-fast',
-        modelName: prepared.requestedModelLabel || 'Free Browser AI',
-        provider: requestedGateway || 'pollinations',
-        gateway: requestedGateway || 'pollinations',
+        modelId: requestedModel || 'gemini::gemini-4-hydrogen',
+        modelName: prepared.requestedModelLabel || 'Free Server AI',
+        provider: requestedGateway || 'server',
+        gateway: requestedGateway || 'server',
         isFallback: false,
       });
 
@@ -2642,14 +2640,37 @@ async function startServer() {
       let enteredCodePhase = false;
       let lastFilesKey = '';
       let lastBytesSent = 0;
+      let lastPreviewBytesSent = 0;
+      let emittedReasoningPhase = false;
 
-      await streamPollinationsRealTime({
+      let activeModelUsed = requestedModel || 'gemini::gemini-4-hydrogen';
+      let activeModelName = prepared.requestedModelLabel || 'Gemini Flash (Vision · Free Server)';
+      let activeProvider = requestedGateway || 'google';
+
+      await streamServerFreeAiRealTime({
+        requestedModel,
         systemPrompt: prepared.systemPrompt,
         historyMessages: prepared.historyMessages,
         userPrompt: prepared.userPrompt,
+        attachmentDataUrl,
         signal: clientAbort.signal,
+        onModelMeta: (meta) => {
+          activeModelUsed = meta.modelId;
+          activeModelName = meta.modelName;
+          activeProvider = meta.provider;
+          sendEvent({
+            type: 'meta',
+            kind: 'chat',
+            modelId: meta.modelId,
+            modelName: meta.modelName,
+            provider: meta.provider,
+            gateway: meta.provider,
+            isFallback: false,
+          });
+        },
         onReasoningChunk: () => {
-          if (!enteredCodePhase) {
+          if (!enteredCodePhase && !emittedReasoningPhase) {
+            emittedReasoningPhase = true;
             sendEvent({
               type: 'phase',
               phase: 'understanding',
@@ -2736,6 +2757,17 @@ async function startServer() {
                 bytesBuilt: htmlSoFar.length,
               });
             }
+            if (htmlSoFar.length >= 600 && htmlSoFar.length - lastPreviewBytesSent >= 2400) {
+              lastPreviewBytesSent = htmlSoFar.length;
+              const liveHtml = finalizePartialPreviewHtml(cleanSoFar);
+              if (liveHtml) {
+                sendEvent({
+                  type: 'partialHtml',
+                  previewHtml: liveHtml,
+                  bytesBuilt: htmlSoFar.length,
+                });
+              }
+            }
           }
         },
       });
@@ -2747,9 +2779,9 @@ async function startServer() {
         message,
         mode,
         previousHtml,
-        modelUsed: requestedModel || 'pollinations::openai-fast',
-        modelName: prepared.requestedModelLabel || 'Free Browser AI',
-        provider: requestedGateway || 'pollinations',
+        modelUsed: activeModelUsed,
+        modelName: activeModelName,
+        provider: activeProvider,
         startedAt: job.startedAt,
       });
 

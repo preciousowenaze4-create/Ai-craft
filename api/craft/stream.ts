@@ -3,6 +3,7 @@ import {
   extractLiveBuildArtifacts,
   extractPlanStepsFromRaw,
   extractSessionTitleFromRaw,
+  finalizePartialPreviewHtml,
   findCodeStart,
   sanitizeBuildProse,
   stripReasoningTags,
@@ -22,7 +23,7 @@ import {
 import {
   finalizeRealtimeOutput,
   prepareRealtimePrompt,
-  streamPollinationsRealTime,
+  streamServerFreeAiRealTime,
   type VisualHintsSpec,
 } from '../_realtimeEngine.js';
 
@@ -215,10 +216,10 @@ export async function POST(request: Request): Promise<Response> {
         sendEvent({
           type: 'meta',
           kind: prepared.naturalMediaIntent ? 'media' : 'chat',
-          modelId: requestedModel || 'pollinations::openai-fast',
-          modelName: prepared.requestedModelLabel || 'Free Browser AI',
-          provider: requestedGateway || 'pollinations',
-          gateway: requestedGateway || 'pollinations',
+          modelId: requestedModel || 'gemini::gemini-4-hydrogen',
+          modelName: prepared.requestedModelLabel || 'Free Server AI',
+          provider: requestedGateway || 'server',
+          gateway: requestedGateway || 'server',
           isFallback: false,
         });
 
@@ -273,13 +274,36 @@ export async function POST(request: Request): Promise<Response> {
         let enteredCodePhase = false;
         let lastFilesKey = '';
         let lastBytesSent = 0;
+        let lastPreviewBytesSent = 0;
+        let emittedReasoningPhase = false;
 
-        await streamPollinationsRealTime({
+        let activeModelUsed = requestedModel || 'gemini::gemini-4-hydrogen';
+        let activeModelName = prepared.requestedModelLabel || 'Gemini Flash (Vision · Free Server)';
+        let activeProvider = requestedGateway || 'google';
+
+        await streamServerFreeAiRealTime({
+          requestedModel,
           systemPrompt: prepared.systemPrompt,
           historyMessages: prepared.historyMessages,
           userPrompt: prepared.userPrompt,
+          attachmentDataUrl,
+          onModelMeta: (meta) => {
+            activeModelUsed = meta.modelId;
+            activeModelName = meta.modelName;
+            activeProvider = meta.provider;
+            sendEvent({
+              type: 'meta',
+              kind: 'chat',
+              modelId: meta.modelId,
+              modelName: meta.modelName,
+              provider: meta.provider,
+              gateway: meta.provider,
+              isFallback: false,
+            });
+          },
           onReasoningChunk: () => {
-            if (!enteredCodePhase) {
+            if (!enteredCodePhase && !emittedReasoningPhase) {
+              emittedReasoningPhase = true;
               sendEvent({
                 type: 'phase',
                 phase: 'understanding',
@@ -369,6 +393,17 @@ export async function POST(request: Request): Promise<Response> {
                   bytesBuilt: htmlSoFar.length,
                 });
               }
+              if (htmlSoFar.length >= 600 && htmlSoFar.length - lastPreviewBytesSent >= 2400) {
+                lastPreviewBytesSent = htmlSoFar.length;
+                const liveHtml = finalizePartialPreviewHtml(cleanSoFar);
+                if (liveHtml) {
+                  sendEvent({
+                    type: 'partialHtml',
+                    previewHtml: liveHtml,
+                    bytesBuilt: htmlSoFar.length,
+                  });
+                }
+              }
             }
           },
         });
@@ -380,9 +415,9 @@ export async function POST(request: Request): Promise<Response> {
           message,
           mode,
           previousHtml,
-          modelUsed: requestedModel || 'pollinations::openai-fast',
-          modelName: prepared.requestedModelLabel || 'Free Browser AI',
-          provider: requestedGateway || 'pollinations',
+          modelUsed: activeModelUsed,
+          modelName: activeModelName,
+          provider: activeProvider,
           startedAt,
         });
 

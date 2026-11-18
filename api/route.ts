@@ -9,7 +9,7 @@ import {
 import {
   finalizeRealtimeOutput,
   prepareRealtimePrompt,
-  streamPollinationsRealTime,
+  streamServerFreeAiRealTime,
   type VisualHintsSpec,
 } from './_realtimeEngine.js';
 
@@ -229,12 +229,16 @@ export async function POST(request: Request): Promise<Response> {
       );
     }
 
-    // Default synchronous test/endpoint mode: run real-time Pollinations stream and finalize
     let rawOutput = '';
-    await streamPollinationsRealTime({
+    const streamRes = await streamServerFreeAiRealTime({
+      requestedModel: typeof body.model === 'string' ? body.model : undefined,
       systemPrompt: prepared.systemPrompt,
       historyMessages: prepared.historyMessages,
       userPrompt: prepared.userPrompt,
+      attachmentDataUrl:
+        typeof (body.attachmentDataUrl ?? opts.attachmentDataUrl) === 'string'
+          ? String(body.attachmentDataUrl ?? opts.attachmentDataUrl)
+          : null,
       onContentChunk: (chunk) => {
         rawOutput += chunk;
       },
@@ -245,9 +249,9 @@ export async function POST(request: Request): Promise<Response> {
       message,
       mode,
       previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
-      modelUsed: body.model || 'pollinations::openai-fast',
-      modelName: prepared.requestedModelLabel,
-      provider: 'pollinations',
+      modelUsed: streamRes.modelUsed,
+      modelName: streamRes.modelName,
+      provider: streamRes.provider,
     });
 
     return Response.json(

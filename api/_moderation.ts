@@ -9,7 +9,10 @@ import {
   serializeSupabaseUser,
 } from './_supabaseAuth.js';
 
-const OWNER_FALLBACK_EMAIL = 'preciousddkid@gmail.com';
+const OWNER_FALLBACK_EMAILS = [
+  'preciousddkid@gmail.com',
+  'preciousowenaze4@gmail.com',
+];
 const MODERATION_BUCKET = 'aicraft-user-data';
 const MODERATION_REGISTRY_OBJECT = '__moderation/registry.json';
 
@@ -64,18 +67,20 @@ export function normalizeAuthEmail(email: string | null | undefined): string {
   return typeof email === 'string' ? email.trim().toLowerCase() : '';
 }
 
-function getServerOwnerEmail(): string {
+function getServerOwnerEmails(): string[] {
   const fromEnv =
     typeof process.env.OWNER_ADMIN_EMAIL === 'string'
-      ? normalizeAuthEmail(process.env.OWNER_ADMIN_EMAIL)
-      : '';
-  return fromEnv || OWNER_FALLBACK_EMAIL;
+      ? process.env.OWNER_ADMIN_EMAIL.split(',')
+          .map((e) => normalizeAuthEmail(e))
+          .filter(Boolean)
+      : [];
+  return Array.from(new Set([...fromEnv, ...OWNER_FALLBACK_EMAILS]));
 }
 
 export function isOwnerEmail(email: string | null | undefined): boolean {
   const normalized = normalizeAuthEmail(email);
   if (!normalized) return false;
-  return normalized === getServerOwnerEmail();
+  return getServerOwnerEmails().includes(normalized);
 }
 
 function createServiceClient() {

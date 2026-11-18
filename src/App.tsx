@@ -27,7 +27,7 @@ import { TopBar } from './components/TopBar';
 import { unlockSpeechSynthesis } from './hooks/useSpeechNarration';
 import {
   analyzeAttachmentVisualHints,
-  generateBrowserImageClient,
+  normalizeBuilderModelId,
   streamRealTimeBrowserAi,
 } from './utils/browserAi';
 import { inspectBuiltAppCompleteness } from './utils/screenExtractor';
@@ -440,11 +440,10 @@ export default function App() {
   const [swipedProjectId, setSwipedProjectId] = useState<string | null>(null);
   const [inlineNotice, setInlineNotice] = useState<string | null>(null);
   const [models, setModels] = useState<OpenRouterModel[]>([]);
-  const [selectedModel, setSelectedModel] = useState<string>(() => {
-    const saved = loadSavedString(STORAGE_MODEL_KEY);
-    if (!saved || saved === 'auto::architect') return 'auto::free-browser';
-    return saved;
-  });
+  const [selectedModel, setSelectedModel] = useState<string>(() =>
+    normalizeBuilderModelId(loadSavedString(STORAGE_MODEL_KEY))
+  );
+  const [serverFreeAiReady, setServerFreeAiReady] = useState<boolean>(false);
   const [modelsLoading, setModelsLoading] = useState<boolean>(true);
   const [modelsError, setModelsError] = useState<string | null>(null);
   const [transactions, setTransactions] = useState<PaymentTransaction[]>(() => {
@@ -1015,26 +1014,20 @@ export default function App() {
       }
       const data = (await response.json()) as {
         models?: OpenRouterModel[];
+        serverFreeAiReady?: boolean;
         error?: string;
       };
+      setServerFreeAiReady(Boolean(data?.serverFreeAiReady));
       const fetched = Array.isArray(data?.models) ? data.models : [];
       if (fetched.length > 0) {
         setModels(fetched);
         setSelectedModel((prev) => {
-          const normalizedPrev =
-            !prev || prev === 'auto::architect' ? 'auto::free-browser' : prev;
-          const matched = normalizedPrev
-            ? fetched.find(
-                (m) =>
-                  m.id === normalizedPrev &&
-                  (m.isFree ||
-                    m.gateway === 'auto' ||
-                    m.gateway === 'puter' ||
-                    m.gateway === 'pollinations' ||
-                    m.gateway === 'browser' ||
-                    m.gateway === 'web-search')
-              )
-            : undefined;
+          const normalizedPrev = normalizeBuilderModelId(prev);
+          const matched = fetched.find((m) => m.id === normalizedPrev);
+          if (data?.serverFreeAiReady && (!matched || matched.id.startsWith('puter::'))) {
+            const serverFirst = fetched.find((m) => !m.id.startsWith('puter::'));
+            if (serverFirst) return serverFirst.id;
+          }
           return matched ? matched.id : fetched[0].id;
         });
       } else if (!response.ok || data?.error) {
@@ -1603,6 +1596,22 @@ export default function App() {
                   pendingBytes = evt.bytesBuilt;
                   scheduleBufferedFlush();
                 }
+              } else if (evt.type === 'partialHtml' && evt.previewHtml) {
+                if (typeof evt.bytesBuilt === 'number') {
+                  latestBytesBuilt = evt.bytesBuilt;
+                }
+                const partialHtml = evt.previewHtml;
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  kind: 'build',
+                  phase: t.phase === 'understanding' ? 'building' : t.phase,
+                  phaseLabel: 'Building & checking live preview...',
+                  previewHtml: partialHtml,
+                  bytesBuilt:
+                    typeof evt.bytesBuilt === 'number'
+                      ? evt.bytesBuilt
+                      : t.bytesBuilt,
+                }));
               } else if (evt.type === 'reset') {
                 stopCreditTicker();
                 targetCreditsForTurn = 0;
@@ -2090,6 +2099,18 @@ export default function App() {
           options.attachmentDataUrl
         );
 
+        const normalizedModel = normalizeBuilderModelId(modelToUse);
+        const shouldUseServerFreeAi =
+          normalizedModel.startsWith('gemini::') ||
+          normalizedModel.startsWith('groq::') ||
+          normalizedModel.startsWith('openrouter::') ||
+          (serverFreeAiReady && !normalizedModel.startsWith('puter::'));
+
+        if (shouldUseServerFreeAi) {
+          await runServerSseStream(visualHints);
+          return;
+        }
+
         // 1. Prepare live grounded prompt (checks moderation, billing, live clinic/web search & photography)
         const prepareRes = await fetch('/api/route', {
           method: 'POST',
@@ -2142,49 +2163,7 @@ export default function App() {
           applyBillingSummary(prepared.billing);
         }
 
-        // 2. Direct Media Studio (Image / Music / Video)
-        const targetMediaKind = prepared.mediaKind || prepared.naturalMediaIntent;
-        if (targetMediaKind) {
-          if (targetMediaKind === 'image' && !options.forceChat) {
-            updateTurn(projectId, turnId, (t) => ({
-              ...t,
-              kind: 'media',
-              phase: 'building',
-              phaseLabel: 'Generating bespoke visual from description...',
-            }));
-            const directImg = await generateBrowserImageClient({
-              prompt: message,
-              modelId: modelToUse,
-              signal: controller.signal,
-            });
-            if (directImg) {
-              activeConnectionsRef.current.delete(turnId);
-              updateTurn(projectId, turnId, (t) => ({
-                ...t,
-                kind: 'media',
-                phase: 'complete',
-                phaseLabel: 'Image ready',
-                thoughtSeconds: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
-                aiText: `Generated image for "${message.slice(0, 120)}".`,
-                media: {
-                  kind: 'image',
-                  dataUrl: directImg.dataUrl,
-                  mimeType: directImg.mimeType,
-                  prompt: message,
-                  modelId: directImg.modelId,
-                  gateway: directImg.gateway,
-                },
-                modelId: directImg.modelId,
-                modelProvider: directImg.gateway,
-              }));
-              return;
-            }
-          }
-          await runServerSseStream(visualHints);
-          return;
-        }
-
-        // 3. True Real-Time Browser AI Streaming (Puter.js v2 & Browser-Direct Pollinations SSE)
+        // 2. True Real-Time Vision & Code Streaming (Claude Sonnet 4.6 / Gemini 2.5 Flash via Puter)
         const hasSearchHits = Boolean(prepared.searchData?.results?.length);
         updateTurn(projectId, turnId, (t) => ({
           ...t,
@@ -2284,10 +2263,11 @@ export default function App() {
 
         try {
           browserResult = await streamRealTimeBrowserAi({
-            modelId: modelToUse || 'auto::free-browser',
+            modelId: normalizeBuilderModelId(modelToUse),
             systemPrompt: prepared.systemPrompt,
             historyMessages: prepared.historyMessages,
             userPrompt: prepared.userPrompt,
+            previousHtml,
             attachmentDataUrl: options.attachmentDataUrl,
             signal: controller.signal,
             ...streamTurnCallbacks,
@@ -2299,16 +2279,14 @@ export default function App() {
           browserStreamError =
             err instanceof Error
               ? err
-              : new Error('Free browser AI stream unavailable.');
+              : new Error('Unable to reach Vision & Code AI right now.');
         }
 
-        // If browser-direct AI couldn't complete (e.g., CORS/402), try server SSE stream cleanly
         if (!browserResult || !browserResult.rawOutput.trim()) {
           if (browserStreamError) {
-            await runServerSseStream(visualHints);
-            return;
+            throw browserStreamError;
           }
-          throw new Error('Free browser AI did not return any output. Please retry.');
+          throw new Error('Vision & Code AI did not return any output. Please retry.');
         }
 
         type FinalizedPayload = {
@@ -2367,9 +2345,13 @@ export default function App() {
         let finalized = await runFinalizePass(browserResult.rawOutput, browserResult);
 
         // 5. Calm Self-Inspection & Expansion Pass 2:
-        //    Inspect what the AI actually built in Preview; if it rushed out only 1-2 screens or < 12 KB,
-        //    keep the initial screen(s) visible in ScreenStudioStrip while the AI inspects & completes all screens!
-        if (finalized.kind === 'build' && finalized.previewHtml) {
+        //    Inspect what the AI actually built in Preview; on Puter (which has no 45s-per-reply IP limit),
+        //    if Pass 1 rushed out only 1-2 screens or < 12 KB, keep Pass 1 screens visible while adding remaining layers.
+        if (
+          finalized.kind === 'build' &&
+          finalized.previewHtml &&
+          browserResult.modelUsed.startsWith('puter::')
+        ) {
           const audit = inspectBuiltAppCompleteness(finalized.previewHtml, message);
           if (audit.needsExpansionPass && !controller.signal.aborted) {
             updateTurn(projectId, turnId, (t) => ({
@@ -2385,15 +2367,16 @@ export default function App() {
 
             try {
               const expansionPrompt = [
-                `CURRENT BUILT PREVIEW HTML (${(finalized.previewHtml.length / 1024).toFixed(1)} KB):\n\`\`\`html\n${finalized.previewHtml.slice(0, 14000)}\n\`\`\``,
+                `CURRENT BUILT PREVIEW HTML (${(finalized.previewHtml.length / 1024).toFixed(1)} KB):\n\`\`\`html\n${finalized.previewHtml.slice(0, 120000)}\n\`\`\``,
                 audit.critiquePrompt,
               ].join('\n\n');
 
               const pass2Result = await streamRealTimeBrowserAi({
-                modelId: browserResult.modelUsed || modelToUse || 'auto::free-browser',
+                modelId: normalizeBuilderModelId(browserResult.modelUsed || modelToUse),
                 systemPrompt: prepared.systemPrompt,
                 historyMessages: prepared.historyMessages,
                 userPrompt: expansionPrompt,
+                previousHtml: finalized.previewHtml,
                 attachmentDataUrl: options.attachmentDataUrl,
                 signal: controller.signal,
                 ...streamTurnCallbacks,
@@ -3145,6 +3128,44 @@ export default function App() {
     );
   };
 
+  const handleStopGeneration = useCallback(
+    (projectId: string) => {
+      const targetProject = projectsRef.current.find((p) => p.id === projectId);
+      if (!targetProject) return;
+
+      const workingTurn = [...targetProject.turns]
+        .reverse()
+        .find((t) => t.phase === 'understanding' || t.phase === 'building');
+      if (!workingTurn) return;
+
+      const ctrl = activeConnectionsRef.current.get(workingTurn.id);
+      if (ctrl) {
+        ctrl.abort();
+        activeConnectionsRef.current.delete(workingTurn.id);
+      }
+
+      const preservedHtml =
+        workingTurn.previewHtml?.trim() ||
+        [...targetProject.turns]
+          .slice(0, targetProject.turns.findIndex((t) => t.id === workingTurn.id))
+          .reverse()
+          .find((t) => Boolean(t.previewHtml))?.previewHtml ||
+        '';
+
+      updateTurn(projectId, workingTurn.id, (t) => ({
+        ...t,
+        phase: 'paused',
+        pausedReason: 'STREAM_INTERRUPTED',
+        phaseLabel: 'Stopped · Progress saved',
+        pausedMessage: preservedHtml
+          ? 'Stopped right here and saved all code drawn so far. Tap Continue Building (even with another AI) to pick up from this exact spot.'
+          : 'Stopped cleanly. Tap Continue Building to resume from this request.',
+        previewHtml: preservedHtml || t.previewHtml,
+      }));
+    },
+    [updateTurn]
+  );
+
   const handleScanClick = () => {
     setInlineNotice('QR preview scanner ready');
   };
@@ -3705,6 +3726,7 @@ export default function App() {
             }}
             onSendFollowUp={handleFollowUp}
             onContinueTurn={handleContinueTurn}
+            onStopGeneration={() => handleStopGeneration(activeProject.id)}
             onCheckCanUseAi={checkCanConsumeCredit}
             onPaymentRequired={(nextBilling, errMsg) => {
               if (nextBilling) applyBillingSummary(nextBilling);
