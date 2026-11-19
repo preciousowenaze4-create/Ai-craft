@@ -7,13 +7,7 @@ export interface BrowserVisualHints {
 
 export const DEFAULT_GEMINI_BUILDER_MODEL_ID = 'gemini::gemini-4-hydrogen';
 
-export const VALID_GEMINI_MODEL_IDS = [
-  'gemini::gemini-4-hydrogen',
-  'gemini::gemini-3.1-pro-preview',
-  'gemini::gemini-3.1-flash-lite',
-  'gemini::gemini-2.5-flash',
-  'gemini::gemini-2.5-flash-preview-12-2025',
-] as const;
+export const VALID_GEMINI_MODEL_IDS = ['gemini::gemini-4-hydrogen'] as const;
 
 export function normalizeBuilderModelId(rawId?: string | null): string {
   const trimmed = (rawId || '').trim();

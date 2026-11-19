@@ -32,7 +32,9 @@ import {
   BACKEND_DESIGNER_MODEL_ID,
   GEMINI_BUILDER_MODELS,
   buildGatewayExecutionPlan,
+  getOrderedBackendGeminiFailoverModels,
   getServerGeminiApiKey,
+  markGatewayCandidateCooldown,
   parseGatewayModelIdentifier,
 } from './_aiGateways.js';
 import {
@@ -51,30 +53,87 @@ export function createGeminiClient(apiKey: string): GoogleGenAI {
   });
 }
 
-function formatGeminiApiError(err: unknown, modelName: string): string {
-  const rawMsg =
+function extractReadableErrorMessage(err: unknown): string {
+  let msg =
     err instanceof Error
       ? err.message
       : typeof err === 'string'
         ? err
         : 'AI Craft engine request failed.';
+  for (let depth = 0; depth < 3; depth += 1) {
+    const trimmed = msg.trim();
+    if (!trimmed.startsWith('{')) break;
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        message?: string;
+        error?: { message?: string } | string;
+      };
+      if (typeof parsed.error === 'string' && parsed.error.trim()) {
+        msg = parsed.error;
+        continue;
+      }
+      if (
+        parsed.error &&
+        typeof parsed.error === 'object' &&
+        typeof parsed.error.message === 'string' &&
+        parsed.error.message.trim()
+      ) {
+        msg = parsed.error.message;
+        continue;
+      }
+      if (typeof parsed.message === 'string' && parsed.message.trim()) {
+        msg = parsed.message;
+        continue;
+      }
+    } catch {
+      break;
+    }
+    break;
+  }
+  return msg.trim();
+}
+
+function isKeyFatalError(rawLower: string): boolean {
+  return (
+    rawLower.includes('api_key_invalid') ||
+    rawLower.includes('api key not valid') ||
+    rawLower.includes('api key expired') ||
+    rawLower.includes('permission_denied') ||
+    rawLower.includes('403')
+  );
+}
+
+function isModelNotFoundError(rawLower: string): boolean {
+  return (
+    rawLower.includes('not_found') ||
+    rawLower.includes('404') ||
+    rawLower.includes('not found') ||
+    rawLower.includes('is not supported for')
+  );
+}
+
+function formatGeminiApiError(err: unknown, modelName: string): string {
+  const rawMsg = extractReadableErrorMessage(err);
   const lower = rawMsg.toLowerCase();
 
-  if (
-    lower.includes('api_key_invalid') ||
-    lower.includes('api key not valid') ||
-    lower.includes('permission_denied') ||
-    lower.includes('403')
-  ) {
-    return 'Your GEMINI_API_KEY was rejected or is invalid. Please check GEMINI_API_KEY in Vercel Environment Variables (or Settings > Secrets).';
+  if (isKeyFatalError(lower)) {
+    return 'Your GEMINI_API_KEY was rejected or expired. Please check GEMINI_API_KEY in Vercel Environment Variables.';
   }
   if (lower.includes('resource_exhausted') || lower.includes('429') || lower.includes('quota')) {
-    return `${modelName} reached its API quota or rate limit. Try switching to AI Craft Pro (4 Hydrogen) or AI Craft Mini (3.1).`;
+    return `${modelName} reached its current API quota limit across all backup models. Please wait a moment or recharge/upgrade GEMINI_API_KEY.`;
   }
-  if (lower.includes('not_found') || lower.includes('404') || lower.includes('not found')) {
-    return `${modelName} is not available on this GEMINI_API_KEY yet. Try switching to AI Craft Pro (4 Hydrogen) or AI Craft 2.5 Flash.`;
+  if (
+    lower.includes('503') ||
+    lower.includes('unavailable') ||
+    lower.includes('high demand') ||
+    lower.includes('overloaded')
+  ) {
+    return `${modelName} and backup engines are temporarily busy on Google servers. Tap Continue / Retry in a few seconds.`;
   }
-  return rawMsg.slice(0, 320);
+  if (isModelNotFoundError(lower)) {
+    return `${modelName} could not reach an enabled model on this GEMINI_API_KEY.`;
+  }
+  return rawMsg.slice(0, 260);
 }
 
 export interface VisualHintsSpec {
@@ -200,33 +259,41 @@ async function runBackendDesignArchitect(params: {
   });
 
   const generatePromise = (async () => {
-    try {
-      const response = await ai.models.generateContent({
-        model: BACKEND_DESIGNER_MODEL_ID,
-        contents: [{ role: 'user', parts: designerParts }],
-        config: {
-          systemInstruction:
-            'You are the internal UI/UX Design Architect inside AI Craft. Produce a crisp, practical visual design blueprint (colors, layout hierarchy, components, multi-screen structure) with zero HTML or code fences.',
-        },
-      });
-      const textOut = (response.text || '').trim().slice(0, 1400);
-      const usage = response.usageMetadata;
-      void recordGeminiApiUsage({
-        modelId: BACKEND_DESIGNER_MODEL_ID,
-        promptTokens: usage?.promptTokenCount,
-        candidatesTokens: usage?.candidatesTokenCount,
-        totalTokens: usage?.totalTokenCount ?? Math.max(120, Math.ceil(textOut.length / 4)),
-        source: 'design-architect',
-      });
-      return textOut;
-    } catch (err) {
-      void recordGeminiApiError({
-        modelId: BACKEND_DESIGNER_MODEL_ID,
-        error: err,
-        source: 'design-architect',
-      });
-      return '';
+    const designerModels = [BACKEND_DESIGNER_MODEL_ID, 'gemini-2.5-flash'];
+    for (const designerModel of designerModels) {
+      try {
+        const response = await ai.models.generateContent({
+          model: designerModel,
+          contents: [{ role: 'user', parts: designerParts }],
+          config: {
+            systemInstruction:
+              'You are the internal UI/UX Design Architect inside AI Craft. Produce a crisp, practical visual design blueprint (colors, layout hierarchy, components, multi-screen structure) with zero HTML or code fences.',
+          },
+        });
+        const textOut = (response.text || '').trim().slice(0, 1400);
+        const usage = response.usageMetadata;
+        void recordGeminiApiUsage({
+          modelId: designerModel,
+          promptTokens: usage?.promptTokenCount,
+          candidatesTokens: usage?.candidatesTokenCount,
+          totalTokens: usage?.totalTokenCount ?? Math.max(120, Math.ceil(textOut.length / 4)),
+          source: 'design-architect',
+        });
+        if (textOut) return textOut;
+      } catch (err) {
+        const lower = extractReadableErrorMessage(err).toLowerCase();
+        if (isKeyFatalError(lower)) {
+          void recordGeminiApiError({
+            modelId: designerModel,
+            error: err,
+            source: 'design-architect',
+          });
+          return '';
+        }
+        // Silently advance to fallback designer model on 503/404/429
+      }
     }
+    return '';
   })();
 
   return Promise.race([generatePromise, timeoutPromise]);
@@ -597,16 +664,14 @@ export async function streamServerFreeAiRealTime(params: {
   }
 
   const parsedModel = parseGatewayModelIdentifier(params.requestedModel);
-  const matched =
-    GEMINI_BUILDER_MODELS.find(
-      (m) =>
-        m.id === params.requestedModel ||
-        m.upstreamModelId === parsedModel.upstreamModelId
-    ) ?? GEMINI_BUILDER_MODELS[0];
+  const flagshipModel = GEMINI_BUILDER_MODELS[0];
+  const failoverCandidates = getOrderedBackendGeminiFailoverModels(
+    parsedModel.upstreamModelId
+  );
 
   params.onModelMeta?.({
-    modelId: matched.id,
-    modelName: matched.name,
+    modelId: flagshipModel.id,
+    modelName: flagshipModel.name,
     provider: 'aicraft',
   });
 
@@ -637,63 +702,102 @@ export async function streamServerFreeAiRealTime(params: {
   userParts.push({ text: params.userPrompt });
   contents.push({ role: 'user', parts: userParts });
 
-  try {
-    const streamResponse = await ai.models.generateContentStream({
-      model: matched.upstreamModelId,
-      contents,
-      config: {
-        systemInstruction: params.systemPrompt,
-      },
-    });
+  let lastError: unknown = null;
+  let lastAttemptedUpstreamId = failoverCandidates[0]?.upstreamModelId || 'gemini-4-hydrogen';
 
+  for (const candidate of failoverCandidates) {
+    if (params.signal?.aborted) {
+      throw new Error('Request cancelled.');
+    }
+
+    lastAttemptedUpstreamId = candidate.upstreamModelId;
     let fullContent = '';
+    let emittedAnyChunk = false;
     let lastPromptTokens = 0;
     let lastCandidatesTokens = 0;
     let lastTotalTokens = 0;
 
-    for await (const chunk of streamResponse) {
-      if (params.signal?.aborted) break;
-      const c = chunk as GenerateContentResponse;
-      if (c.usageMetadata) {
-        lastPromptTokens = c.usageMetadata.promptTokenCount ?? lastPromptTokens;
-        lastCandidatesTokens = c.usageMetadata.candidatesTokenCount ?? lastCandidatesTokens;
-        lastTotalTokens = c.usageMetadata.totalTokenCount ?? lastTotalTokens;
+    try {
+      const streamResponse = await ai.models.generateContentStream({
+        model: candidate.upstreamModelId,
+        contents,
+        config: {
+          systemInstruction: params.systemPrompt,
+        },
+      });
+
+      for await (const chunk of streamResponse) {
+        if (params.signal?.aborted) break;
+        const c = chunk as GenerateContentResponse;
+        if (c.usageMetadata) {
+          lastPromptTokens = c.usageMetadata.promptTokenCount ?? lastPromptTokens;
+          lastCandidatesTokens = c.usageMetadata.candidatesTokenCount ?? lastCandidatesTokens;
+          lastTotalTokens = c.usageMetadata.totalTokenCount ?? lastTotalTokens;
+        }
+        const text = typeof c.text === 'string' ? c.text : '';
+        if (text) {
+          fullContent += text;
+          emittedAnyChunk = true;
+          params.onContentChunk(text);
+        }
       }
-      const text = typeof c.text === 'string' ? c.text : '';
-      if (text) {
-        fullContent += text;
-        params.onContentChunk(text);
+
+      if (!fullContent.trim()) {
+        throw new Error(`${candidate.label} returned an empty response.`);
       }
+
+      const fallbackEstimate = Math.max(
+        1,
+        Math.ceil((params.userPrompt.length + params.systemPrompt.length + fullContent.length) / 4)
+      );
+      await recordGeminiApiUsage({
+        modelId: candidate.upstreamModelId,
+        promptTokens:
+          lastPromptTokens || Math.ceil((params.userPrompt.length + params.systemPrompt.length) / 4),
+        candidatesTokens: lastCandidatesTokens || Math.ceil(fullContent.length / 4),
+        totalTokens: lastTotalTokens || fallbackEstimate,
+        source: 'craft-stream',
+      }).catch(() => undefined);
+
+      return {
+        rawOutput: fullContent,
+        modelUsed: flagshipModel.id,
+        modelName: flagshipModel.name,
+        provider: 'aicraft',
+      };
+    } catch (err) {
+      lastError = err;
+      const lower = extractReadableErrorMessage(err).toLowerCase();
+
+      if (isKeyFatalError(lower)) {
+        await recordGeminiApiError({
+          modelId: candidate.upstreamModelId,
+          error: err,
+          source: 'craft-stream',
+        }).catch(() => undefined);
+        throw new Error(formatGeminiApiError(err, flagshipModel.name));
+      }
+
+      // If this model hasn't streamed partial text to the client yet, silently advance
+      // to the next healthy Gemini model in the backend failover chain.
+      if (!emittedAnyChunk) {
+        const cooldownMs = isModelNotFoundError(lower) ? 15 * 60_000 : 45_000;
+        markGatewayCandidateCooldown(candidate.cooldownKey, cooldownMs);
+        continue;
+      }
+
+      // Partial output already streamed; surface clean formatted message
+      throw new Error(formatGeminiApiError(err, flagshipModel.name));
     }
-
-    if (!fullContent.trim()) {
-      throw new Error(`${matched.name} returned an empty response.`);
-    }
-
-    const fallbackEstimate = Math.max(
-      1,
-      Math.ceil((params.userPrompt.length + params.systemPrompt.length + fullContent.length) / 4)
-    );
-    await recordGeminiApiUsage({
-      modelId: matched.upstreamModelId,
-      promptTokens: lastPromptTokens || Math.ceil((params.userPrompt.length + params.systemPrompt.length) / 4),
-      candidatesTokens: lastCandidatesTokens || Math.ceil(fullContent.length / 4),
-      totalTokens: lastTotalTokens || fallbackEstimate,
-      source: 'craft-stream',
-    }).catch(() => undefined);
-
-    return {
-      rawOutput: fullContent,
-      modelUsed: matched.id,
-      modelName: matched.name,
-      provider: 'aicraft',
-    };
-  } catch (err) {
-    await recordGeminiApiError({
-      modelId: matched.upstreamModelId,
-      error: err,
-      source: 'craft-stream',
-    }).catch(() => undefined);
-    throw new Error(formatGeminiApiError(err, matched.name));
   }
+
+  // Only record global exhaustion if ALL models in the backend chain failed
+  if (lastError) {
+    await recordGeminiApiError({
+      modelId: lastAttemptedUpstreamId,
+      error: lastError,
+      source: 'craft-stream',
+    }).catch(() => undefined);
+  }
+  throw new Error(formatGeminiApiError(lastError, flagshipModel.name));
 }

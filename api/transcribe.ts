@@ -35,45 +35,57 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     const ai = createGeminiClient(geminiKey);
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-transcribe',
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType,
-              data: audioBase64,
-            },
+    const transcribeModels = ['gemini-2.5-flash', 'gemini-4-hydrogen', 'gemini-2.0-flash'];
+    let lastTranscribeErr: unknown = null;
+    for (const modelId of transcribeModels) {
+      try {
+        const response = await ai.models.generateContent({
+          model: modelId,
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType,
+                  data: audioBase64,
+                },
+              },
+              {
+                text: `Transcribe this audio cleanly into plain text${
+                  body.language ? ` (spoken language hint: ${body.language})` : ''
+                }. Return only the spoken words.`,
+              },
+            ],
           },
-          {
-            text: `Transcribe this audio cleanly into plain text${
-              body.language ? ` (spoken language hint: ${body.language})` : ''
-            }. Return only the spoken words.`,
-          },
-        ],
-      },
-    });
+        });
 
-    const text = (response.text || '').trim();
-    const usage = response.usageMetadata;
-    void recordGeminiApiUsage({
-      modelId: 'gemini-3.5-transcribe',
-      promptTokens: usage?.promptTokenCount,
-      candidatesTokens: usage?.candidatesTokenCount,
-      totalTokens: usage?.totalTokenCount ?? Math.max(50, Math.ceil(text.length / 4)),
-      source: 'transcribe',
-    });
-    if (!text) {
-      return Response.json(
-        { error: 'No speech detected in audio recording.' },
-        { status: 422 }
-      );
+        const text = (response.text || '').trim();
+        const usage = response.usageMetadata;
+        void recordGeminiApiUsage({
+          modelId,
+          promptTokens: usage?.promptTokenCount,
+          candidatesTokens: usage?.candidatesTokenCount,
+          totalTokens: usage?.totalTokenCount ?? Math.max(50, Math.ceil(text.length / 4)),
+          source: 'transcribe',
+        });
+        if (!text) {
+          return Response.json(
+            { error: 'No speech detected in audio recording.' },
+            { status: 422 }
+          );
+        }
+
+        return Response.json({ text });
+      } catch (err) {
+        lastTranscribeErr = err;
+      }
     }
 
-    return Response.json({ text });
+    throw lastTranscribeErr instanceof Error
+      ? lastTranscribeErr
+      : new Error('Unable to transcribe audio input.');
   } catch (err) {
     void recordGeminiApiError({
-      modelId: 'gemini-3.5-transcribe',
+      modelId: 'gemini-2.5-flash',
       error: err,
       source: 'transcribe',
     });

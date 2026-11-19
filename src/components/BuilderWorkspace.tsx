@@ -2202,16 +2202,26 @@ export function BuilderWorkspace({
                     <span>Restricted</span>
                   </span>
                 )}
-                <ModelSelectorPopover
-                  mode={mode}
-                  models={models}
-                  selectedModel={selectedModel}
-                  modelsLoading={modelsLoading}
-                  modelsError={modelsError}
-                  isStreaming={isStreaming}
-                  onSelectModel={onSelectModel}
-                  onRetryModels={onRetryModels}
-                />
+                {models.length > 1 ? (
+                  <ModelSelectorPopover
+                    mode={mode}
+                    models={models}
+                    selectedModel={selectedModel}
+                    modelsLoading={modelsLoading}
+                    modelsError={modelsError}
+                    isStreaming={isStreaming}
+                    onSelectModel={onSelectModel}
+                    onRetryModels={onRetryModels}
+                  />
+                ) : (
+                  <span
+                    className="inline-flex items-center gap-1.5 pr-1.5 text-[11px] font-medium text-[#71717A]"
+                    title="Automatic backend multi-model failover active"
+                  >
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                    <span>Auto</span>
+                  </span>
+                )}
               </div>
             </div>
 

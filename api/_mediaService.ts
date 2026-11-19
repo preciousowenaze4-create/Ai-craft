@@ -566,34 +566,32 @@ async function composeArrangementWithAi(
 
   const geminiKey = getServerGeminiApiKey();
   if (geminiKey) {
-    try {
-      const ai = createGeminiClient(geminiKey);
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: prompt,
-        config: {
-          systemInstruction: systemPrompt,
-          responseMimeType: 'application/json',
-        },
-      });
-      const outText = response.text || '';
-      const usage = response.usageMetadata;
-      void recordGeminiApiUsage({
-        modelId: 'gemini-4-hydrogen',
-        promptTokens: usage?.promptTokenCount,
-        candidatesTokens: usage?.candidatesTokenCount,
-        totalTokens: usage?.totalTokenCount ?? Math.max(80, Math.ceil((prompt.length + outText.length) / 4)),
-        source: 'media-plan',
-      });
-      const plan = parseAiPlan(outText);
-      if (plan) return plan;
-    } catch (err) {
-      void recordGeminiApiError({
-        modelId: 'gemini-4-hydrogen',
-        error: err,
-        source: 'media-plan',
-      });
-      // use deterministic prompt-seeded plan
+    const ai = createGeminiClient(geminiKey);
+    const plannerModels = ['gemini-4-hydrogen', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+    for (const modelId of plannerModels) {
+      try {
+        const response = await ai.models.generateContent({
+          model: modelId,
+          contents: prompt,
+          config: {
+            systemInstruction: systemPrompt,
+            responseMimeType: 'application/json',
+          },
+        });
+        const outText = response.text || '';
+        const usage = response.usageMetadata;
+        void recordGeminiApiUsage({
+          modelId,
+          promptTokens: usage?.promptTokenCount,
+          candidatesTokens: usage?.candidatesTokenCount,
+          totalTokens: usage?.totalTokenCount ?? Math.max(80, Math.ceil((prompt.length + outText.length) / 4)),
+          source: 'media-plan',
+        });
+        const plan = parseAiPlan(outText);
+        if (plan) return plan;
+      } catch {
+        // silently try next backend planner model
+      }
     }
   }
 

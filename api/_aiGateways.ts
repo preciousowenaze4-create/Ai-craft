@@ -58,10 +58,24 @@ export function hasServerFreeAiKey(): boolean {
   return Boolean(getServerGeminiApiKey());
 }
 
+export const BACKEND_GEMINI_FAILOVER_CHAIN: ReadonlyArray<{
+  upstreamModelId: string;
+  label: string;
+}> = [
+  { upstreamModelId: 'gemini-4-hydrogen', label: 'AI Craft Pro (4 Hydrogen)' },
+  { upstreamModelId: 'gemini-2.5-pro', label: 'AI Craft Pro Engine (2.5 Pro)' },
+  { upstreamModelId: 'gemini-2.5-flash', label: 'AI Craft 2.5 Flash' },
+  { upstreamModelId: 'gemini-3.1-pro-preview', label: 'AI Craft 3.1 Pro' },
+  { upstreamModelId: 'gemini-3.1-flash-lite-preview', label: 'AI Craft 3.1 Mini Preview' },
+  { upstreamModelId: 'gemini-3.1-flash-lite', label: 'AI Craft 3.1 Lite' },
+  { upstreamModelId: 'gemini-2.5-flash-lite', label: 'AI Craft 2.5 Lite' },
+  { upstreamModelId: 'gemini-2.0-flash', label: 'AI Craft 2.0 Flash' },
+];
+
 /**
- * Visible AI Craft builder lineup (5 user-facing models).
- * Gemini 2.5 Pro is dedicated to the hidden Backend Design Architect Engine.
- * All powered server-side by process.env.GEMINI_API_KEY.
+ * Visible AI Craft builder lineup (single unified flagship AI shown to users).
+ * All other Gemini models run automatically in the backend failover chain
+ * if the flagship model hits 503 high demand, 404, or rate limits.
  */
 export const GEMINI_BUILDER_MODELS: UnifiedAiModel[] = [
   {
@@ -72,56 +86,8 @@ export const GEMINI_BUILDER_MODELS: UnifiedAiModel[] = [
     provider: 'aicraft',
     contextLength: 1048576,
     isFree: true,
-    tierLabel: 'Latest · Fast',
+    tierLabel: 'Flagship · Auto',
     capabilities: ['Vision', 'Screenshots', 'Code', 'DB'],
-    category: 'code',
-  },
-  {
-    id: 'gemini::gemini-3.1-pro-preview',
-    upstreamModelId: 'gemini-3.1-pro-preview',
-    gateway: 'gemini',
-    name: 'AI Craft Pro (3.1)',
-    provider: 'aicraft',
-    contextLength: 1048576,
-    isFree: true,
-    tierLabel: 'Pro · Coding',
-    capabilities: ['Vision', 'Screenshots', 'Code', 'DB'],
-    category: 'code',
-  },
-  {
-    id: 'gemini::gemini-3.1-flash-lite',
-    upstreamModelId: 'gemini-3.1-flash-lite',
-    gateway: 'gemini',
-    name: 'AI Craft Mini (3.1)',
-    provider: 'aicraft',
-    contextLength: 1048576,
-    isFree: true,
-    tierLabel: 'Ultra Fast',
-    capabilities: ['Vision', 'Screenshots', 'Code', 'Fast'],
-    category: 'code',
-  },
-  {
-    id: 'gemini::gemini-2.5-flash',
-    upstreamModelId: 'gemini-2.5-flash',
-    gateway: 'gemini',
-    name: 'AI Craft 2.5 Flash',
-    provider: 'aicraft',
-    contextLength: 1048576,
-    isFree: true,
-    tierLabel: '2.5 · Flash',
-    capabilities: ['Vision', 'Screenshots', 'Code', 'Fast'],
-    category: 'code',
-  },
-  {
-    id: 'gemini::gemini-2.5-flash-preview-12-2025',
-    upstreamModelId: 'gemini-2.5-flash-preview-12-2025',
-    gateway: 'gemini',
-    name: 'AI Craft 2.5 Preview',
-    provider: 'aicraft',
-    contextLength: 1048576,
-    isFree: true,
-    tierLabel: 'Preview · Fast',
-    capabilities: ['Vision', 'Screenshots', 'Code', 'Fast'],
     category: 'code',
   },
 ];
@@ -160,6 +126,26 @@ export function isGatewayCandidateCoolingDown(cooldownKey: string): boolean {
   return true;
 }
 
+export function getOrderedBackendGeminiFailoverModels(
+  preferredUpstreamId?: string
+): Array<{ upstreamModelId: string; label: string; cooldownKey: string }> {
+  const base = [...BACKEND_GEMINI_FAILOVER_CHAIN];
+  if (preferredUpstreamId) {
+    const idx = base.findIndex((m) => m.upstreamModelId === preferredUpstreamId);
+    if (idx > 0) {
+      const [picked] = base.splice(idx, 1);
+      base.unshift(picked);
+    }
+  }
+  const withKeys = base.map((m) => ({
+    ...m,
+    cooldownKey: buildCandidateCooldownKey('gemini', '', m.upstreamModelId),
+  }));
+  const ready = withKeys.filter((m) => !isGatewayCandidateCoolingDown(m.cooldownKey));
+  const cooling = withKeys.filter((m) => isGatewayCandidateCoolingDown(m.cooldownKey));
+  return [...ready, ...cooling];
+}
+
 export function getGatewayOrder(): AiGatewayId[] {
   return ['gemini'];
 }
@@ -170,9 +156,12 @@ export function parseGatewayModelIdentifier(
   const raw = typeof modelId === 'string' ? modelId.trim() : '';
   const bare = raw.replace(/^gemini::/i, '').trim();
 
-  const matched = GEMINI_BUILDER_MODELS.find(
-    (m) => m.id === raw || m.upstreamModelId === bare
-  );
+  const matched =
+    GEMINI_BUILDER_MODELS.find(
+      (m) => m.id === raw || m.upstreamModelId === bare
+    ) ??
+    BACKEND_GEMINI_FAILOVER_CHAIN.find((m) => m.upstreamModelId === bare);
+
   if (matched) {
     return { gateway: 'gemini', upstreamModelId: matched.upstreamModelId };
   }
