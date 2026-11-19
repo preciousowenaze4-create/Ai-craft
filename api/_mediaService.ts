@@ -6,6 +6,10 @@ import {
 import { createGeminiClient } from './_realtimeEngine.js';
 import { runLiveBrowserSearch } from './_builderCore.js';
 import { isTextToSpeechModel } from './_openrouterModels.js';
+import {
+  recordGeminiApiError,
+  recordGeminiApiUsage,
+} from './_geminiUsage.js';
 
 export type MediaAssetKind = 'image' | 'music' | 'video';
 
@@ -572,9 +576,23 @@ async function composeArrangementWithAi(
           responseMimeType: 'application/json',
         },
       });
-      const plan = parseAiPlan(response.text || '');
+      const outText = response.text || '';
+      const usage = response.usageMetadata;
+      void recordGeminiApiUsage({
+        modelId: 'gemini-4-hydrogen',
+        promptTokens: usage?.promptTokenCount,
+        candidatesTokens: usage?.candidatesTokenCount,
+        totalTokens: usage?.totalTokenCount ?? Math.max(80, Math.ceil((prompt.length + outText.length) / 4)),
+        source: 'media-plan',
+      });
+      const plan = parseAiPlan(outText);
       if (plan) return plan;
-    } catch {
+    } catch (err) {
+      void recordGeminiApiError({
+        modelId: 'gemini-4-hydrogen',
+        error: err,
+        source: 'media-plan',
+      });
       // use deterministic prompt-seeded plan
     }
   }

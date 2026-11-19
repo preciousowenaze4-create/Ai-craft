@@ -35,6 +35,10 @@ import {
   getServerGeminiApiKey,
   parseGatewayModelIdentifier,
 } from './_aiGateways.js';
+import {
+  recordGeminiApiError,
+  recordGeminiApiUsage,
+} from './_geminiUsage.js';
 
 export function createGeminiClient(apiKey: string): GoogleGenAI {
   return new GoogleGenAI({
@@ -205,8 +209,22 @@ async function runBackendDesignArchitect(params: {
             'You are the internal UI/UX Design Architect inside AI Craft. Produce a crisp, practical visual design blueprint (colors, layout hierarchy, components, multi-screen structure) with zero HTML or code fences.',
         },
       });
-      return (response.text || '').trim().slice(0, 1400);
-    } catch {
+      const textOut = (response.text || '').trim().slice(0, 1400);
+      const usage = response.usageMetadata;
+      void recordGeminiApiUsage({
+        modelId: BACKEND_DESIGNER_MODEL_ID,
+        promptTokens: usage?.promptTokenCount,
+        candidatesTokens: usage?.candidatesTokenCount,
+        totalTokens: usage?.totalTokenCount ?? Math.max(120, Math.ceil(textOut.length / 4)),
+        source: 'design-architect',
+      });
+      return textOut;
+    } catch (err) {
+      void recordGeminiApiError({
+        modelId: BACKEND_DESIGNER_MODEL_ID,
+        error: err,
+        source: 'design-architect',
+      });
       return '';
     }
   })();
@@ -629,9 +647,18 @@ export async function streamServerFreeAiRealTime(params: {
     });
 
     let fullContent = '';
+    let lastPromptTokens = 0;
+    let lastCandidatesTokens = 0;
+    let lastTotalTokens = 0;
+
     for await (const chunk of streamResponse) {
       if (params.signal?.aborted) break;
       const c = chunk as GenerateContentResponse;
+      if (c.usageMetadata) {
+        lastPromptTokens = c.usageMetadata.promptTokenCount ?? lastPromptTokens;
+        lastCandidatesTokens = c.usageMetadata.candidatesTokenCount ?? lastCandidatesTokens;
+        lastTotalTokens = c.usageMetadata.totalTokenCount ?? lastTotalTokens;
+      }
       const text = typeof c.text === 'string' ? c.text : '';
       if (text) {
         fullContent += text;
@@ -643,6 +670,18 @@ export async function streamServerFreeAiRealTime(params: {
       throw new Error(`${matched.name} returned an empty response.`);
     }
 
+    const fallbackEstimate = Math.max(
+      1,
+      Math.ceil((params.userPrompt.length + params.systemPrompt.length + fullContent.length) / 4)
+    );
+    await recordGeminiApiUsage({
+      modelId: matched.upstreamModelId,
+      promptTokens: lastPromptTokens || Math.ceil((params.userPrompt.length + params.systemPrompt.length) / 4),
+      candidatesTokens: lastCandidatesTokens || Math.ceil(fullContent.length / 4),
+      totalTokens: lastTotalTokens || fallbackEstimate,
+      source: 'craft-stream',
+    }).catch(() => undefined);
+
     return {
       rawOutput: fullContent,
       modelUsed: matched.id,
@@ -650,6 +689,11 @@ export async function streamServerFreeAiRealTime(params: {
       provider: 'aicraft',
     };
   } catch (err) {
+    await recordGeminiApiError({
+      modelId: matched.upstreamModelId,
+      error: err,
+      source: 'craft-stream',
+    }).catch(() => undefined);
     throw new Error(formatGeminiApiError(err, matched.name));
   }
 }

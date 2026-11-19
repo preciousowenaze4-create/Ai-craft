@@ -1,5 +1,9 @@
 import { getServerGeminiApiKey } from './_aiGateways.js';
 import { createGeminiClient } from './_realtimeEngine.js';
+import {
+  recordGeminiApiError,
+  recordGeminiApiUsage,
+} from './_geminiUsage.js';
 
 export async function POST(request: Request): Promise<Response> {
   try {
@@ -51,6 +55,14 @@ export async function POST(request: Request): Promise<Response> {
     });
 
     const text = (response.text || '').trim();
+    const usage = response.usageMetadata;
+    void recordGeminiApiUsage({
+      modelId: 'gemini-3.5-transcribe',
+      promptTokens: usage?.promptTokenCount,
+      candidatesTokens: usage?.candidatesTokenCount,
+      totalTokens: usage?.totalTokenCount ?? Math.max(50, Math.ceil(text.length / 4)),
+      source: 'transcribe',
+    });
     if (!text) {
       return Response.json(
         { error: 'No speech detected in audio recording.' },
@@ -60,6 +72,11 @@ export async function POST(request: Request): Promise<Response> {
 
     return Response.json({ text });
   } catch (err) {
+    void recordGeminiApiError({
+      modelId: 'gemini-3.5-transcribe',
+      error: err,
+      source: 'transcribe',
+    });
     return Response.json(
       {
         error:

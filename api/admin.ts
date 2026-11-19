@@ -4,8 +4,12 @@ import {
   authenticateRequestForModeration,
   listAllRealSignedInUsers,
 } from './_moderation.js';
+import {
+  getGeminiApiUsageSnapshot,
+  updateOrResetGeminiQuota,
+} from './_geminiUsage.js';
 
-const VALID_ACTIONS: ModerationActionType[] = [
+const VALID_MODERATION_ACTIONS: ModerationActionType[] = [
   'ban',
   'unban',
   'verify',
@@ -29,11 +33,15 @@ export async function GET(request: Request): Promise<Response> {
     );
   }
 
-  const users = await listAllRealSignedInUsers();
+  const [users, geminiUsage] = await Promise.all([
+    listAllRealSignedInUsers(),
+    getGeminiApiUsageSnapshot(),
+  ]);
   return Response.json(
     {
       ok: true,
       users,
+      geminiUsage,
     },
     { headers: { 'Cache-Control': 'no-store' } }
   );
@@ -59,16 +67,35 @@ export async function POST(request: Request): Promise<Response> {
     email?: string;
     action?: string;
     reason?: string;
+    dailyRequestsLimit?: number;
+    dailyTokensLimit?: number;
+    overallTokensLimit?: number;
   };
 
-  const action =
-    typeof body.action === 'string'
-      ? (body.action.trim().toLowerCase() as ModerationActionType)
-      : ('' as ModerationActionType);
+  const rawAction =
+    typeof body.action === 'string' ? body.action.trim().toLowerCase() : '';
 
-  if (!VALID_ACTIONS.includes(action)) {
+  if (rawAction === 'reset_quota' || rawAction === 'set_quota_limit') {
+    const geminiUsage = await updateOrResetGeminiQuota({
+      resetUsagePool: rawAction === 'reset_quota',
+      dailyRequestsLimit: body.dailyRequestsLimit,
+      dailyTokensLimit: body.dailyTokensLimit,
+      overallTokensLimit: body.overallTokensLimit,
+    });
     return Response.json(
-      { error: 'Invalid moderation action.' },
+      {
+        ok: true,
+        geminiUsage,
+      },
+      { headers: { 'Cache-Control': 'no-store' } }
+    );
+  }
+
+  const action = rawAction as ModerationActionType;
+
+  if (!VALID_MODERATION_ACTIONS.includes(action)) {
+    return Response.json(
+      { error: 'Invalid admin action.' },
       { status: 400, headers: { 'Cache-Control': 'no-store' } }
     );
   }

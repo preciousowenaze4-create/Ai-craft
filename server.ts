@@ -98,6 +98,12 @@ import {
   streamServerFreeAiRealTime,
   type VisualHintsSpec,
 } from './api/_realtimeEngine.js';
+import {
+  getGeminiApiUsageSnapshot,
+  recordGeminiApiError,
+  recordGeminiApiUsage,
+  updateOrResetGeminiQuota,
+} from './api/_geminiUsage.js';
 import { handleMemoryRequest } from './api/_memoryHandler.js';
 import {
   getProjectMemory,
@@ -1066,8 +1072,11 @@ async function startServer() {
       res.status(403).json({ error: 'Forbidden.' });
       return;
     }
-    const users = await listAllRealSignedInUsers();
-    res.json({ ok: true, users });
+    const [users, geminiUsage] = await Promise.all([
+      listAllRealSignedInUsers(),
+      getGeminiApiUsageSnapshot(),
+    ]);
+    res.json({ ok: true, users, geminiUsage });
   });
 
   app.post('/api/admin', async (req, res) => {
@@ -1094,7 +1103,24 @@ async function startServer() {
       email?: string;
       action?: string;
       reason?: string;
+      dailyRequestsLimit?: number;
+      dailyTokensLimit?: number;
+      overallTokensLimit?: number;
     };
+    const rawAction =
+      typeof body.action === 'string' ? body.action.trim().toLowerCase() : '';
+
+    if (rawAction === 'reset_quota' || rawAction === 'set_quota_limit') {
+      const geminiUsage = await updateOrResetGeminiQuota({
+        resetUsagePool: rawAction === 'reset_quota',
+        dailyRequestsLimit: body.dailyRequestsLimit,
+        dailyTokensLimit: body.dailyTokensLimit,
+        overallTokensLimit: body.overallTokensLimit,
+      });
+      res.json({ ok: true, geminiUsage });
+      return;
+    }
+
     const validActions: ModerationActionType[] = [
       'ban',
       'unban',
@@ -1103,13 +1129,10 @@ async function startServer() {
       'restrict',
       'unrestrict',
     ];
-    const action =
-      typeof body.action === 'string'
-        ? (body.action.trim().toLowerCase() as ModerationActionType)
-        : ('' as ModerationActionType);
+    const action = rawAction as ModerationActionType;
 
     if (!validActions.includes(action)) {
-      res.status(400).json({ error: 'Invalid moderation action.' });
+      res.status(400).json({ error: 'Invalid admin action.' });
       return;
     }
 
@@ -1982,6 +2005,14 @@ async function startServer() {
       });
 
       const text = (response.text || '').trim();
+      const usage = response.usageMetadata;
+      void recordGeminiApiUsage({
+        modelId: 'gemini-3.5-transcribe',
+        promptTokens: usage?.promptTokenCount,
+        candidatesTokens: usage?.candidatesTokenCount,
+        totalTokens: usage?.totalTokenCount ?? Math.max(50, Math.ceil(text.length / 4)),
+        source: 'transcribe',
+      });
       if (!text) {
         res.status(422).json({ error: 'No speech detected in audio recording.' });
         return;
@@ -1989,6 +2020,11 @@ async function startServer() {
 
       res.json({ text });
     } catch (err) {
+      void recordGeminiApiError({
+        modelId: 'gemini-3.5-transcribe',
+        error: err,
+        source: 'transcribe',
+      });
       res.status(500).json({
         error: err instanceof Error ? err.message : 'Unable to process audio input.',
       });

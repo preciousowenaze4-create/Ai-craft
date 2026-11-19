@@ -4,11 +4,14 @@ import {
   BadgeCheck,
   Ban,
   CheckCircle2,
+  KeyRound,
   Loader2,
   RefreshCw,
+  RotateCcw,
   Search,
   ShieldAlert,
   ShieldCheck,
+  SlidersHorizontal,
   UserCheck,
   Users,
 } from 'lucide-react';
@@ -29,6 +32,34 @@ export interface ManagedUserItem {
   updatedAt: string;
 }
 
+export interface GeminiApiUsageSnapshot {
+  keyConfigured: boolean;
+  keyMask: string;
+  dailyDate: string;
+  dailyRequestsUsed: number;
+  dailyRequestsLimit: number;
+  dailyRequestsRemaining: number;
+  dailyTokensUsed: number;
+  dailyTokensLimit: number;
+  dailyTokensRemaining: number;
+  cycleRequestsUsed: number;
+  cycleTokensUsed: number;
+  overallTokensLimit: number;
+  overallTokensRemaining: number;
+  lifetimeRequestsUsed: number;
+  lifetimeTokensUsed: number;
+  dailyRemainingPercent: number;
+  overallRemainingPercent: number;
+  remainingPercent: number;
+  quotaExhausted: boolean;
+  exhaustedReason?: string;
+  lastErrorAt?: string;
+  lastUsageAt?: string;
+  lastModelId?: string;
+  status: 'healthy' | 'warning' | 'critical' | 'exhausted' | 'unconfigured';
+  updatedAt: string;
+}
+
 type AdminAction =
   | 'ban'
   | 'unban'
@@ -42,6 +73,18 @@ type StatusFilter = 'all' | 'active' | 'verified' | 'restricted' | 'banned';
 interface OwnerAdminPanelProps {
   authHeaders: Record<string, string>;
   currentUserId?: string;
+}
+
+function formatCompactCount(num: number): string {
+  const safe = Math.max(0, Math.round(Number.isFinite(num) ? num : 0));
+  if (safe >= 1_000_000) {
+    const m = safe / 1_000_000;
+    return `${m >= 10 ? m.toFixed(1) : m.toFixed(2).replace(/\.00$/, '')}M`;
+  }
+  if (safe >= 10_000) {
+    return `${(safe / 1_000).toFixed(1).replace(/\.0$/, '')}K`;
+  }
+  return safe.toLocaleString();
 }
 
 function formatRelativeTime(iso: string): string {
@@ -69,6 +112,7 @@ function formatProviderLabel(provider: string): string {
 
 export function OwnerAdminPanel({ authHeaders, currentUserId }: OwnerAdminPanelProps) {
   const [users, setUsers] = useState<ManagedUserItem[]>([]);
+  const [geminiUsage, setGeminiUsage] = useState<GeminiApiUsageSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -76,10 +120,14 @@ export function OwnerAdminPanel({ authHeaders, currentUserId }: OwnerAdminPanelP
   const [filter, setFilter] = useState<StatusFilter>('all');
   const [pendingKey, setPendingKey] = useState<string | null>(null);
 
-  const loadUsers = useCallback(
+  const [showLimitEditor, setShowLimitEditor] = useState(false);
+  const [quotaBusy, setQuotaBusy] = useState(false);
+  const [draftDailyLimit, setDraftDailyLimit] = useState('1500');
+  const [draftPoolLimit, setDraftPoolLimit] = useState('2000000');
+
+  const loadAdminData = useCallback(
     async (silent = false) => {
       if (!silent) setRefreshing(true);
-      setErrorMsg(null);
       try {
         const res = await fetch('/api/admin', {
           method: 'GET',
@@ -88,16 +136,23 @@ export function OwnerAdminPanel({ authHeaders, currentUserId }: OwnerAdminPanelP
         const data = (await res.json().catch(() => ({}))) as {
           ok?: boolean;
           users?: ManagedUserItem[];
+          geminiUsage?: GeminiApiUsageSnapshot;
           error?: string;
         };
         if (!res.ok || !Array.isArray(data.users)) {
-          throw new Error(data.error || 'Could not load signed-in users.');
+          throw new Error(data.error || 'Could not load admin dashboard.');
         }
         setUsers(data.users);
+        if (data.geminiUsage) {
+          setGeminiUsage(data.geminiUsage);
+        }
+        if (!silent) setErrorMsg(null);
       } catch (err) {
-        setErrorMsg(
-          err instanceof Error ? err.message : 'Unable to fetch signed-in users.'
-        );
+        if (!silent) {
+          setErrorMsg(
+            err instanceof Error ? err.message : 'Unable to fetch admin dashboard.'
+          );
+        }
       } finally {
         setLoading(false);
         setRefreshing(false);
@@ -107,8 +162,78 @@ export function OwnerAdminPanel({ authHeaders, currentUserId }: OwnerAdminPanelP
   );
 
   useEffect(() => {
-    void loadUsers(false);
-  }, [loadUsers]);
+    void loadAdminData(false);
+  }, [loadAdminData]);
+
+  // Live background sync so remaining Gemini API quota bar draws back in real time as users build
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void loadAdminData(true);
+      }
+    }, 3500);
+    const onFocus = () => void loadAdminData(true);
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [loadAdminData]);
+
+  useEffect(() => {
+    if (geminiUsage && !showLimitEditor) {
+      setDraftDailyLimit(String(geminiUsage.dailyRequestsLimit));
+      setDraftPoolLimit(String(geminiUsage.overallTokensLimit));
+    }
+  }, [geminiUsage, showLimitEditor]);
+
+  const handleQuotaAction = async (
+    action: 'reset_quota' | 'set_quota_limit',
+    overrides?: { dailyRequestsLimit?: number; overallTokensLimit?: number }
+  ) => {
+    if (quotaBusy) return;
+    setQuotaBusy(true);
+    setErrorMsg(null);
+    try {
+      const dailyNum = Number(overrides?.dailyRequestsLimit ?? draftDailyLimit);
+      const poolNum = Number(overrides?.overallTokensLimit ?? draftPoolLimit);
+      const payload =
+        action === 'reset_quota'
+          ? { action: 'reset_quota' }
+          : {
+              action: 'set_quota_limit',
+              dailyRequestsLimit:
+                Number.isFinite(dailyNum) && dailyNum >= 10 ? Math.round(dailyNum) : undefined,
+              overallTokensLimit:
+                Number.isFinite(poolNum) && poolNum >= 1000 ? Math.round(poolNum) : undefined,
+            };
+
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+        },
+        body: JSON.stringify(payload),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        geminiUsage?: GeminiApiUsageSnapshot;
+        error?: string;
+      };
+      if (!res.ok || !data.geminiUsage) {
+        throw new Error(data.error || 'Unable to update Gemini API quota.');
+      }
+      setGeminiUsage(data.geminiUsage);
+      if (action === 'set_quota_limit') {
+        setShowLimitEditor(false);
+      }
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Quota update failed.');
+    } finally {
+      setQuotaBusy(false);
+    }
+  };
 
   const handleAction = async (user: ManagedUserItem, action: AdminAction) => {
     const busyId = `${user.id}:${action}`;
@@ -179,8 +304,219 @@ export function OwnerAdminPanel({ authHeaders, currentUserId }: OwnerAdminPanelP
     });
   }, [users, filter, searchQuery]);
 
+  const quotaPct = geminiUsage ? Math.max(0, Math.min(100, geminiUsage.remainingPercent)) : 0;
+  const barColorClass = !geminiUsage?.keyConfigured
+    ? 'bg-zinc-400'
+    : geminiUsage.status === 'exhausted'
+      ? 'bg-red-600'
+      : geminiUsage.status === 'critical'
+        ? 'bg-gradient-to-r from-red-600 to-orange-500'
+        : geminiUsage.status === 'warning'
+          ? 'bg-gradient-to-r from-amber-500 to-amber-400'
+          : 'bg-gradient-to-r from-[#0D5BFF] to-[#2563EB]';
+
+  const statusBadge = !geminiUsage
+    ? { label: 'Loading', cls: 'bg-zinc-100 text-zinc-600', dot: 'bg-zinc-400' }
+    : !geminiUsage.keyConfigured
+      ? { label: 'Key Missing', cls: 'bg-zinc-100 text-zinc-700', dot: 'bg-zinc-400' }
+      : geminiUsage.status === 'exhausted'
+        ? { label: 'Exhausted', cls: 'bg-red-100 text-red-700', dot: 'bg-red-600' }
+        : geminiUsage.status === 'critical'
+          ? { label: 'Almost Out', cls: 'bg-orange-100 text-orange-800', dot: 'bg-orange-600 animate-pulse' }
+          : geminiUsage.status === 'warning'
+            ? { label: 'Running Low', cls: 'bg-amber-100 text-amber-800', dot: 'bg-amber-500' }
+            : { label: 'Live', cls: 'bg-emerald-100 text-emerald-800', dot: 'bg-emerald-500 animate-pulse' };
+
   return (
     <div className="flex-1 min-h-0 flex flex-col gap-2 overflow-hidden">
+      {/* Permanent Shared Gemini API Key Live Quota Bar ("Long Line") */}
+      <div className="rounded-[15px] border border-black/[0.08] bg-white px-3 py-2.5 shadow-[0_4px_16px_rgba(15,15,30,0.03)] shrink-0">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="w-7 h-7 rounded-lg bg-[#EEF4FF] text-[#0D5BFF] flex items-center justify-center shrink-0">
+              <KeyRound className="w-3.5 h-3.5" />
+            </span>
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <p className="font-display font-bold text-[12.5px] text-[#0B0B0F] truncate">
+                  Gemini API Key Pool
+                </p>
+                <span
+                  className={`inline-flex items-center gap-1 px-1.5 py-[1px] rounded-full text-[9.5px] font-semibold shrink-0 ${statusBadge.cls}`}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${statusBadge.dot}`} />
+                  {statusBadge.label}
+                </span>
+              </div>
+              <p className="text-[10px] text-[#71717A] tabular-nums truncate">
+                Key {geminiUsage?.keyMask ?? '••••'} · Shared across all users
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => setShowLimitEditor((v) => !v)}
+              className="h-6 px-2 rounded-full border border-black/10 text-[10px] font-semibold text-[#52525B] hover:text-[#0B0B0F] hover:bg-black/[0.03] inline-flex items-center gap-1 transition-colors"
+            >
+              <SlidersHorizontal className="w-2.5 h-2.5" />
+              <span>Limit</span>
+            </button>
+            <button
+              type="button"
+              disabled={quotaBusy}
+              onClick={() => void handleQuotaAction('reset_quota')}
+              title="Reset quota after recharging or upgrading your Gemini API key"
+              className="h-6 px-2 rounded-full bg-[#0B0B0F] text-white text-[10px] font-semibold hover:bg-black/85 active:scale-95 transition-all inline-flex items-center gap-1 disabled:opacity-50"
+            >
+              {quotaBusy ? (
+                <Loader2 className="w-2.5 h-2.5 animate-spin" />
+              ) : (
+                <RotateCcw className="w-2.5 h-2.5" />
+              )}
+              <span>Recharged</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Live Remaining Number + Full-Width Long Line */}
+        <div className="mt-2">
+          <div className="flex items-baseline justify-between gap-2 mb-1">
+            <div className="flex items-baseline gap-1.5 min-w-0">
+              <span className="font-display font-bold text-[15px] text-[#0B0B0F] tabular-nums leading-none">
+                {geminiUsage
+                  ? geminiUsage.dailyRequestsRemaining.toLocaleString()
+                  : '—'}
+              </span>
+              <span className="text-[10.5px] font-medium text-[#71717A] tabular-nums truncate">
+                / {geminiUsage ? geminiUsage.dailyRequestsLimit.toLocaleString() : '1,500'} daily reqs left
+              </span>
+            </div>
+
+            <div className="text-right shrink-0">
+              <span
+                className={`font-display font-bold text-[12.5px] tabular-nums ${
+                  geminiUsage?.status === 'exhausted' || quotaPct <= 15
+                    ? 'text-red-600'
+                    : geminiUsage?.status === 'warning'
+                      ? 'text-amber-600'
+                      : 'text-[#0D5BFF]'
+                }`}
+              >
+                {geminiUsage ? `${quotaPct.toFixed(1)}%` : '—'}
+              </span>
+              <span className="text-[10px] text-[#71717A] ml-1 tabular-nums">
+                ({geminiUsage ? formatCompactCount(geminiUsage.overallTokensRemaining) : '—'} pool left)
+              </span>
+            </div>
+          </div>
+
+          {/* Permanent Full-Width Long Line Drawing Back With Usage */}
+          <div
+            role="progressbar"
+            aria-label="Shared Gemini API key remaining quota"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(quotaPct)}
+            className="w-full h-3 rounded-full bg-[#ECEEF2] border border-black/[0.06] overflow-hidden"
+          >
+            <div
+              className={`h-full rounded-full transition-all duration-500 ease-out ${barColorClass}`}
+              style={{ width: `${quotaPct}%` }}
+            />
+          </div>
+
+          <div className="mt-1.5 flex items-center justify-between gap-2 text-[10px] text-[#71717A] tabular-nums">
+            <span className="truncate">
+              Today: {geminiUsage ? geminiUsage.dailyRequestsUsed.toLocaleString() : 0} calls ·{' '}
+              {geminiUsage ? formatCompactCount(geminiUsage.dailyTokensUsed) : '0'} tokens
+            </span>
+            <span className="shrink-0">
+              Pool: {geminiUsage ? formatCompactCount(geminiUsage.cycleTokensUsed) : '0'} /{' '}
+              {geminiUsage ? formatCompactCount(geminiUsage.overallTokensLimit) : '2M'} · All-time{' '}
+              {geminiUsage ? formatCompactCount(geminiUsage.lifetimeTokensUsed) : '0'}
+            </span>
+          </div>
+        </div>
+
+        {(geminiUsage?.quotaExhausted ||
+          (geminiUsage?.keyConfigured && quotaPct <= 15)) && (
+          <div
+            className={`mt-2 rounded-xl px-2.5 py-1.5 text-[10.5px] font-medium flex items-start gap-1.5 ${
+              geminiUsage.quotaExhausted
+                ? 'bg-red-50 border border-red-200 text-red-700'
+                : 'bg-amber-50 border border-amber-200 text-amber-800'
+            }`}
+          >
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-[1px]" />
+            <span>
+              {geminiUsage.quotaExhausted
+                ? geminiUsage.exhaustedReason ||
+                  'Gemini API limit finished — AI builds will stop for everyone until you recharge or upgrade GEMINI_API_KEY and tap Recharged.'
+                : 'Gemini free daily limit / token pool is almost finished. Recharge or upgrade GEMINI_API_KEY soon so users are not interrupted.'}
+            </span>
+          </div>
+        )}
+
+        {showLimitEditor && (
+          <div className="mt-2 pt-2 border-t border-black/[0.07] flex flex-col gap-1.5">
+            <div className="flex items-center gap-1 overflow-x-auto no-scrollbar">
+              {[
+                { label: 'Free (1.5k/day · 2M)', daily: '1500', pool: '2000000' },
+                { label: 'Tier 1 (10k/day · 20M)', daily: '10000', pool: '20000000' },
+                { label: 'Scale (50k/day · 100M)', daily: '50000', pool: '100000000' },
+              ].map((preset) => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  onClick={() => {
+                    setDraftDailyLimit(preset.daily);
+                    setDraftPoolLimit(preset.pool);
+                    void handleQuotaAction('set_quota_limit', {
+                      dailyRequestsLimit: Number(preset.daily),
+                      overallTokensLimit: Number(preset.pool),
+                    });
+                  }}
+                  className="h-6 px-2 rounded-full bg-[#F3F4F6] hover:bg-[#E5E7EB] text-[10px] font-semibold text-[#0B0B0F] whitespace-nowrap shrink-0"
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="grid grid-cols-[1fr_1fr_auto] gap-1.5 items-center">
+              <input
+                type="number"
+                min={10}
+                value={draftDailyLimit}
+                onChange={(e) => setDraftDailyLimit(e.target.value)}
+                aria-label="Daily request limit"
+                placeholder="Daily reqs"
+                className="h-7 px-2 rounded-lg bg-[#F5F5F7] border border-black/[0.07] text-[11px] text-[#0B0B0F] tabular-nums focus:outline-none focus:border-[#0D5BFF]"
+              />
+              <input
+                type="number"
+                min={1000}
+                value={draftPoolLimit}
+                onChange={(e) => setDraftPoolLimit(e.target.value)}
+                aria-label="Key token pool limit"
+                placeholder="Token pool"
+                className="h-7 px-2 rounded-lg bg-[#F5F5F7] border border-black/[0.07] text-[11px] text-[#0B0B0F] tabular-nums focus:outline-none focus:border-[#0D5BFF]"
+              />
+              <button
+                type="button"
+                disabled={quotaBusy}
+                onClick={() => void handleQuotaAction('set_quota_limit')}
+                className="h-7 px-2.5 rounded-lg bg-[#0D5BFF] text-white text-[10.5px] font-semibold hover:bg-[#094EE0] disabled:opacity-50"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* Owner Header Summary Card */}
       <div className="rounded-[15px] border border-black/[0.08] bg-white px-3 py-2.5 shadow-[0_4px_16px_rgba(15,15,30,0.03)] shrink-0">
         <div className="flex items-center justify-between gap-2">
@@ -200,9 +536,9 @@ export function OwnerAdminPanel({ authHeaders, currentUserId }: OwnerAdminPanelP
 
           <button
             type="button"
-            onClick={() => void loadUsers(false)}
+            onClick={() => void loadAdminData(false)}
             disabled={refreshing}
-            aria-label="Refresh users list"
+            aria-label="Refresh admin dashboard"
             className="w-8 h-8 rounded-full border border-black/12 text-[#52525B] hover:text-[#0B0B0F] hover:bg-black/[0.03] active:scale-95 transition-all flex items-center justify-center shrink-0 disabled:opacity-60"
           >
             {refreshing ? (
