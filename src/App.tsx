@@ -1182,7 +1182,7 @@ export default function App() {
         title?: string;
         slug?: string;
         customAppId?: string;
-        logo?: Record<string, string>;
+        logo?: Record<string, string> | null;
         forceBump?: boolean;
         secrets?: ProjectSecret[];
       }
@@ -1203,7 +1203,10 @@ export default function App() {
       const targetAppId = overrides?.customAppId
         ? slugifyAppTitle(overrides.customAppId)
         : proj.deployment?.appId || resolvedSlug;
-      const nextLogo = overrides?.logo ?? proj.deployment?.logo;
+      const nextLogo =
+        overrides?.logo === null
+          ? undefined
+          : (overrides?.logo ?? proj.deployment?.logo);
       const nextVersion = Math.max(1, (proj.deployment?.version ?? 0) + 1);
       const configuredOrigin = (
         import.meta.env.VITE_PUBLIC_APP_ORIGIN as string | undefined
@@ -1292,9 +1295,7 @@ export default function App() {
           const liveUrl = `${publicOrigin}${data.path}`;
           const finalAppId = data.appId || targetAppId;
           const finalSlug = data.slug || resolvedSlug;
-          const logoUrl = data.logoUrl
-            ? `${publicOrigin}${data.logoUrl}`
-            : `${publicOrigin}/app/${finalAppId}/icon-180.png?v=${typeof data.version === 'number' ? data.version : nextVersion}`;
+          const logoUrl = data.logoUrl ? `${publicOrigin}${data.logoUrl}` : undefined;
           const themeColor = data.themeColor || proj.deployment?.themeColor;
           const deployedAt = data.deployedAt || new Date().toISOString();
           const version =
@@ -2651,7 +2652,7 @@ export default function App() {
     if (!activeProject) return;
     if (isProjectWorking(activeProject)) return;
     if (
-      (activeProject.deployment?.liveUrl && activeProject.deployment?.logoUrl) ||
+      activeProject.deployment?.liveUrl ||
       activeProject.deployment?.livePublishing
     ) {
       return;

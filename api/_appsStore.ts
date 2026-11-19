@@ -211,6 +211,26 @@ export function filterPublicSafeEnv(
   return safe;
 }
 
+export function isAppLogoOrPwaEnabled(
+  record: Pick<PublishedAppRecord, 'html' | 'logo'>
+): boolean {
+  const logoObj = record.logo;
+  if (
+    logoObj &&
+    typeof logoObj === 'object' &&
+    Object.values(logoObj).some((v) => typeof v === 'string' && v.trim().length > 0)
+  ) {
+    return true;
+  }
+  const html = String(record.html || '');
+  return (
+    /<meta\b[^>]*name=["']aicraft-pwa["'][^>]*content=["']enabled["'][^>]*>/i.test(html) ||
+    /<meta\b[^>]*name=["']aicraft-logo["'][^>]*>/i.test(html) ||
+    /id=["']aicraft-app-icon["']/i.test(html) ||
+    /\[\[\s*LOGO\s*:/i.test(html)
+  );
+}
+
 export function getAppLogoConfig(record: PublishedAppRecord): AppLogoConfig {
   return extractAppLogoConfig({
     title: record.title,
@@ -328,11 +348,12 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
   let html = String(record.html || '').trim();
   if (!html) return '';
 
+  const pwaAndLogoEnabled = isAppLogoOrPwaEnabled(record);
   const logo = getAppLogoConfig(record);
   const v = Math.max(1, Number(record.version) || 1);
   const basePath = `/app/${record.appId}`;
 
-  // Strip any inherited or stale PWA icon/manifest tags so the app always uses its own generated logo & manifest
+  // Strip stale or unsolicited PWA icon/manifest tags so non-PWA apps stay clean web/app pages
   html = html
     .replace(/<link\b[^>]*rel=["'](?:manifest|apple-touch-icon|icon|shortcut icon)["'][^>]*>/gi, '')
     .replace(/<meta\b[^>]*name=["'](?:viewport|theme-color|mobile-web-app-capable|apple-mobile-web-app-capable|apple-mobile-web-app-status-bar-style|apple-mobile-web-app-title)["'][^>]*>/gi, '');
@@ -344,16 +365,31 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
     enabled: true,
     tables: Array.isArray(record.tables) ? record.tables : [],
   }).replace(/</g, '\\u003c');
-  const safePwaInfo = JSON.stringify({
-    appId: record.appId,
-    name: record.title,
-    shortName: logo.shortName,
-    themeColor: logo.themeColor,
-    backgroundColor: logo.backgroundColor,
-    logoUrl: `${basePath}/icon-180.png?v=${v}`,
-    svgLogoUrl: `${basePath}/icon.svg?v=${v}`,
-    manifestUrl: `${basePath}/manifest.webmanifest?v=${v}`,
-  }).replace(/</g, '\\u003c');
+  const safePwaInfo = JSON.stringify(
+    pwaAndLogoEnabled
+      ? {
+          enabled: true,
+          appId: record.appId,
+          name: record.title,
+          shortName: logo.shortName,
+          themeColor: logo.themeColor,
+          backgroundColor: logo.backgroundColor,
+          logoUrl: `${basePath}/icon-180.png?v=${v}`,
+          svgLogoUrl: `${basePath}/icon.svg?v=${v}`,
+          manifestUrl: `${basePath}/manifest.webmanifest?v=${v}`,
+        }
+      : {
+          enabled: false,
+          appId: record.appId,
+          name: record.title,
+          shortName: logo.shortName,
+          themeColor: logo.themeColor,
+          backgroundColor: logo.backgroundColor,
+          logoUrl: '',
+          svgLogoUrl: '',
+          manifestUrl: '',
+        }
+  ).replace(/</g, '\\u003c');
 
   const pwaBaseStyle = `<style id="aicraft-pwa-base">
   :root {
@@ -516,7 +552,7 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
     installListeners.forEach(function(fn) { try { fn(true); } catch (err) {} });
   });
 
-  if ('serviceWorker' in navigator) {
+  if (pwaInfo.enabled && 'serviceWorker' in navigator) {
     window.addEventListener('load', function() {
       navigator.serviceWorker
         .register('/app/' + encodeURIComponent(pwaInfo.appId) + '/sw.js', { scope: '/app/' + pwaInfo.appId })
@@ -648,18 +684,23 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
   const statusBarStyle = logo.isDark ? 'black-translucent' : 'default';
 
   const headAdditions: string[] = [
-    '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />',
-    `<meta name="theme-color" content="${logo.themeColor}" />`,
-    '<meta name="mobile-web-app-capable" content="yes" />',
-    '<meta name="apple-mobile-web-app-capable" content="yes" />',
-    `<meta name="apple-mobile-web-app-status-bar-style" content="${statusBarStyle}" />`,
-    `<meta name="apple-mobile-web-app-title" content="${safeShortName}" />`,
-    `<link rel="manifest" href="${basePath}/manifest.webmanifest?v=${v}" />`,
-    `<link rel="apple-touch-icon" sizes="180x180" href="${basePath}/icon-180.png?v=${v}" />`,
-    `<link rel="icon" type="image/png" sizes="192x192" href="${basePath}/icon-192.png?v=${v}" />`,
-    `<link rel="icon" type="image/png" sizes="32x32" href="${basePath}/icon-192.png?v=${v}" />`,
-    `<link rel="icon" type="image/svg+xml" href="${basePath}/icon.svg?v=${v}" />`,
+    '<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />',
   ];
+
+  if (pwaAndLogoEnabled) {
+    headAdditions.push(
+      `<meta name="theme-color" content="${logo.themeColor}" />`,
+      '<meta name="mobile-web-app-capable" content="yes" />',
+      '<meta name="apple-mobile-web-app-capable" content="yes" />',
+      `<meta name="apple-mobile-web-app-status-bar-style" content="${statusBarStyle}" />`,
+      `<meta name="apple-mobile-web-app-title" content="${safeShortName}" />`,
+      `<link rel="manifest" href="${basePath}/manifest.webmanifest?v=${v}" />`,
+      `<link rel="apple-touch-icon" sizes="180x180" href="${basePath}/icon-180.png?v=${v}" />`,
+      `<link rel="icon" type="image/png" sizes="192x192" href="${basePath}/icon-192.png?v=${v}" />`,
+      `<link rel="icon" type="image/png" sizes="32x32" href="${basePath}/icon-192.png?v=${v}" />`,
+      `<link rel="icon" type="image/svg+xml" href="${basePath}/icon.svg?v=${v}" />`
+    );
+  }
 
   if (!/<title\b[^>]*>/i.test(html)) {
     headAdditions.push(`<title>${safeTitle}</title>`);

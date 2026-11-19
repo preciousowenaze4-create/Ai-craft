@@ -5,6 +5,7 @@ import {
   buildStandaloneAppHtml,
   filterPublicSafeEnv,
   getAppLogoConfig,
+  isAppLogoOrPwaEnabled,
   loadPublishedApp,
   renderAppIconPng,
   renderAppIconSvg,
@@ -131,7 +132,8 @@ export async function GET(request: Request): Promise<Response> {
   }
 
   if (reqUrl.searchParams.get('format') === 'json') {
-    const logo = getAppLogoConfig(record);
+    const hasLogoOrPwa = isAppLogoOrPwaEnabled(record);
+    const logo = hasLogoOrPwa ? getAppLogoConfig(record) : null;
     return Response.json(
       {
         exists: true,
@@ -141,9 +143,13 @@ export async function GET(request: Request): Promise<Response> {
         slug: record.slug,
         mode: record.mode,
         version: record.version,
-        themeColor: logo.themeColor,
-        logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
-        manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
+        ...(hasLogoOrPwa && logo
+          ? {
+              themeColor: logo.themeColor,
+              logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
+              manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
+            }
+          : {}),
         updatedAt: record.updatedAt,
       },
       { headers: { 'Cache-Control': 'no-store' } }
@@ -262,7 +268,8 @@ export async function POST(request: Request): Promise<Response> {
     updatedAt: new Date().toISOString(),
   });
 
-  const logo = getAppLogoConfig(record);
+  const hasLogoOrPwa = isAppLogoOrPwaEnabled(record);
+  const logo = hasLogoOrPwa ? getAppLogoConfig(record) : null;
 
   return Response.json(
     {
@@ -270,9 +277,13 @@ export async function POST(request: Request): Promise<Response> {
       appId: record.appId,
       slug: record.slug,
       path: `/app/${record.appId}`,
-      logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
-      manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
-      themeColor: logo.themeColor,
+      ...(hasLogoOrPwa && logo
+        ? {
+            logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
+            manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
+            themeColor: logo.themeColor,
+          }
+        : {}),
       version: record.version,
       deployedAt: record.updatedAt,
     },

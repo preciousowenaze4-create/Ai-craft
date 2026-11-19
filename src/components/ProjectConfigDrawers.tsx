@@ -10,6 +10,8 @@ import {
   ExternalLink,
   Eye,
   EyeOff,
+  FileCode2,
+  FolderTree,
   KeyRound,
   Lightbulb,
   Loader2,
@@ -820,7 +822,31 @@ interface ProjectDatabaseModalProps {
   isStreaming: boolean;
   latestPreviewHtml: string;
   databaseConfig: ProjectDatabaseConfig;
+  secrets?: ProjectSecret[];
+  codeParts?: Array<{ id: string; label: string; content: string }>;
+  latestBuildFiles?: string[];
   onClose: () => void;
+}
+
+interface RealTimeBuiltFile {
+  path: string;
+  label: string;
+  content: string;
+  kind: 'code' | 'database' | 'screen';
+  lineCount: number;
+  bytes: number;
+}
+
+function extractScreenSectionHtml(fullHtml: string, screenId: string): string {
+  if (!fullHtml || !screenId) return '';
+  const escaped = screenId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const sectionRegex = new RegExp(
+    `<(?:section|div|main|article)\\b[^>]*(?:id|data-screen|data-view|data-tab|data-page)=["']${escaped}["'][^>]*>[\\s\\S]*?(?=<\\/(?:section|main|article)>|$)`,
+    'i'
+  );
+  const m = sectionRegex.exec(fullHtml);
+  if (!m) return '';
+  return m[0].trim();
 }
 
 export function ProjectDatabaseModal({
@@ -832,10 +858,18 @@ export function ProjectDatabaseModal({
   isStreaming,
   latestPreviewHtml,
   databaseConfig,
+  secrets = [],
+  codeParts = [],
+  latestBuildFiles = [],
   onClose,
 }: ProjectDatabaseModalProps) {
+  const [activeTab, setActiveTab] = useState<'database' | 'files'>('database');
   const [copiedSqlId, setCopiedSqlId] = useState<string | null>(null);
+  const [copiedFilePath, setCopiedFilePath] = useState<string | null>(null);
+  const [selectedFilePath, setSelectedFilePath] = useState<string>('index.html');
   const [collapsedTables, setCollapsedTables] = useState<Record<string, boolean>>({});
+  const [addingRowTable, setAddingRowTable] = useState<string | null>(null);
+  const [newRowDraft, setNewRowDraft] = useState<Record<string, string>>({});
   const [feedback, setFeedback] = useState<string | null>(null);
   const [dataRefreshTick, setDataRefreshTick] = useState(0);
 
@@ -848,8 +882,19 @@ export function ProjectDatabaseModal({
         setDataRefreshTick((n) => n + 1);
       }
     };
+    const handleStorage = () => {
+      setDataRefreshTick((n) => n + 1);
+    };
     window.addEventListener('aicraft:db-updated', handleDbUpdate);
-    return () => window.removeEventListener('aicraft:db-updated', handleDbUpdate);
+    window.addEventListener('storage', handleStorage);
+    const poll = window.setInterval(() => {
+      setDataRefreshTick((n) => n + 1);
+    }, 1000);
+    return () => {
+      window.removeEventListener('aicraft:db-updated', handleDbUpdate);
+      window.removeEventListener('storage', handleStorage);
+      window.clearInterval(poll);
+    };
   }, [open, projectId]);
 
   useEffect(() => {
@@ -861,6 +906,16 @@ export function ProjectDatabaseModal({
   const detected = useMemo(
     () => detectSchemaFromHtml(latestPreviewHtml),
     [latestPreviewHtml]
+  );
+
+  const hasSupabaseConfigured = useMemo(
+    () =>
+      secrets.some(
+        (s) =>
+          s.value.trim().length > 0 &&
+          (/supabase/i.test(s.key) || /^https:\/\/[a-z0-9-]+\.supabase\.co/i.test(s.value))
+      ),
+    [secrets]
   );
 
   const liveStoredMap = useMemo(() => {
@@ -941,7 +996,7 @@ export function ProjectDatabaseModal({
     for (const [tableName, store] of liveStoredMap.entries()) {
       const inferredCols: ProjectDatabaseColumn[] = [];
       const seenCols = new Set<string>();
-      for (const row of store.rows.slice(0, 10)) {
+      for (const row of store.rows.slice(0, 12)) {
         for (const [k, v] of Object.entries(row)) {
           const cleanCol = sanitizeTableName(k);
           if (!cleanCol || seenCols.has(cleanCol)) continue;
@@ -996,6 +1051,61 @@ export function ProjectDatabaseModal({
     return `CREATE TABLE IF NOT EXISTS ${table.name} (\n${colLines.join(',\n')}\n);`;
   };
 
+  const builtFiles = useMemo<RealTimeBuiltFile[]>(() => {
+    const list: RealTimeBuiltFile[] = [];
+    const seen = new Set<string>();
+    const pushFile = (path: string, content: string, kind: RealTimeBuiltFile['kind']) => {
+      if (!path || seen.has(path)) return;
+      seen.add(path);
+      const clean = content || '';
+      list.push({
+        path,
+        label: path,
+        content: clean,
+        kind,
+        lineCount: clean ? clean.split('\n').length : 0,
+        bytes: clean.length,
+      });
+    };
+
+    for (const part of codeParts) {
+      if (part.content) {
+        pushFile(part.id, part.content, 'code');
+      }
+    }
+
+    if (structuredTables.length > 0) {
+      const fullSql = structuredTables.map((t) => buildCreateSql(t)).join('\n\n');
+      pushFile('database/schema.sql', fullSql, 'database');
+
+      const snapshotObj: Record<string, Record<string, unknown>[]> = {};
+      for (const tbl of structuredTables) {
+        snapshotObj[tbl.name] = liveStoredMap.get(tbl.name)?.rows ?? [];
+      }
+      pushFile('database/records.json', JSON.stringify(snapshotObj, null, 2), 'database');
+    }
+
+    if (latestPreviewHtml) {
+      for (const rawPath of latestBuildFiles) {
+        if (!rawPath || seen.has(rawPath)) continue;
+        if (rawPath.startsWith('screens/')) {
+          const screenName = rawPath.replace(/^screens\//, '').replace(/\.html$/i, '');
+          const sectionCode = extractScreenSectionHtml(latestPreviewHtml, screenName);
+          if (sectionCode) {
+            pushFile(rawPath, sectionCode, 'screen');
+          }
+        }
+      }
+    }
+
+    return list;
+  }, [codeParts, structuredTables, liveStoredMap, latestPreviewHtml, latestBuildFiles]);
+
+  const activeFile = useMemo(
+    () => builtFiles.find((f) => f.path === selectedFilePath) || builtFiles[0] || null,
+    [builtFiles, selectedFilePath]
+  );
+
   const handleCopySql = async (table: ProjectDatabaseTable) => {
     try {
       await navigator.clipboard.writeText(buildCreateSql(table));
@@ -1003,6 +1113,70 @@ export function ProjectDatabaseModal({
       window.setTimeout(() => setCopiedSqlId(null), 1800);
     } catch {
       // ignore clipboard restriction
+    }
+  };
+
+  const handleCopyFile = async (file: RealTimeBuiltFile) => {
+    try {
+      await navigator.clipboard.writeText(file.content);
+      setCopiedFilePath(file.path);
+      window.setTimeout(() => setCopiedFilePath(null), 1800);
+    } catch {
+      // ignore clipboard restriction
+    }
+  };
+
+  const handleDeleteRow = (tableName: string, storageKey: string, rowId: unknown, rowIndex: number) => {
+    try {
+      const store = liveStoredMap.get(tableName);
+      if (!store) return;
+      const nextRows = store.rows.filter((r, idx) =>
+        rowId !== undefined && rowId !== null ? r.id !== rowId : idx !== rowIndex
+      );
+      window.localStorage.setItem(storageKey, JSON.stringify(nextRows));
+      setDataRefreshTick((n) => n + 1);
+      window.dispatchEvent(
+        new CustomEvent('aicraft:db-updated', { detail: { projectId, table: tableName } })
+      );
+      setFeedback(`Deleted record from "${tableName}".`);
+    } catch {
+      // ignore storage error
+    }
+  };
+
+  const handleInsertRow = (table: ProjectDatabaseTable) => {
+    const storageKey =
+      liveStoredMap.get(table.name)?.storageKey || `aicraft_db_${projectId}_${table.name}`;
+    try {
+      const existing = liveStoredMap.get(table.name)?.rows ?? [];
+      const row: Record<string, unknown> = {
+        id: `row_${Date.now().toString(36)}`,
+        created_at: new Date().toISOString(),
+      };
+      for (const col of table.columns) {
+        if (col.name === 'id' || col.name === 'created_at') continue;
+        const rawVal = (newRowDraft[col.name] ?? '').trim();
+        if (!rawVal) continue;
+        if (col.type === 'number') {
+          const num = Number(rawVal);
+          row[col.name] = Number.isFinite(num) ? num : 0;
+        } else if (col.type === 'boolean') {
+          row[col.name] = rawVal.toLowerCase() === 'true' || rawVal === '1';
+        } else {
+          row[col.name] = rawVal;
+        }
+      }
+      const nextRows = [row, ...existing];
+      window.localStorage.setItem(storageKey, JSON.stringify(nextRows));
+      setAddingRowTable(null);
+      setNewRowDraft({});
+      setDataRefreshTick((n) => n + 1);
+      window.dispatchEvent(
+        new CustomEvent('aicraft:db-updated', { detail: { projectId, table: table.name } })
+      );
+      setFeedback(`Added record to "${table.name}".`);
+    } catch {
+      // ignore storage error
     }
   };
 
@@ -1024,11 +1198,54 @@ export function ProjectDatabaseModal({
       open={open}
       onClose={onClose}
       mode={mode}
-      title="Database"
-      subtitle={`Real-time structured storage · ${projectTitle}`}
+      title="Database & Files"
+      subtitle={`Real-time app data & source files · ${projectTitle}`}
       icon={<Database className="w-[18px] h-[18px] text-[#6D4AFF]" />}
     >
       <div className="flex flex-col gap-3.5">
+        {/* Real-Time Database vs Files Option Tabs */}
+        <div
+          role="tablist"
+          aria-label="Inspector sections"
+          className="grid grid-cols-2 gap-1.5 p-1 rounded-2xl bg-[#F4F4F6] border border-black/[0.06]"
+        >
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'database'}
+            onClick={() => setActiveTab('database')}
+            className={`min-h-[38px] px-3 rounded-xl text-[12.5px] font-semibold flex items-center justify-center gap-1.5 transition-all ${
+              activeTab === 'database'
+                ? 'bg-white text-[#0B0B0F] shadow-[0_1px_4px_rgba(11,11,15,0.08)]'
+                : 'text-[#52525B] hover:text-[#0B0B0F]'
+            }`}
+          >
+            <Database className="w-3.5 h-3.5 text-[#6D4AFF] shrink-0" />
+            <span>Database</span>
+            <span className="text-[11px] font-mono text-[#71717A] tabular-nums">
+              ({structuredTables.length})
+            </span>
+          </button>
+
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'files'}
+            onClick={() => setActiveTab('files')}
+            className={`min-h-[38px] px-3 rounded-xl text-[12.5px] font-semibold flex items-center justify-center gap-1.5 transition-all ${
+              activeTab === 'files'
+                ? 'bg-white text-[#0B0B0F] shadow-[0_1px_4px_rgba(11,11,15,0.08)]'
+                : 'text-[#52525B] hover:text-[#0B0B0F]'
+            }`}
+          >
+            <FolderTree className="w-3.5 h-3.5 text-[#6D4AFF] shrink-0" />
+            <span>Files</span>
+            <span className="text-[11px] font-mono text-[#71717A] tabular-nums">
+              ({builtFiles.length})
+            </span>
+          </button>
+        </div>
+
         {feedback && (
           <p
             role="status"
@@ -1038,28 +1255,300 @@ export function ProjectDatabaseModal({
           </p>
         )}
 
-        {structuredTables.length === 0 ? (
+        {activeTab === 'database' ? (
+          structuredTables.length === 0 ? (
+            <div className="py-8 px-5 rounded-2xl bg-[#FAFAFC] border border-black/[0.06] text-center flex flex-col items-center gap-2.5">
+              <div className="w-11 h-11 rounded-2xl bg-[#F3F0FF] text-[#6D4AFF] flex items-center justify-center">
+                <Database className="w-5 h-5" />
+              </div>
+              <p className="text-[14px] font-semibold text-[#0B0B0F]">
+                {isStreaming
+                  ? 'Designing database tables...'
+                  : 'No database built yet'}
+              </p>
+              <p className="text-[12.5px] text-[#71717A] leading-relaxed max-w-[320px]">
+                {isStreaming
+                  ? 'As AI Craft engineers your app, structured tables, columns, and starter records appear here in real time.'
+                  : hasBuiltApp
+                    ? 'This app does not define structured tables yet. Ask the AI to store real data (users, items, bookings, messages) and tables appear here live.'
+                    : 'Ask AI Craft to build an app first. Every table and record the AI builds streams here in real time.'}
+              </p>
+            </div>
+          ) : (
+            <>
+              {/* Live Database Connection & Summary Bar */}
+              <div className="flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-2xl bg-[#FAFAFC] border border-black/[0.06]">
+                <div className="min-w-0 flex flex-col gap-0.5">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span
+                      aria-hidden="true"
+                      className={`w-2 h-2 rounded-full shrink-0 ${
+                        isStreaming ? 'bg-[#6D4AFF] animate-pulse' : 'bg-emerald-500'
+                      }`}
+                    />
+                    <span className="text-[12.5px] font-semibold text-[#0B0B0F] tabular-nums truncate">
+                      {structuredTables.length}{' '}
+                      {structuredTables.length === 1 ? 'table' : 'tables'} ·{' '}
+                      {totalLiveRows} {totalLiveRows === 1 ? 'record' : 'records'}
+                    </span>
+                  </div>
+                  <span className="text-[11px] text-[#71717A] truncate pl-4">
+                    {hasSupabaseConfigured
+                      ? 'Connected to Supabase Secret + Live App DB'
+                      : 'Live App DB synced with Preview'}
+                  </span>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setDataRefreshTick((n) => n + 1)}
+                  className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg border border-black/[0.08] bg-white hover:bg-black/[0.03] text-[12px] font-medium text-[#3F3F46] active:scale-95 transition-all shrink-0"
+                >
+                  <RefreshCw className="w-3.5 h-3.5 text-[#6D4AFF]" />
+                  <span>Sync</span>
+                </button>
+              </div>
+
+              {/* Structured Database Tables */}
+              <div className="flex flex-col gap-3">
+                {structuredTables.map((table) => {
+                  const store = liveStoredMap.get(table.name);
+                  const storageKey = store?.storageKey || `aicraft_db_${projectId}_${table.name}`;
+                  const rows = store?.rows ?? [];
+                  const isCollapsed = Boolean(collapsedTables[table.name]);
+                  const isAdding = addingRowTable === table.name;
+                  const editableCols = table.columns.filter(
+                    (c) => c.name !== 'id' && c.name !== 'created_at'
+                  );
+
+                  return (
+                    <div
+                      key={table.id}
+                      className="rounded-2xl border border-black/[0.08] bg-white overflow-hidden"
+                    >
+                      <div className="px-3.5 py-2.5 bg-[#FAFAFC] border-b border-black/[0.06] flex items-center justify-between gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setCollapsedTables((prev) => ({
+                              ...prev,
+                              [table.name]: !prev[table.name],
+                            }))
+                          }
+                          className="flex items-center gap-2 min-w-0 text-left flex-1"
+                        >
+                          {isCollapsed ? (
+                            <ChevronRight className="w-4 h-4 text-[#71717A] shrink-0" />
+                          ) : (
+                            <ChevronDown className="w-4 h-4 text-[#71717A] shrink-0" />
+                          )}
+                          <span className="font-mono text-[13px] font-semibold text-[#0B0B0F] truncate">
+                            {table.name}
+                          </span>
+                          <span className="text-[11.5px] text-[#71717A] tabular-nums whitespace-nowrap">
+                            {table.columns.length} cols · {rows.length}{' '}
+                            {rows.length === 1 ? 'row' : 'rows'}
+                          </span>
+                        </button>
+
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAddingRowTable(isAdding ? null : table.name);
+                              setNewRowDraft({});
+                            }}
+                            className="h-7 px-2 rounded-lg border border-black/[0.08] bg-white text-[11px] font-medium text-[#6D4AFF] hover:bg-[#F3F0FF] flex items-center gap-1"
+                          >
+                            <Plus className="w-3 h-3" />
+                            <span>Row</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => void handleCopySql(table)}
+                            className="h-7 px-2 rounded-lg border border-black/[0.08] bg-white text-[11px] font-medium text-[#3F3F46] hover:bg-black/[0.03] flex items-center gap-1"
+                          >
+                            {copiedSqlId === table.id ? (
+                              <>
+                                <Check className="w-3 h-3 text-[#6D4AFF]" />
+                                <span>SQL</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3 h-3" />
+                                <span>SQL</span>
+                              </>
+                            )}
+                          </button>
+
+                          {rows.length > 0 && store && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleClearTableRows(table.name, storageKey)
+                              }
+                              aria-label={`Clear ${table.name} records`}
+                              className="h-7 px-2 rounded-lg text-[11px] font-medium text-red-600 hover:bg-red-50"
+                            >
+                              Clear
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {!isCollapsed && (
+                        <div className="flex flex-col divide-y divide-black/[0.06]">
+                          {/* Columns Structure */}
+                          <div className="p-3 bg-white">
+                            <div className="flex flex-wrap gap-1.5">
+                              {table.columns.map((col) => (
+                                <div
+                                  key={`${table.name}-${col.name}`}
+                                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#F7F7FA] border border-black/[0.06]"
+                                >
+                                  <span className="font-mono text-[11.5px] font-medium text-[#0B0B0F]">
+                                    {col.name}
+                                  </span>
+                                  <span className="text-[10.5px] font-mono text-[#6D4AFF]">
+                                    {col.type}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* Inline Quick Insert Form */}
+                          {isAdding && (
+                            <div className="p-3 bg-[#FAFAFC] flex flex-col gap-2">
+                              <span className="text-[11.5px] font-semibold text-[#0B0B0F]">
+                                Add record to {table.name}
+                              </span>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                {(editableCols.length > 0
+                                  ? editableCols.slice(0, 6)
+                                  : [{ name: 'title', type: 'text' as const }]
+                                ).map((col) => (
+                                  <input
+                                    key={col.name}
+                                    type="text"
+                                    value={newRowDraft[col.name] ?? ''}
+                                    onChange={(e) =>
+                                      setNewRowDraft((prev) => ({
+                                        ...prev,
+                                        [col.name]: e.target.value,
+                                      }))
+                                    }
+                                    placeholder={`${col.name} (${col.type})`}
+                                    className="h-8 px-2.5 rounded-lg border border-black/[0.1] bg-white text-[12px] font-mono text-[#0B0B0F] focus:outline-none focus:ring-2 focus:ring-[#6D4AFF]/30"
+                                  />
+                                ))}
+                              </div>
+                              <div className="flex items-center justify-end gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setAddingRowTable(null)}
+                                  className="h-7 px-2.5 rounded-lg text-[11.5px] font-medium text-[#52525B] hover:bg-black/[0.04]"
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleInsertRow(table)}
+                                  className="h-7 px-3 rounded-lg bg-[#6D4AFF] text-white text-[11.5px] font-semibold hover:bg-[#5B35F0]"
+                                >
+                                  Save Row
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Live Records Table */}
+                          {rows.length > 0 ? (
+                            <div className="max-h-48 overflow-auto bg-white">
+                              <table className="w-full text-left border-collapse text-[11.5px] font-mono">
+                                <thead className="bg-[#FAFAFC] text-[#52525B] sticky top-0 border-b border-black/[0.06]">
+                                  <tr>
+                                    {table.columns.slice(0, 5).map((col) => (
+                                      <th
+                                        key={col.name}
+                                        className="px-3 py-1.5 font-semibold whitespace-nowrap"
+                                      >
+                                        {col.name}
+                                      </th>
+                                    ))}
+                                    <th className="px-2 py-1.5 w-8" />
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-black/[0.05] text-[#18181B]">
+                                  {rows.slice(0, 20).map((row, idx) => (
+                                    <tr key={String(row.id ?? idx)} className="hover:bg-[#FAFAFC]">
+                                      {table.columns.slice(0, 5).map((col) => {
+                                        const rawCell = row[col.name];
+                                        const cellStr =
+                                          rawCell === null || rawCell === undefined
+                                            ? '—'
+                                            : typeof rawCell === 'object'
+                                              ? JSON.stringify(rawCell)
+                                              : String(rawCell);
+                                        return (
+                                          <td
+                                            key={col.name}
+                                            className="px-3 py-1.5 max-w-[140px] truncate"
+                                            title={cellStr}
+                                          >
+                                            {cellStr}
+                                          </td>
+                                        );
+                                      })}
+                                      <td className="px-2 py-1 text-right">
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            handleDeleteRow(table.name, storageKey, row.id, idx)
+                                          }
+                                          aria-label={`Delete row ${idx + 1}`}
+                                          className="p-1 rounded text-[#71717A] hover:text-red-600 hover:bg-red-50"
+                                        >
+                                          <Trash2 className="w-3 h-3" />
+                                        </button>
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          ) : (
+                            <p className="px-3.5 py-2.5 text-[11.5px] text-[#71717A]">
+                              Schema ready — tap + Row above or interact in Preview to store live records.
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )
+        ) : builtFiles.length === 0 ? (
           <div className="py-8 px-5 rounded-2xl bg-[#FAFAFC] border border-black/[0.06] text-center flex flex-col items-center gap-2.5">
             <div className="w-11 h-11 rounded-2xl bg-[#F3F0FF] text-[#6D4AFF] flex items-center justify-center">
-              <Database className="w-5 h-5" />
+              <FileCode2 className="w-5 h-5" />
             </div>
             <p className="text-[14px] font-semibold text-[#0B0B0F]">
-              {isStreaming
-                ? 'Listening for database tables...'
-                : 'No database built yet'}
+              {isStreaming ? 'Writing files in real time...' : 'No built files yet'}
             </p>
             <p className="text-[12.5px] text-[#71717A] leading-relaxed max-w-[320px]">
               {isStreaming
-                ? 'As AI Craft designs your app, structured tables and live records will appear here automatically in real time.'
-                : hasBuiltApp
-                  ? 'This app does not store structured tables yet. Ask the AI to add persistent data (like profiles, posts, orders, or saved items) and it will structure tables here automatically.'
-                  : 'Ask AI Craft to build an app first. Any database tables created for your app will structure and update here automatically in real time.'}
+                ? 'Source files (index.html, styles.css, app.js, database/schema.sql) stream here live as AI Craft builds.'
+                : 'Ask AI Craft to build an app first. All generated HTML, CSS, JavaScript, screen modules, and SQL schemas appear here.'}
             </p>
           </div>
         ) : (
-          <>
-            {/* Live Summary Bar */}
-            <div className="flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-2xl bg-[#FAFAFC] border border-black/[0.06]">
+          <div className="flex flex-col gap-3">
+            {/* Live File Status Bar */}
+            <div className="flex items-center justify-between gap-2 px-3.5 py-2 rounded-2xl bg-[#FAFAFC] border border-black/[0.06]">
               <div className="flex items-center gap-2 min-w-0">
                 <span
                   aria-hidden="true"
@@ -1067,169 +1556,73 @@ export function ProjectDatabaseModal({
                     isStreaming ? 'bg-[#6D4AFF] animate-pulse' : 'bg-emerald-500'
                   }`}
                 />
-                <span className="text-[12.5px] font-semibold text-[#0B0B0F] tabular-nums truncate">
-                  {structuredTables.length}{' '}
-                  {structuredTables.length === 1 ? 'table' : 'tables'} ·{' '}
-                  {totalLiveRows} {totalLiveRows === 1 ? 'record' : 'records'}
+                <span className="text-[12px] font-semibold text-[#0B0B0F] truncate">
+                  {builtFiles.length} {builtFiles.length === 1 ? 'file' : 'files'} ·{' '}
+                  {isStreaming ? 'Writing live...' : 'Synced'}
                 </span>
               </div>
-
-              <button
-                type="button"
-                onClick={() => setDataRefreshTick((n) => n + 1)}
-                className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg border border-black/[0.08] bg-white hover:bg-black/[0.03] text-[12px] font-medium text-[#3F3F46] active:scale-95 transition-all shrink-0"
-              >
-                <RefreshCw className="w-3.5 h-3.5 text-[#6D4AFF]" />
-                <span>Refresh</span>
-              </button>
+              {activeFile && (
+                <button
+                  type="button"
+                  onClick={() => void handleCopyFile(activeFile)}
+                  className="inline-flex items-center gap-1 h-7 px-2.5 rounded-lg border border-black/[0.08] bg-white hover:bg-black/[0.03] text-[11.5px] font-medium text-[#0B0B0F]"
+                >
+                  {copiedFilePath === activeFile.path ? (
+                    <>
+                      <Check className="w-3 h-3 text-emerald-600" />
+                      <span>Copied</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3 h-3" />
+                      <span>Copy file</span>
+                    </>
+                  )}
+                </button>
+              )}
             </div>
 
-            {/* Structured Database Tables */}
-            <div className="flex flex-col gap-3">
-              {structuredTables.map((table) => {
-                const store = liveStoredMap.get(table.name);
-                const rows = store?.rows ?? [];
-                const isCollapsed = Boolean(collapsedTables[table.name]);
-
+            {/* File Selector Strip */}
+            <div className="flex flex-wrap gap-1.5">
+              {builtFiles.map((file) => {
+                const isSelected = activeFile?.path === file.path;
                 return (
-                  <div
-                    key={table.id}
-                    className="rounded-2xl border border-black/[0.08] bg-white overflow-hidden"
+                  <button
+                    key={file.path}
+                    type="button"
+                    onClick={() => setSelectedFilePath(file.path)}
+                    className={`px-2.5 py-1.5 rounded-xl border text-[11.5px] font-mono font-medium inline-flex items-center gap-1.5 transition-all ${
+                      isSelected
+                        ? 'bg-[#0B0B0F] text-white border-[#0B0B0F]'
+                        : 'bg-white text-[#3F3F46] border-black/[0.08] hover:bg-[#FAFAFC]'
+                    }`}
                   >
-                    <div className="px-3.5 py-2.5 bg-[#FAFAFC] border-b border-black/[0.06] flex items-center justify-between gap-2">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setCollapsedTables((prev) => ({
-                            ...prev,
-                            [table.name]: !prev[table.name],
-                          }))
-                        }
-                        className="flex items-center gap-2 min-w-0 text-left flex-1"
-                      >
-                        {isCollapsed ? (
-                          <ChevronRight className="w-4 h-4 text-[#71717A] shrink-0" />
-                        ) : (
-                          <ChevronDown className="w-4 h-4 text-[#71717A] shrink-0" />
-                        )}
-                        <span className="font-mono text-[13px] font-semibold text-[#0B0B0F] truncate">
-                          {table.name}
-                        </span>
-                        <span className="text-[11.5px] text-[#71717A] tabular-nums whitespace-nowrap">
-                          {table.columns.length} cols · {rows.length}{' '}
-                          {rows.length === 1 ? 'row' : 'rows'}
-                        </span>
-                      </button>
-
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => void handleCopySql(table)}
-                          className="h-7 px-2 rounded-lg border border-black/[0.08] bg-white text-[11px] font-medium text-[#3F3F46] hover:bg-black/[0.03] flex items-center gap-1"
-                        >
-                          {copiedSqlId === table.id ? (
-                            <>
-                              <Check className="w-3 h-3 text-[#6D4AFF]" />
-                              <span>SQL</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy className="w-3 h-3" />
-                              <span>SQL</span>
-                            </>
-                          )}
-                        </button>
-
-                        {rows.length > 0 && store && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleClearTableRows(table.name, store.storageKey)
-                            }
-                            aria-label={`Clear ${table.name} records`}
-                            className="h-7 px-2 rounded-lg text-[11px] font-medium text-red-600 hover:bg-red-50"
-                          >
-                            Clear
-                          </button>
-                        )}
-                      </div>
-                    </div>
-
-                    {!isCollapsed && (
-                      <div className="flex flex-col divide-y divide-black/[0.06]">
-                        {/* Columns Structure */}
-                        <div className="p-3 bg-white">
-                          <div className="flex flex-wrap gap-1.5">
-                            {table.columns.map((col) => (
-                              <div
-                                key={`${table.name}-${col.name}`}
-                                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#F7F7FA] border border-black/[0.06]"
-                              >
-                                <span className="font-mono text-[11.5px] font-medium text-[#0B0B0F]">
-                                  {col.name}
-                                </span>
-                                <span className="text-[10.5px] font-mono text-[#6D4AFF]">
-                                  {col.type}
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-
-                        {/* Live Records Preview */}
-                        {rows.length > 0 ? (
-                          <div className="max-h-44 overflow-auto bg-white">
-                            <table className="w-full text-left border-collapse text-[11.5px] font-mono">
-                              <thead className="bg-[#FAFAFC] text-[#52525B] sticky top-0 border-b border-black/[0.06]">
-                                <tr>
-                                  {table.columns.slice(0, 5).map((col) => (
-                                    <th
-                                      key={col.name}
-                                      className="px-3 py-1.5 font-semibold whitespace-nowrap"
-                                    >
-                                      {col.name}
-                                    </th>
-                                  ))}
-                                </tr>
-                              </thead>
-                              <tbody className="divide-y divide-black/[0.05] text-[#18181B]">
-                                {rows.slice(0, 12).map((row, idx) => (
-                                  <tr key={String(row.id ?? idx)}>
-                                    {table.columns.slice(0, 5).map((col) => {
-                                      const rawCell = row[col.name];
-                                      const cellStr =
-                                        rawCell === null || rawCell === undefined
-                                          ? '—'
-                                          : typeof rawCell === 'object'
-                                            ? JSON.stringify(rawCell)
-                                            : String(rawCell);
-                                      return (
-                                        <td
-                                          key={col.name}
-                                          className="px-3 py-1.5 max-w-[140px] truncate"
-                                          title={cellStr}
-                                        >
-                                          {cellStr}
-                                        </td>
-                                      );
-                                    })}
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        ) : (
-                          <p className="px-3.5 py-2.5 text-[11.5px] text-[#71717A]">
-                            Table ready — live records saved by this app in Preview appear here automatically.
-                          </p>
-                        )}
-                      </div>
+                    {file.kind === 'database' ? (
+                      <Database className="w-3 h-3 shrink-0 text-[#8B5CF6]" />
+                    ) : (
+                      <Code2 className="w-3 h-3 shrink-0 text-[#8B5CF6]" />
                     )}
-                  </div>
+                    <span>{file.label}</span>
+                  </button>
                 );
               })}
             </div>
-          </>
+
+            {/* Live File Content Viewer */}
+            {activeFile && (
+              <div className="rounded-2xl border border-black/[0.08] bg-[#111118] text-[#E4E4E7] overflow-hidden">
+                <div className="px-3.5 py-2 bg-[#1A1A24] border-b border-white/10 flex items-center justify-between text-[11px] font-mono text-[#A1A1AA]">
+                  <span className="truncate">{activeFile.path}</span>
+                  <span className="tabular-nums shrink-0">
+                    {activeFile.lineCount} lines · {(activeFile.bytes / 1024).toFixed(1)} KB
+                  </span>
+                </div>
+                <pre className="p-3.5 text-[11.5px] leading-relaxed font-mono overflow-auto max-h-[300px] whitespace-pre">
+                  {activeFile.content}
+                </pre>
+              </div>
+            )}
+          </div>
         )}
       </div>
     </DrawerShell>

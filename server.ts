@@ -44,6 +44,7 @@ import {
   extractLogoDirectiveFromRaw,
   filterPublicSafeEnv,
   getAppLogoConfig,
+  isAppLogoOrPwaEnabled,
   loadPublishedApp,
   renderAppIconPng,
   renderAppIconSvg,
@@ -1679,7 +1680,8 @@ async function startServer() {
       return;
     }
     if (req.query.format === 'json') {
-      const logo = getAppLogoConfig(record);
+      const hasLogoOrPwa = isAppLogoOrPwaEnabled(record);
+      const logo = hasLogoOrPwa ? getAppLogoConfig(record) : null;
       res.setHeader('Cache-Control', 'no-store');
       res.json({
         exists: true,
@@ -1689,9 +1691,13 @@ async function startServer() {
         slug: record.slug,
         mode: record.mode,
         version: record.version,
-        themeColor: logo.themeColor,
-        logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
-        manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
+        ...(hasLogoOrPwa && logo
+          ? {
+              themeColor: logo.themeColor,
+              logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
+              manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
+            }
+          : {}),
         updatedAt: record.updatedAt,
       });
       return;
@@ -1826,7 +1832,8 @@ async function startServer() {
       updatedAt: new Date().toISOString(),
     });
 
-    const logo = getAppLogoConfig(record);
+    const hasLogoOrPwa = isAppLogoOrPwaEnabled(record);
+    const logo = hasLogoOrPwa ? getAppLogoConfig(record) : null;
 
     res.setHeader('Cache-Control', 'no-store');
     res.json({
@@ -1834,9 +1841,13 @@ async function startServer() {
       appId: record.appId,
       slug: record.slug,
       path: `/app/${record.appId}`,
-      logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
-      manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
-      themeColor: logo.themeColor,
+      ...(hasLogoOrPwa && logo
+        ? {
+            logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
+            manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
+            themeColor: logo.themeColor,
+          }
+        : {}),
       version: record.version,
       deployedAt: record.updatedAt,
     });
@@ -2298,6 +2309,7 @@ async function startServer() {
           message: message || 'App build',
           mode,
           previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
+          hasAttachment: Boolean(body.attachmentDataUrl ?? opts.attachmentDataUrl),
           modelUsed: body.modelUsed,
           modelName: body.modelName,
           provider: body.provider,
@@ -2488,6 +2500,7 @@ async function startServer() {
         message,
         mode,
         previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
+        hasAttachment: Boolean(body.attachmentDataUrl ?? opts.attachmentDataUrl),
         modelUsed: streamRes.modelUsed,
         modelName: streamRes.modelName,
         provider: streamRes.provider,
@@ -3031,6 +3044,7 @@ async function startServer() {
         message,
         mode,
         previousHtml,
+        hasAttachment: Boolean(attachmentDataUrl),
         modelUsed: activeModelUsed,
         modelName: activeModelName,
         provider: activeProvider,

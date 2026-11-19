@@ -19,7 +19,6 @@ import {
   Image as ImageIcon,
   KeyRound,
   Lightbulb,
-  Link2,
   Loader2,
   MoreVertical,
   Music,
@@ -197,7 +196,6 @@ export function BuilderWorkspace({
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const [previewKey, setPreviewKey] = useState(0);
   const [copiedCode, setCopiedCode] = useState(false);
-  const [copiedLiveUrl, setCopiedLiveUrl] = useState(false);
   const [activeCodeTab, setActiveCodeTab] = useState<'index.html' | 'styles.css' | 'app.js'>('index.html');
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -320,6 +318,187 @@ export function BuilderWorkspace({
 
   const databaseConfigRef = useRef(databaseConfig);
   databaseConfigRef.current = databaseConfig;
+
+  // Real-time pre-hydration: extract AICraft.db tables and literal starter inserts from generated HTML
+  // so opening Database directly from the chat tab immediately reflects real built tables & records.
+  useEffect(() => {
+    if (!latestPreviewHtml || !projectId) return;
+    if (isStreaming) return;
+
+    const cleanIdent = (raw: string) =>
+      raw
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+
+    const tryParseObjectLiteral = (objText: string): Record<string, unknown> | null => {
+      try {
+        let jsonish = objText
+          .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')
+          .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')
+          .replace(/'((?:\\.|[^'\\])*)'/g, (_, inner: string) =>
+            JSON.stringify(inner.replace(/\\'/g, "'"))
+          )
+          .replace(/,\s*([}\]])/g, '$1');
+        const parsed = JSON.parse(jsonish) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Ignore dynamic JS expressions that require runtime iframe execution
+      }
+      return null;
+    };
+
+    const tableSeeds = new Map<string, Record<string, unknown>[]>();
+    const detectedColsByTable = new Map<string, Map<string, ProjectDatabaseColumn>>();
+
+    const recordColumn = (tableName: string, key: string, sampleVal?: unknown) => {
+      const col = cleanIdent(key);
+      if (!col) return;
+      let colMap = detectedColsByTable.get(tableName);
+      if (!colMap) {
+        colMap = new Map();
+        detectedColsByTable.set(tableName, colMap);
+      }
+      if (colMap.has(col)) return;
+      const inferredType: ProjectDatabaseColumn['type'] =
+        typeof sampleVal === 'number'
+          ? 'number'
+          : typeof sampleVal === 'boolean'
+            ? 'boolean'
+            : sampleVal !== null && typeof sampleVal === 'object'
+              ? 'json'
+              : col === 'created_at' || col === 'updated_at' || col.endsWith('_at')
+                ? 'timestamp'
+                : 'text';
+      colMap.set(col, { name: col, type: inferredType, required: col === 'id' });
+    };
+
+    // Match direct AICraft.db.insert('table', { ... }) calls
+    const insertRegex = /AICraft\.db\.insert\(\s*['"`]([a-zA-Z0-9_-]+)['"`]\s*,\s*\{/g;
+    let m: RegExpExecArray | null;
+    while ((m = insertRegex.exec(latestPreviewHtml)) !== null) {
+      const tableName = cleanIdent(m[1] || '');
+      if (!tableName) continue;
+      const startBrace = m.index + m[0].length - 1;
+      let depth = 0;
+      let endIdx = -1;
+      let inStr: string | null = null;
+      for (let i = startBrace; i < Math.min(latestPreviewHtml.length, startBrace + 2500); i += 1) {
+        const ch = latestPreviewHtml[i];
+        if (inStr) {
+          if (ch === '\\') {
+            i += 1;
+            continue;
+          }
+          if (ch === inStr) inStr = null;
+          continue;
+        }
+        if (ch === '"' || ch === "'" || ch === '`') {
+          inStr = ch;
+          continue;
+        }
+        if (ch === '{') depth += 1;
+        else if (ch === '}') {
+          depth -= 1;
+          if (depth === 0) {
+            endIdx = i;
+            break;
+          }
+        }
+      }
+      if (endIdx === -1) continue;
+      const rawObj = latestPreviewHtml.slice(startBrace, endIdx + 1);
+      const parsedObj = tryParseObjectLiteral(rawObj);
+      recordColumn(tableName, 'id', 'text');
+      if (parsedObj) {
+        for (const [k, v] of Object.entries(parsedObj)) {
+          recordColumn(tableName, k, v);
+        }
+        const list = tableSeeds.get(tableName) ?? [];
+        list.push({
+          id:
+            typeof parsedObj.id === 'string' && parsedObj.id
+              ? parsedObj.id
+              : `seed_${tableName}_${list.length + 1}`,
+          created_at:
+            typeof parsedObj.created_at === 'string' && parsedObj.created_at
+              ? parsedObj.created_at
+              : new Date().toISOString(),
+          ...parsedObj,
+        });
+        tableSeeds.set(tableName, list);
+      }
+      recordColumn(tableName, 'created_at', 'timestamp');
+    }
+
+    // Also capture any AICraft.db.list/update/remove table schemas
+    const callRegex = /AICraft\.db\.\w+\(\s*['"`]([a-zA-Z0-9_-]+)['"`]/g;
+    for (const callMatch of latestPreviewHtml.matchAll(callRegex)) {
+      const tableName = cleanIdent(callMatch[1] || '');
+      if (!tableName) continue;
+      recordColumn(tableName, 'id', 'text');
+      recordColumn(tableName, 'created_at', 'timestamp');
+    }
+
+    let dbMutated = false;
+    try {
+      for (const [tableName, rows] of tableSeeds.entries()) {
+        if (rows.length === 0) continue;
+        const storageKey = `aicraft_db_${projectId}_${tableName}`;
+        const existingRaw = window.localStorage.getItem(storageKey);
+        const existingParsed = existingRaw ? (JSON.parse(existingRaw) as unknown) : null;
+        if (!Array.isArray(existingParsed) || existingParsed.length === 0) {
+          window.localStorage.setItem(storageKey, JSON.stringify(rows));
+          dbMutated = true;
+        }
+      }
+    } catch {
+      // ignore storage quota errors
+    }
+
+    if (detectedColsByTable.size > 0) {
+      const currentDb = databaseConfigRef.current;
+      let changed = false;
+      const nextTables = [...currentDb.tables];
+      for (const [tableName, colMap] of detectedColsByTable.entries()) {
+        const existingIdx = nextTables.findIndex((t) => t.name === tableName);
+        if (existingIdx === -1) {
+          nextTables.push({
+            id: `tbl-${tableName}`,
+            name: tableName,
+            columns: Array.from(colMap.values()),
+          });
+          changed = true;
+        } else {
+          const existing = nextTables[existingIdx];
+          const seen = new Set(existing.columns.map((c) => c.name));
+          const extra = Array.from(colMap.values()).filter((c) => !seen.has(c.name));
+          if (extra.length > 0) {
+            nextTables[existingIdx] = {
+              ...existing,
+              columns: [...existing.columns, ...extra],
+            };
+            changed = true;
+          }
+        }
+      }
+      if (changed) {
+        onUpdateDatabase({
+          ...currentDb,
+          enabled: true,
+          tables: nextTables,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    if (dbMutated) {
+      window.dispatchEvent(new CustomEvent('aicraft:db-updated', { detail: { projectId } }));
+    }
+  }, [latestPreviewHtml, projectId, isStreaming, onUpdateDatabase]);
 
   const secretsFingerprint = useMemo(
     () => secrets.map((s) => `${s.key}:${s.updatedAt}`).join('|'),
@@ -714,7 +893,7 @@ export function BuilderWorkspace({
       return Promise.resolve({
         outcome: 'dismissed',
         platform: 'preview',
-        message: 'Open your Live App Link in Safari or Chrome to install with its custom Home Screen icon.'
+        message: 'Open your deployed app link in Safari or Chrome if you enabled Home Screen install.'
       });
     },
     get themeColor() { return getPreviewThemeColor(); }
@@ -1302,17 +1481,6 @@ export function BuilderWorkspace({
     return 'Ready to share';
   };
 
-  const handleCopyLiveUrl = async () => {
-    if (!deployment.liveUrl) return;
-    try {
-      await navigator.clipboard.writeText(deployment.liveUrl);
-      setCopiedLiveUrl(true);
-      window.setTimeout(() => setCopiedLiveUrl(false), 2000);
-    } catch {
-      // ignore clipboard restriction
-    }
-  };
-
   const handleCopyCode = async () => {
     if (!latestPreviewHtml) return;
     try {
@@ -1867,72 +2035,6 @@ export function BuilderWorkspace({
                     </div>
                   )}
 
-                  {/* Clean Live App Link Card (Copy URL only — no Enabled AI / Open buttons) */}
-                  {isBuildTurn &&
-                    stepBuildingDone &&
-                    Boolean(turn.previewHtml) &&
-                    turn.id === latestBuiltTurnId &&
-                    (deployment.liveUrl || deployment.livePublishing) && (
-                      <div className="rounded-2xl border border-black/[0.08] bg-[#F7F7FA] px-3.5 py-3 flex flex-col gap-2">
-                        <div className="flex items-center justify-between gap-2">
-                          <div className="flex items-center gap-1.5 text-[12.5px] font-semibold text-[#0B0B0F]">
-                            <Link2 className="w-3.5 h-3.5 text-[#6D4AFF] shrink-0" />
-                            <span>Live App Link</span>
-                          </div>
-                          {deployment.livePublishing ? (
-                            <span className="inline-flex items-center gap-1 text-[11.5px] text-[#71717A]">
-                              <Loader2 className="w-3 h-3 animate-spin text-[#6D4AFF]" />
-                              <span>Generating link...</span>
-                            </span>
-                          ) : deployment.version > 0 ? (
-                            <span className="text-[11.5px] font-medium text-emerald-700 tabular-nums">
-                              Live · v{deployment.version}
-                            </span>
-                          ) : null}
-                        </div>
-
-                        {deployment.liveUrl && (
-                          <div className="rounded-xl border border-black/[0.09] bg-white px-3 py-2 flex items-center gap-2.5">
-                            {deployment.logoUrl && (
-                              <img
-                                src={deployment.logoUrl}
-                                alt={`${projectTitle} icon`}
-                                className="w-8 h-8 rounded-lg object-cover border border-black/10 shrink-0"
-                              />
-                            )}
-                            <div className="min-w-0 flex-1">
-                              <span className="block font-mono text-[12px] text-[#0B0B0F] truncate select-all">
-                                {deployment.liveUrl}
-                              </span>
-                              {deployment.logoUrl && (
-                                <span className="block text-[10.5px] text-[#71717A] truncate">
-                                  Custom app icon · Add to Home Screen ready
-                                </span>
-                              )}
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => void handleCopyLiveUrl()}
-                              aria-label="Copy live app link"
-                              className="min-h-[36px] px-3 rounded-lg border border-black/[0.1] bg-[#FAFAFC] hover:bg-black/[0.04] text-[12px] font-medium text-[#0B0B0F] inline-flex items-center gap-1.5 shrink-0 active:scale-95 transition-all"
-                            >
-                              {copiedLiveUrl ? (
-                                <>
-                                  <Check className="w-3.5 h-3.5 text-emerald-600" />
-                                  <span>Copied</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Copy className="w-3.5 h-3.5" />
-                                  <span>Copy</span>
-                                </>
-                              )}
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
                   {/* Paused Build Card — Stops at 0 Credits OR Near Serverless Limit & Unlocks "Continue" */}
                   {isPausedTurn && (() => {
                     const isStreamInterrupted =
@@ -2441,6 +2543,9 @@ export function BuilderWorkspace({
         isStreaming={isStreaming}
         latestPreviewHtml={latestPreviewHtml}
         databaseConfig={databaseConfig}
+        secrets={secrets}
+        codeParts={codeParts}
+        latestBuildFiles={latestBuiltTurn?.files ?? []}
         onClose={() => setActiveDrawer(null)}
       />
 

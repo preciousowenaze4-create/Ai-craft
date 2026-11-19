@@ -248,14 +248,14 @@ async function runBackendDesignArchitect(params: {
       hintsText,
       params.searchQuery ? `Search topic: ${params.searchQuery}` : '',
       `User goal: "${params.message.slice(0, 900)}"`,
-      'Produce a concise, production-ready UI/UX architecture blueprint in 8-10 tight bullet points covering: (1) Exact hex color tokens (background, card surface, primary accent, ink), (2) Typography & layout spacing rhythm, (3) Screen tabs/views (4-6 screens) or targeted surgical layer addition if updating an existing app, (4) Key interactive cards, buttons, and visual polish details. Write ONLY the design blueprint — zero HTML or code blocks.',
+      'Produce a concise, production-ready UI/UX & data architecture blueprint in 8-10 tight bullet points covering: (1) Exact hex color tokens (background, card surface, primary accent, ink), (2) Typography & layout spacing rhythm, (3) Screen tabs/views (4-6 screens) or targeted surgical layer addition if updating an existing app, (4) Real `window.AICraft.db` tables & fields plus real interactive CRUD handlers (zero hardcoded static cards or dead buttons), (5) Do NOT invent a brand logo or PWA Home Screen setup unless the user explicitly requested one or attached a logo image. Write ONLY the blueprint — zero HTML or code blocks.',
     ]
       .filter(Boolean)
       .join('\n'),
   });
 
   const timeoutPromise = new Promise<string>((resolve) => {
-    setTimeout(() => resolve(''), 6000);
+    setTimeout(() => resolve(''), 9500);
   });
 
   const generatePromise = (async () => {
@@ -495,10 +495,30 @@ export interface FinalizeRealtimeInput {
   message: string;
   mode: 'mobile' | 'web';
   previousHtml?: string;
+  hasAttachment?: boolean;
   modelUsed?: string;
   modelName?: string;
   provider?: string;
   startedAt?: number;
+}
+
+export function userRequestedLogoOrPwa(
+  message: string,
+  hasAttachment = false,
+  rawHasLogoTag = false
+): boolean {
+  const msg = String(message || '').toLowerCase();
+  if (
+    /\b(?:logo|app\s*icon|brand\s*icon|favicon|emblem|monogram|wordmark|add\s+to\s+home\s*screen|home\s*screen\s*(?:app|icon)|pwa|installable|standalone\s*app)\b/i.test(
+      msg
+    )
+  ) {
+    return true;
+  }
+  if (hasAttachment && rawHasLogoTag) {
+    return true;
+  }
+  return false;
 }
 
 export interface FinalizedRealtimeResult {
@@ -538,7 +558,13 @@ export function finalizeRealtimeOutput(
     : deriveServerSessionTitle(input.message, input.mode);
 
   const planSteps = extractPlanStepsFromRaw(cleanedRaw);
-  const logo = extractLogoDirectiveFromRaw(cleanedRaw);
+  const extractedLogo = extractLogoDirectiveFromRaw(cleanedRaw);
+  const allowLogoOrPwa = userRequestedLogoOrPwa(
+    input.message,
+    Boolean(input.hasAttachment),
+    Boolean(extractedLogo)
+  );
+  const logo = allowLogoOrPwa ? extractedLogo : null;
 
   if (/\[\[\s*MODE\s*:\s*GENERATE\s*\]\]/i.test(cleanedRaw)) {
     const mediaPromptMatch = /\[\[\s*MEDIA_PROMPT\s*:\s*([^\]]+?)\s*\]\]/i.exec(cleanedRaw);

@@ -462,6 +462,7 @@ export async function POST(request: Request): Promise<Response> {
           message,
           mode,
           previousHtml,
+          hasAttachment: Boolean(attachmentDataUrl),
           modelUsed: activeModelUsed,
           modelName: activeModelName,
           provider: activeProvider,
