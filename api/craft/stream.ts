@@ -239,14 +239,23 @@ export async function POST(request: Request): Promise<Response> {
           clientTimeZone,
           visualHints,
           projectMemoryContext: retrievedMemory.brainContext || '',
+          onStage: (stage) => {
+            sendEvent({
+              type: 'phase',
+              phase: stage.phase,
+              kind: stage.kind,
+              action: stage.action,
+              label: stage.label,
+            });
+          },
         });
 
         sendEvent({
           type: 'meta',
           kind: prepared.naturalMediaIntent ? 'media' : 'chat',
           modelId: requestedModel || 'gemini::gemini-4-hydrogen',
-          modelName: prepared.requestedModelLabel || 'Gemini 4 Hydrogen (Flash)',
-          provider: 'google',
+          modelName: prepared.requestedModelLabel || 'AI Craft Pro (4 Hydrogen)',
+          provider: 'aicraft',
           gateway: 'gemini',
           isFallback: false,
         });
@@ -306,8 +315,8 @@ export async function POST(request: Request): Promise<Response> {
         let emittedReasoningPhase = false;
 
         let activeModelUsed = requestedModel || 'gemini::gemini-4-hydrogen';
-        let activeModelName = prepared.requestedModelLabel || 'Gemini 4 Hydrogen (Flash)';
-        let activeProvider = 'google';
+        let activeModelName = prepared.requestedModelLabel || 'AI Craft Pro (4 Hydrogen)';
+        let activeProvider = 'aicraft';
 
         await streamServerFreeAiRealTime({
           requestedModel,
@@ -437,6 +446,16 @@ export async function POST(request: Request): Promise<Response> {
         });
 
         clearInterval(keepAlive);
+
+        if (enteredCodePhase) {
+          sendEvent({
+            type: 'phase',
+            phase: 'building',
+            kind: 'build',
+            action: 'Checking',
+            label: 'Checking code & live preview...',
+          });
+        }
 
         const finalized = finalizeRealtimeOutput({
           rawOutput: rawAccumulated,

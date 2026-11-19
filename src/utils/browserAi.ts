@@ -11,7 +11,6 @@ export const VALID_GEMINI_MODEL_IDS = [
   'gemini::gemini-4-hydrogen',
   'gemini::gemini-3.1-pro-preview',
   'gemini::gemini-3.1-flash-lite',
-  'gemini::gemini-2.5-pro',
   'gemini::gemini-2.5-flash',
   'gemini::gemini-2.5-flash-preview-12-2025',
 ] as const;

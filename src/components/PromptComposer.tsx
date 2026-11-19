@@ -140,8 +140,8 @@ export function PromptComposer({
           <span className="text-[12.5px] font-medium text-[#18181B] truncate">
             {activeModel?.name ??
               (modelsLoading
-                ? 'Connecting Vision & Code AI...'
-                : 'Gemini 2.5 Flash (Vision · Fast)')}
+                ? 'Connecting AI Craft Engine...'
+                : 'AI Craft Pro (4 Hydrogen)')}
           </span>
         </div>
 

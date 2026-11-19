@@ -29,6 +29,7 @@ import {
 } from './_builderCore.js';
 import { GoogleGenAI, type GenerateContentResponse } from '@google/genai';
 import {
+  BACKEND_DESIGNER_MODEL_ID,
   GEMINI_BUILDER_MODELS,
   buildGatewayExecutionPlan,
   getServerGeminiApiKey,
@@ -52,7 +53,7 @@ function formatGeminiApiError(err: unknown, modelName: string): string {
       ? err.message
       : typeof err === 'string'
         ? err
-        : 'Gemini API request failed.';
+        : 'AI Craft engine request failed.';
   const lower = rawMsg.toLowerCase();
 
   if (
@@ -64,10 +65,10 @@ function formatGeminiApiError(err: unknown, modelName: string): string {
     return 'Your GEMINI_API_KEY was rejected or is invalid. Please check GEMINI_API_KEY in Vercel Environment Variables (or Settings > Secrets).';
   }
   if (lower.includes('resource_exhausted') || lower.includes('429') || lower.includes('quota')) {
-    return `${modelName} reached its Gemini API quota or rate limit. Try switching to Gemini 4 Hydrogen or Gemini 3.1 Flash Lite, or check your Gemini API plan.`;
+    return `${modelName} reached its API quota or rate limit. Try switching to AI Craft Pro (4 Hydrogen) or AI Craft Mini (3.1).`;
   }
   if (lower.includes('not_found') || lower.includes('404') || lower.includes('not found')) {
-    return `${modelName} is not available on this GEMINI_API_KEY yet. Try Gemini 4 Hydrogen, Gemini 3.1 Pro, Gemini 2.5 Pro, or Gemini 2.5 Flash.`;
+    return `${modelName} is not available on this GEMINI_API_KEY yet. Try switching to AI Craft Pro (4 Hydrogen) or AI Craft 2.5 Flash.`;
   }
   return rawMsg.slice(0, 320);
 }
@@ -77,6 +78,13 @@ export interface VisualHintsSpec {
   surfaceTheme?: 'dark' | 'light';
   width?: number;
   height?: number;
+}
+
+export interface PrepareRealtimeStageEvent {
+  phase: 'understanding' | 'building';
+  kind: 'chat' | 'build' | 'media';
+  action: string;
+  label: string;
 }
 
 export interface PrepareRealtimeInput {
@@ -101,6 +109,7 @@ export interface PrepareRealtimeInput {
   reactEnabled?: boolean;
   backendEnabled?: boolean;
   projectMemoryContext?: string;
+  onStage?: (stage: PrepareRealtimeStageEvent) => void;
 }
 
 export interface PreparedRealtimePrompt {
@@ -118,6 +127,7 @@ export interface PreparedRealtimePrompt {
     images: SearchImageItem[];
   };
   timeContext: string;
+  designBlueprint?: string;
 }
 
 export function detectNaturalMediaRequest(
@@ -125,6 +135,83 @@ export function detectNaturalMediaRequest(
   _hasPreviousHtml: boolean
 ): 'image' | 'music' | 'video' | null {
   return null;
+}
+
+/**
+ * Hidden Backend Design Architect Engine (powered by Gemini 2.5 Pro).
+ * Runs automatically behind the scenes when building or designing an app,
+ * producing a concise UI/UX visual blueprint for the active builder model.
+ */
+async function runBackendDesignArchitect(params: {
+  message: string;
+  mode: 'mobile' | 'web';
+  hasPreviousHtml: boolean;
+  previewSummary: string;
+  attachmentDataUrl?: string | null;
+  visualHints?: VisualHintsSpec | null;
+  searchQuery?: string;
+}): Promise<string> {
+  const geminiKey = getServerGeminiApiKey();
+  if (!geminiKey) return '';
+
+  const ai = createGeminiClient(geminiKey);
+  const designerParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
+
+  if (params.attachmentDataUrl && params.attachmentDataUrl.startsWith('data:image/')) {
+    const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/.exec(
+      params.attachmentDataUrl
+    );
+    if (match?.[1] && match?.[2]) {
+      designerParts.push({
+        inlineData: {
+          mimeType: match[1],
+          data: match[2],
+        },
+      });
+    }
+  }
+
+  const hintsText =
+    params.visualHints?.dominantColor || params.visualHints?.surfaceTheme
+      ? `Screenshot cues: dominant=${params.visualHints.dominantColor || 'auto'}, surface=${params.visualHints.surfaceTheme || 'auto'}, size=${params.visualHints.width || '?'}x${params.visualHints.height || '?'}.`
+      : '';
+
+  designerParts.push({
+    text: [
+      `Target: ${params.mode === 'mobile' ? 'Mobile App (Android & iOS)' : 'Responsive Full-Stack Web App'}.`,
+      params.hasPreviousHtml && params.previewSummary
+        ? `Existing app context:\n${params.previewSummary.slice(0, 900)}`
+        : 'Brand new app build from scratch.',
+      hintsText,
+      params.searchQuery ? `Search topic: ${params.searchQuery}` : '',
+      `User goal: "${params.message.slice(0, 900)}"`,
+      'Produce a concise, production-ready UI/UX architecture blueprint in 8-10 tight bullet points covering: (1) Exact hex color tokens (background, card surface, primary accent, ink), (2) Typography & layout spacing rhythm, (3) Screen tabs/views (4-6 screens) or targeted surgical layer addition if updating an existing app, (4) Key interactive cards, buttons, and visual polish details. Write ONLY the design blueprint — zero HTML or code blocks.',
+    ]
+      .filter(Boolean)
+      .join('\n'),
+  });
+
+  const timeoutPromise = new Promise<string>((resolve) => {
+    setTimeout(() => resolve(''), 6000);
+  });
+
+  const generatePromise = (async () => {
+    try {
+      const response = await ai.models.generateContent({
+        model: BACKEND_DESIGNER_MODEL_ID,
+        contents: [{ role: 'user', parts: designerParts }],
+        config: {
+          systemInstruction:
+            'You are the internal UI/UX Design Architect inside AI Craft. Produce a crisp, practical visual design blueprint (colors, layout hierarchy, components, multi-screen structure) with zero HTML or code fences.',
+        },
+      });
+      return (response.text || '').trim().slice(0, 1400);
+    } catch {
+      return '';
+    }
+  })();
+
+  return Promise.race([generatePromise, timeoutPromise]);
 }
 
 export async function prepareRealtimePrompt(
@@ -158,11 +245,55 @@ export async function prepareRealtimePrompt(
     input.webSearchEnabled !== false &&
     (initialRoute !== 'chat' || shouldRunChatSearch(message, hasPreviousHtml));
 
+  if (wantsSearch) {
+    input.onStage?.({
+      phase: 'understanding',
+      kind: initialRoute === 'build' ? 'build' : 'chat',
+      action: 'Searching',
+      label: 'Searching live web & references...',
+    });
+  }
+
   const searchData = wantsSearch
     ? await runLiveBrowserSearch(buildFocusedSearchQuery(message))
     : { query: '', results: [], images: [] };
 
   const webSearchContext = formatWebSearchContext(searchData);
+  const previewSummary = extractPreviewStructureSummary(previousHtml);
+
+  const shouldRunDesignEngine =
+    !input.forceChat &&
+    !naturalMediaIntent &&
+    (initialRoute === 'build' || (initialRoute === 'auto' && message.length >= 10));
+
+  let designBlueprint = '';
+  if (shouldRunDesignEngine && getServerGeminiApiKey()) {
+    input.onStage?.({
+      phase: 'understanding',
+      kind: initialRoute === 'build' ? 'build' : 'chat',
+      action: 'Designing',
+      label: 'Designing UI layout & visual architecture...',
+    });
+    designBlueprint = await runBackendDesignArchitect({
+      message,
+      mode: input.mode,
+      hasPreviousHtml,
+      previewSummary,
+      attachmentDataUrl: input.attachmentDataUrl,
+      visualHints: input.visualHints,
+      searchQuery: searchData.query,
+    });
+  }
+
+  input.onStage?.({
+    phase: 'understanding',
+    kind: initialRoute === 'build' ? 'build' : 'chat',
+    action: 'Thinking',
+    label:
+      initialRoute === 'chat'
+        ? 'Thinking through your question...'
+        : 'Planning screens & database architecture...',
+  });
 
   const timeContext = [
     input.clientTime ? `User local date/time: ${input.clientTime}` : '',
@@ -197,8 +328,6 @@ export async function prepareRealtimePrompt(
     databaseTables,
   });
 
-  const previewSummary = extractPreviewStructureSummary(previousHtml);
-
   const activeFlags: string[] = [];
   if (input.reactEnabled) activeFlags.push('Rich interactive SPA views');
   if (input.backendEnabled) activeFlags.push('Persistent real-time database (`window.AICraft.db`)');
@@ -213,6 +342,7 @@ export async function prepareRealtimePrompt(
     timeContext,
     projectInfraContext,
     projectMemoryContext: input.projectMemoryContext,
+    designBlueprint,
     webSearchContext,
     previewSummary,
     mode: input.mode,
@@ -271,6 +401,7 @@ export async function prepareRealtimePrompt(
     historyMessages,
     searchData,
     timeContext,
+    designBlueprint,
   };
 }
 
@@ -313,8 +444,8 @@ export function finalizeRealtimeOutput(
   const startedAt = typeof input.startedAt === 'number' ? input.startedAt : Date.now();
   const thoughtSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
   const modelUsed = input.modelUsed || 'gemini::gemini-4-hydrogen';
-  const modelName = input.modelName || 'Gemini 4 Hydrogen (Flash)';
-  const provider = input.provider || 'google';
+  const modelName = input.modelName || 'AI Craft Pro (4 Hydrogen)';
+  const provider = input.provider || 'aicraft';
 
   const explicitTitleMatch = /\[\[\s*TITLE\s*:\s*([^\]]+?)\s*\]\]/i.exec(cleanedRaw);
   const title = explicitTitleMatch?.[1]?.trim()
@@ -458,7 +589,7 @@ export async function streamServerFreeAiRealTime(params: {
   params.onModelMeta?.({
     modelId: matched.id,
     modelName: matched.name,
-    provider: 'google',
+    provider: 'aicraft',
   });
 
   const ai = createGeminiClient(geminiKey);
@@ -516,7 +647,7 @@ export async function streamServerFreeAiRealTime(params: {
       rawOutput: fullContent,
       modelUsed: matched.id,
       modelName: matched.name,
-      provider: 'google',
+      provider: 'aicraft',
     };
   } catch (err) {
     throw new Error(formatGeminiApiError(err, matched.name));

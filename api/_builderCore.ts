@@ -1487,6 +1487,7 @@ export function buildCraftSystemPrompt(params: {
   timeContext: string;
   projectInfraContext: string;
   projectMemoryContext?: string;
+  designBlueprint?: string;
   webSearchContext: string;
   previewSummary: string;
   mode: 'mobile' | 'web';
@@ -1501,6 +1502,7 @@ export function buildCraftSystemPrompt(params: {
     timeContext,
     projectInfraContext,
     projectMemoryContext,
+    designBlueprint,
     webSearchContext,
     previewSummary,
     mode,
@@ -1610,12 +1612,17 @@ export function buildCraftSystemPrompt(params: {
     .filter(Boolean)
     .join('\n');
 
+  const designBlock = designBlueprint
+    ? `\nBACKEND DESIGN ARCHITECT ENGINE SPECIFICATION (Follow this tailored UI/UX & visual system closely):\n${designBlueprint}`
+    : '';
+
   if (initialRoute === 'build') {
     return [
       'You are AI Craft, a calm, methodical senior product engineer & full-stack app architect connected directly into a live full-screen Preview workspace.',
       `Real-time clock context: ${timeContext}.`,
       projectInfraContext,
       projectMemoryContext ? `\n${projectMemoryContext}` : '',
+      designBlock,
       webSearchContext ? `\n${webSearchContext}` : '',
       previewSummary ? `\nLIVE PREVIEW ENVIRONMENT AWARENESS:\n${previewSummary}` : '',
       'CRITICAL OUTPUT CONTRACT — TWO STRICTLY SEPARATED PARTS:',
@@ -1631,6 +1638,7 @@ export function buildCraftSystemPrompt(params: {
     `Real-time clock context: ${timeContext}.`,
     projectInfraContext,
     projectMemoryContext ? `\n${projectMemoryContext}` : '',
+    designBlock,
     webSearchContext ? `\n${webSearchContext}` : '',
     previewSummary ? `\nLIVE PREVIEW ENVIRONMENT AWARENESS:\n${previewSummary}` : '',
     'THINK FIRST BEFORE RESPONDING:',

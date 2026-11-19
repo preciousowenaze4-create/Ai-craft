@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
+  Code2,
   Copy,
   Database,
   Download,
@@ -24,7 +25,9 @@ import {
   Music,
   Paperclip,
   Rocket,
+  Search,
   ShieldAlert,
+  Sparkles,
   Square,
   Volume2,
   X,
@@ -1547,7 +1550,33 @@ export function BuilderWorkspace({
                 turn.modelName ||
                 models.find((m) => m.id === turn.modelId)?.name ||
                 activeModel?.name ||
-                'AICRAFT';
+                'AI Craft Pro (4 Hydrogen)';
+
+              const liveActionText = (() => {
+                if (!isTurnWorking) return '';
+                const act = (turn.activeAction || '').trim();
+                if (act) return act;
+                if (turn.phase === 'building') {
+                  return isMediaTurn ? 'Creating' : 'Building';
+                }
+                return displayAiText.length > 0 ? 'Responding' : 'Thinking';
+              })();
+
+              const LiveActionIcon = (() => {
+                const lowerAct = liveActionText.toLowerCase();
+                if (lowerAct.includes('search')) return Search;
+                if (lowerAct.includes('design')) return Sparkles;
+                if (
+                  lowerAct.includes('cod') ||
+                  lowerAct.includes('writ') ||
+                  lowerAct.includes('styl') ||
+                  lowerAct.includes('script') ||
+                  lowerAct.includes('build')
+                ) {
+                  return Code2;
+                }
+                return Lightbulb;
+              })();
 
               return (
                 <article key={turn.id} className="flex flex-col gap-3.5">
@@ -1570,7 +1599,7 @@ export function BuilderWorkspace({
                     </div>
                   </div>
 
-                  {/* Active AI Model Brand Row with Real-Time Logo Tracking */}
+                  {/* Active AI Model Brand Row with Real-Time Activity Tracking */}
                   <div className="flex items-center justify-between pt-0.5 gap-2">
                     <div className="flex items-center gap-2.5 min-w-0">
                       <ProviderLogo
@@ -1586,39 +1615,46 @@ export function BuilderWorkspace({
                         </span>
                         {isTurnWorking && (
                           <span
-                            className="text-[11.5px] font-medium shrink-0"
+                            className="inline-flex items-center gap-1 text-[11.5px] font-semibold shrink-0"
                             style={{ color: theme.accentColor }}
                           >
-                            {turn.phase === 'building'
-                              ? isMediaTurn ||
-                                activeModel?.category === 'image' ||
-                                activeModel?.category === 'music' ||
-                                activeModel?.category === 'video'
-                                ? 'Creating'
-                                : 'Building'
-                              : displayAiText.length > 0
-                                ? 'Responding'
-                                : 'Thinking'}
+                            <span>{liveActionText}</span>
                           </span>
                         )}
                       </div>
                     </div>
                   </div>
 
-                  {/* Live Thought Timer Row */}
-                  <div className="flex items-center gap-2 text-[13.5px] text-[#71717A]">
-                    <Lightbulb className="w-[16px] h-[16px] shrink-0 stroke-[1.8]" />
-                    <span className="tabular-nums">
-                      {isTurnWorking
-                        ? `${turn.phaseLabel} (${
-                            turn.startedAt
-                              ? Math.max(1, Math.floor((nowMs - turn.startedAt) / 1000))
-                              : Math.max(1, turn.thoughtSeconds)
-                          }s)`
-                        : isPausedTurn
-                          ? `Paused at ${Math.max(1, turn.thoughtSeconds)}s`
-                          : `Thought for ${Math.max(1, turn.thoughtSeconds)}s`}
-                    </span>
+                  {/* Live Activity & Thought Timer Row */}
+                  <div className="flex items-center justify-between gap-2 text-[13.5px] text-[#71717A]">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <LiveActionIcon
+                        className={`w-[16px] h-[16px] shrink-0 stroke-[1.8] ${
+                          isTurnWorking ? 'animate-pulse' : ''
+                        }`}
+                        style={isTurnWorking ? { color: theme.accentColor } : undefined}
+                      />
+                      <span className="tabular-nums truncate">
+                        {isTurnWorking
+                          ? `${turn.phaseLabel || liveActionText}${
+                              turn.activeFile && turn.phase === 'building'
+                                ? ` · ${turn.activeFile}`
+                                : ''
+                            } (${
+                              turn.startedAt
+                                ? Math.max(1, Math.floor((nowMs - turn.startedAt) / 1000))
+                                : Math.max(1, turn.thoughtSeconds)
+                            }s)`
+                          : isPausedTurn
+                            ? `Paused at ${Math.max(1, turn.thoughtSeconds)}s`
+                            : `Thought for ${Math.max(1, turn.thoughtSeconds)}s`}
+                      </span>
+                    </div>
+                    {isTurnWorking && (turn.bytesBuilt ?? 0) > 0 && (
+                      <span className="text-[11.5px] font-mono text-[#52525B] shrink-0 tabular-nums">
+                        {((turn.bytesBuilt ?? 0) / 1024).toFixed(1)} KB
+                      </span>
+                    )}
                   </div>
 
                   {/* Calm Replit-Style Step-by-Step Thinking & Blue-Checkmark Plan */}
@@ -2154,8 +2190,8 @@ export function BuilderWorkspace({
                 <span className="text-[12.5px] font-medium text-[#18181B] truncate">
                   {activeModel?.name ??
                     (modelsLoading
-                      ? 'Connecting Vision & Code AI...'
-                      : 'Claude Sonnet 4.6 (Vision · Builder)')}
+                      ? 'Connecting AI Craft Engine...'
+                      : 'AI Craft Pro (4 Hydrogen)')}
                 </span>
               </div>
 

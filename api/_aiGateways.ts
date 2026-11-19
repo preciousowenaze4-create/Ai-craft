@@ -39,6 +39,7 @@ export interface GatewayExecutionCandidate {
 export const SERVER_GEMINI_MODEL_ID = 'gemini::gemini-4-hydrogen';
 export const DEFAULT_BUILDER_MODEL_ID = 'gemini::gemini-4-hydrogen';
 export const SECONDARY_BUILDER_MODEL_ID = 'gemini::gemini-3.1-pro-preview';
+export const BACKEND_DESIGNER_MODEL_ID = 'gemini-2.5-pro';
 
 export function getServerGeminiApiKey(): string {
   return cleanEnvKey(process.env.GEMINI_API_KEY, [
@@ -58,16 +59,17 @@ export function hasServerFreeAiKey(): boolean {
 }
 
 /**
- * Full Gemini builder lineup (latest Flash & Pro + classic 2.5 Flash & Pro),
- * all powered exclusively by process.env.GEMINI_API_KEY on the server.
+ * Visible AI Craft builder lineup (5 user-facing models).
+ * Gemini 2.5 Pro is dedicated to the hidden Backend Design Architect Engine.
+ * All powered server-side by process.env.GEMINI_API_KEY.
  */
 export const GEMINI_BUILDER_MODELS: UnifiedAiModel[] = [
   {
     id: 'gemini::gemini-4-hydrogen',
     upstreamModelId: 'gemini-4-hydrogen',
     gateway: 'gemini',
-    name: 'Gemini 4 Hydrogen (Flash)',
-    provider: 'google',
+    name: 'AI Craft Pro (4 Hydrogen)',
+    provider: 'aicraft',
     contextLength: 1048576,
     isFree: true,
     tierLabel: 'Latest · Fast',
@@ -78,8 +80,8 @@ export const GEMINI_BUILDER_MODELS: UnifiedAiModel[] = [
     id: 'gemini::gemini-3.1-pro-preview',
     upstreamModelId: 'gemini-3.1-pro-preview',
     gateway: 'gemini',
-    name: 'Gemini 3.1 Pro',
-    provider: 'google',
+    name: 'AI Craft Pro (3.1)',
+    provider: 'aicraft',
     contextLength: 1048576,
     isFree: true,
     tierLabel: 'Pro · Coding',
@@ -90,8 +92,8 @@ export const GEMINI_BUILDER_MODELS: UnifiedAiModel[] = [
     id: 'gemini::gemini-3.1-flash-lite',
     upstreamModelId: 'gemini-3.1-flash-lite',
     gateway: 'gemini',
-    name: 'Gemini 3.1 Flash Lite',
-    provider: 'google',
+    name: 'AI Craft Mini (3.1)',
+    provider: 'aicraft',
     contextLength: 1048576,
     isFree: true,
     tierLabel: 'Ultra Fast',
@@ -99,23 +101,11 @@ export const GEMINI_BUILDER_MODELS: UnifiedAiModel[] = [
     category: 'code',
   },
   {
-    id: 'gemini::gemini-2.5-pro',
-    upstreamModelId: 'gemini-2.5-pro',
-    gateway: 'gemini',
-    name: 'Gemini 2.5 Pro',
-    provider: 'google',
-    contextLength: 1048576,
-    isFree: true,
-    tierLabel: '2.5 · Pro',
-    capabilities: ['Vision', 'Screenshots', 'Code', 'DB'],
-    category: 'code',
-  },
-  {
     id: 'gemini::gemini-2.5-flash',
     upstreamModelId: 'gemini-2.5-flash',
     gateway: 'gemini',
-    name: 'Gemini 2.5 Flash',
-    provider: 'google',
+    name: 'AI Craft 2.5 Flash',
+    provider: 'aicraft',
     contextLength: 1048576,
     isFree: true,
     tierLabel: '2.5 · Flash',
@@ -126,8 +116,8 @@ export const GEMINI_BUILDER_MODELS: UnifiedAiModel[] = [
     id: 'gemini::gemini-2.5-flash-preview-12-2025',
     upstreamModelId: 'gemini-2.5-flash-preview-12-2025',
     gateway: 'gemini',
-    name: 'Gemini 2.5 Flash Preview',
-    provider: 'google',
+    name: 'AI Craft 2.5 Preview',
+    provider: 'aicraft',
     contextLength: 1048576,
     isFree: true,
     tierLabel: 'Preview · Fast',
@@ -212,7 +202,7 @@ export async function fetchAllGatewayModels(
   const gateways: GatewayStatusSummary[] = [
     {
       id: 'gemini',
-      label: 'Google Gemini API',
+      label: 'AI Craft Engine',
       baseUrl: 'https://generativelanguage.googleapis.com',
       configured: geminiConfigured,
       keyCount: geminiConfigured ? 1 : 0,

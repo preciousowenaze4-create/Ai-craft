@@ -119,10 +119,10 @@ export function ModelSelectorPopover({
         aria-haspopup="listbox"
         aria-label={
           activeModel
-            ? `Switch Gemini model (current: ${activeModel.name})`
-            : 'Switch Gemini model'
+            ? `Switch AI Craft model (current: ${activeModel.name})`
+            : 'Switch AI Craft model'
         }
-        title={activeModel ? activeModel.name : 'Switch Gemini model'}
+        title={activeModel ? activeModel.name : 'Switch AI Craft model'}
         className={`w-8 h-8 rounded-full flex items-center justify-center transition-all duration-150 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6] ${
           open
             ? 'text-[#0B0B0F]'
@@ -155,13 +155,13 @@ export function ModelSelectorPopover({
             exit={{ opacity: 0, y: 6, scale: 0.96 }}
             transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
             role="dialog"
-            aria-label="Choose Gemini model"
+            aria-label="Choose AI Craft model"
             style={dynamicPanelStyle}
             className="absolute right-0 bottom-full mb-2 z-50 w-[min(284px,calc(100vw-3rem))] rounded-[18px] border backdrop-blur-xl overflow-hidden flex flex-col"
           >
             <div className="px-2.5 pt-2.5 pb-2 border-b border-black/[0.08] flex items-center justify-between gap-2">
               <span className="font-display font-semibold text-[12.5px] text-[#0B0B0F] tracking-[-0.01em] px-0.5">
-                Google Gemini Models
+                AI Craft Models
               </span>
               <div className="flex items-center gap-1.5">
                 <span className="text-[11px] text-[#52525B] tabular-nums">
@@ -171,7 +171,7 @@ export function ModelSelectorPopover({
                   type="button"
                   onClick={onRetryModels}
                   disabled={modelsLoading}
-                  aria-label="Refresh Gemini models"
+                  aria-label="Refresh AI Craft models"
                   className="p-1 rounded-full text-[#52525B] hover:text-[#0B0B0F] hover:bg-black/[0.05] disabled:opacity-40 transition-colors"
                 >
                   <RefreshCw
@@ -183,7 +183,7 @@ export function ModelSelectorPopover({
 
             <div
               role="listbox"
-              aria-label="Available Gemini builders"
+              aria-label="Available AI Craft models"
               className="divide-y divide-black/[0.06] max-h-[292px] overflow-y-auto"
             >
               {modelsLoading && builderModels.length === 0 ? (
@@ -192,7 +192,7 @@ export function ModelSelectorPopover({
                     className="w-4 h-4 animate-spin"
                     style={{ color: theme.accentColor }}
                   />
-                  <span>Loading Gemini models...</span>
+                  <span>Loading AI Craft models...</span>
                 </div>
               ) : modelsError && builderModels.length === 0 ? (
                 <div className="py-5 px-3 text-center flex flex-col items-center gap-2">

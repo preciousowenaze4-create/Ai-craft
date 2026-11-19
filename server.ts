@@ -299,6 +299,8 @@ interface CraftJob {
   dbTables: ParsedDbTable[];
   bytesBuilt: number;
   creditsUsed?: number;
+  billing?: unknown;
+  logo?: Record<string, string>;
   pausedReason?: string;
   pausedMessage?: string;
   aiText: string;
@@ -332,6 +334,8 @@ function serializeJobSnapshot(job: CraftJob) {
     dbTables: job.dbTables,
     bytesBuilt: job.bytesBuilt,
     creditsUsed: job.creditsUsed,
+    billing: job.billing,
+    logo: job.logo,
     pausedReason: job.pausedReason,
     pausedMessage: job.pausedMessage,
     aiText: job.aiText,
@@ -385,6 +389,7 @@ async function startServer() {
         job.phase = payload.phase;
       }
       if (typeof payload.label === 'string') job.phaseLabel = payload.label;
+      if (typeof payload.action === 'string') job.activeAction = payload.action;
     } else if (type === 'plan') {
       if (Array.isArray(payload.allSteps)) {
         job.planSteps = payload.allSteps.filter((s): s is string => typeof s === 'string');
@@ -403,6 +408,11 @@ async function startServer() {
       if (typeof payload.path === 'string') job.activeFile = payload.path;
       if (Array.isArray(payload.allFiles)) {
         job.files = payload.allFiles.filter((f): f is string => typeof f === 'string');
+      }
+      if (typeof payload.bytesBuilt === 'number') job.bytesBuilt = payload.bytesBuilt;
+    } else if (type === 'partialHtml') {
+      if (typeof payload.previewHtml === 'string' && payload.previewHtml) {
+        job.previewHtml = payload.previewHtml;
       }
       if (typeof payload.bytesBuilt === 'number') job.bytesBuilt = payload.bytesBuilt;
     } else if (type === 'progress') {
@@ -482,6 +492,10 @@ async function startServer() {
       }
       if (typeof payload.bytesBuilt === 'number') job.bytesBuilt = payload.bytesBuilt;
       if (typeof payload.creditsUsed === 'number') job.creditsUsed = payload.creditsUsed;
+      if (payload.billing !== undefined) job.billing = payload.billing;
+      if (payload.logo && typeof payload.logo === 'object') {
+        job.logo = payload.logo as Record<string, string>;
+      }
       if (typeof payload.modelUsed === 'string') job.modelId = payload.modelUsed;
       if (typeof payload.modelName === 'string') job.modelName = payload.modelName;
       if (typeof payload.provider === 'string') job.provider = payload.provider;
@@ -1831,6 +1845,7 @@ async function startServer() {
           type: 'done',
           kind: job.kind,
           title: job.title,
+          logo: job.logo,
           fullText: job.aiText,
           previewHtml: job.previewHtml,
           allFiles: job.files,
@@ -1838,6 +1853,7 @@ async function startServer() {
           dbTables: job.dbTables,
           bytesBuilt: job.bytesBuilt,
           creditsUsed: job.creditsUsed,
+          billing: job.billing,
           modelUsed: job.modelId,
           modelName: job.modelName,
           provider: job.provider,
@@ -2746,14 +2762,23 @@ async function startServer() {
         clientTimeZone,
         visualHints,
         projectMemoryContext: retrievedMemory.brainContext || '',
+        onStage: (stage) => {
+          sendEvent({
+            type: 'phase',
+            phase: stage.phase,
+            kind: stage.kind,
+            action: stage.action,
+            label: stage.label,
+          });
+        },
       });
 
       sendEvent({
         type: 'meta',
         kind: prepared.naturalMediaIntent ? 'media' : 'chat',
         modelId: requestedModel || 'gemini::gemini-4-hydrogen',
-        modelName: prepared.requestedModelLabel || 'Gemini 4 Hydrogen (Flash)',
-        provider: 'google',
+        modelName: prepared.requestedModelLabel || 'AI Craft Pro (4 Hydrogen)',
+        provider: 'aicraft',
         gateway: 'gemini',
         isFallback: false,
       });
@@ -2812,8 +2837,8 @@ async function startServer() {
       let emittedReasoningPhase = false;
 
       let activeModelUsed = requestedModel || 'gemini::gemini-4-hydrogen';
-      let activeModelName = prepared.requestedModelLabel || 'Gemini 4 Hydrogen (Flash)';
-      let activeProvider = 'google';
+      let activeModelName = prepared.requestedModelLabel || 'AI Craft Pro (4 Hydrogen)';
+      let activeProvider = 'aicraft';
 
       await streamServerFreeAiRealTime({
         requestedModel,
@@ -2941,6 +2966,16 @@ async function startServer() {
       });
 
       clearInterval(keepAlive);
+
+      if (enteredCodePhase) {
+        sendEvent({
+          type: 'phase',
+          phase: 'building',
+          kind: 'build',
+          action: 'Checking',
+          label: 'Checking code & live preview...',
+        });
+      }
 
       const finalized = finalizeRealtimeOutput({
         rawOutput: rawAccumulated,

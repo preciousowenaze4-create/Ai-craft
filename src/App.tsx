@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ArrowRight, Plus } from 'lucide-react';
+import { ArrowRight, Bell, CheckCircle2, Plus, X } from 'lucide-react';
 import {
   AuthScreen,
   AuthViewMode,
@@ -29,6 +29,11 @@ import {
   analyzeAttachmentVisualHints,
   normalizeBuilderModelId,
 } from './utils/browserAi';
+import {
+  getNotificationPermissionState,
+  requestAppNotificationPermission,
+  sendAppCompletionNotification,
+} from './utils/notifications';
 import { buildProjectSecretHints } from './utils/secretHints';
 import {
   deriveSmartProjectTitle,
@@ -419,9 +424,11 @@ export default function App() {
     return saved || null;
   });
   const [userProfile, setUserProfile] = useState<UserProfile>(() => loadSavedProfile());
-  const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(() =>
-    loadSavedBoolean(STORAGE_NOTIFICATIONS_KEY, false)
-  );
+  const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(() => {
+    const perm = getNotificationPermissionState();
+    if (perm === 'granted') return true;
+    return loadSavedBoolean(STORAGE_NOTIFICATIONS_KEY, true);
+  });
   const [autoReadEnabled, setAutoReadEnabled] = useState<boolean>(() =>
     loadSavedBoolean(STORAGE_AUTOREAD_KEY, true)
   );
@@ -437,6 +444,13 @@ export default function App() {
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [swipedProjectId, setSwipedProjectId] = useState<string | null>(null);
   const [inlineNotice, setInlineNotice] = useState<string | null>(null);
+  const [inAppAlert, setInAppAlert] = useState<{
+    id: string;
+    projectId: string;
+    title: string;
+    body: string;
+    kind: TurnKind;
+  } | null>(null);
   const [models, setModels] = useState<OpenRouterModel[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>(() =>
     normalizeBuilderModelId(loadSavedString(STORAGE_MODEL_KEY))
@@ -452,14 +466,28 @@ export default function App() {
   // Track active network readers per turnId (never globally aborted when switching projects)
   const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
   const retriedTurnsRef = useRef<Set<string>>(new Set());
+  const notifiedTurnIdsRef = useRef<Set<string>>(new Set());
+  const wasBackgroundedRef = useRef<boolean>(false);
   const projectsRef = useRef<CraftProject[]>(projects);
   projectsRef.current = projects;
   const creditsRef = useRef<number>(credits);
   creditsRef.current = credits;
+  const activeProjectIdRef = useRef<string | null>(activeProjectId);
+  activeProjectIdRef.current = activeProjectId;
+  const viewModeRef = useRef<'home' | 'builder'>(viewMode);
+  viewModeRef.current = viewMode;
 
   const persistTimerRef = useRef<number | null>(null);
   const cloudSyncTimerRef = useRef<number | null>(null);
   const cloudHydratedUserRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!inAppAlert) return;
+    const t = window.setTimeout(() => {
+      setInAppAlert((prev) => (prev?.id === inAppAlert.id ? null : prev));
+    }, 6500);
+    return () => window.clearTimeout(t);
+  }, [inAppAlert]);
 
   const isOwnerUser = Boolean(authUser?.isOwner || billing?.isOwner);
 
@@ -1559,6 +1587,13 @@ export default function App() {
                     (nextPhase === 'building' ? 'build' : t.kind),
                   phase: nextPhase,
                   phaseLabel: evt.label!,
+                  activeAction:
+                    evt.action ??
+                    (nextPhase === 'building'
+                      ? t.activeAction && t.activeAction !== 'Thinking'
+                        ? t.activeAction
+                        : 'Building'
+                      : t.activeAction),
                 }));
               } else if (evt.type === 'title' && evt.title) {
                 updateProjectTitle(projectId, evt.title);
@@ -1812,26 +1847,41 @@ export default function App() {
                   }
                   void syncBillingFromServer();
                 }
-                if (
-                  notificationsEnabled &&
-                  document.visibilityState === 'hidden' &&
-                  typeof Notification !== 'undefined' &&
-                  Notification.permission === 'granted'
-                ) {
-                  try {
-                    const matchedProj = projectsRef.current.find(
-                      (p) => p.id === projectId
-                    );
-                    new Notification(matchedProj?.title || 'AI Craft', {
-                      body:
-                        finalKind === 'build'
-                          ? 'Your app build is finished and ready to preview.'
-                          : finalKind === 'media'
-                            ? 'Your generated media is ready.'
-                            : 'AI Craft finished replying to your message.',
+                const matchedProj = projectsRef.current.find(
+                  (p) => p.id === projectId
+                );
+                const projTitle = evt.title || matchedProj?.title || 'AI Craft';
+                const notifBody =
+                  finalKind === 'build'
+                    ? 'Build complete — your app is ready to preview.'
+                    : finalKind === 'media'
+                      ? 'Your generated media is ready.'
+                      : 'AI Craft finished replying to your message.';
+
+                if (!notifiedTurnIdsRef.current.has(turnId)) {
+                  notifiedTurnIdsRef.current.add(turnId);
+                  if (notificationsEnabled) {
+                    void sendAppCompletionNotification({
+                      title: projTitle,
+                      body: notifBody,
+                      tag: `aicraft-${turnId}`,
+                      projectId,
+                      kind: finalKind,
                     });
-                  } catch {
-                    // ignore notification error in unsupported contexts
+                  }
+                  const isHiddenOrAway =
+                    document.visibilityState === 'hidden' ||
+                    wasBackgroundedRef.current ||
+                    viewModeRef.current !== 'builder' ||
+                    activeProjectIdRef.current !== projectId;
+                  if (isHiddenOrAway || finalKind === 'build') {
+                    setInAppAlert({
+                      id: turnId,
+                      projectId,
+                      title: projTitle,
+                      body: notifBody,
+                      kind: finalKind,
+                    });
                   }
                 }
               } else if (evt.type === 'paused') {
@@ -2053,7 +2103,9 @@ export default function App() {
           setInlineNotice(errorText);
           setShowProUpgrade(true);
         }
-        throw new Error(errorText);
+        const httpErr = new Error(errorText) as Error & { isHttpError?: boolean };
+        httpErr.isHttpError = true;
+        throw httpErr;
       };
 
       const runServerSseStream = async (visualHints: unknown) => {
@@ -2104,11 +2156,22 @@ export default function App() {
 
         if (!result.sawTerminalEvent) {
           const reconnectJobId = result.latestJobId || knownJobId;
-          if (
-            document.visibilityState === 'visible' &&
-            (reconnectJobId || !retriedTurnsRef.current.has(turnId))
-          ) {
-            void resumeJobStreamRef.current?.(projectId, turnId, reconnectJobId);
+          const isVisible = document.visibilityState === 'visible';
+          if (reconnectJobId || !isVisible || !retriedTurnsRef.current.has(turnId)) {
+            updateTurn(projectId, turnId, (t) =>
+              t.phase === 'complete' || t.phase === 'paused' || t.phase === 'error'
+                ? t
+                : {
+                    ...t,
+                    jobId: reconnectJobId || t.jobId,
+                    phaseLabel: isVisible
+                      ? 'Reconnecting to live build...'
+                      : 'Continuing in background...',
+                  }
+            );
+            if (isVisible) {
+              void resumeJobStreamRef.current?.(projectId, turnId, reconnectJobId);
+            }
           } else {
             updateTurn(projectId, turnId, (t) =>
               t.phase === 'complete' || t.phase === 'paused' || t.phase === 'error'
@@ -2117,7 +2180,7 @@ export default function App() {
                     ...t,
                     phase: 'error',
                     phaseLabel: 'Paused',
-                    errorMessage: 'Stream connection ended early. Tap Continue / Retry below.',
+                    errorMessage: 'Connection interrupted. Tap Continue / Retry below.',
                   }
             );
           }
@@ -2131,22 +2194,36 @@ export default function App() {
         await runServerSseStream(visualHints);
       } catch (err) {
         activeConnectionsRef.current.delete(turnId);
-        if ((err as Error).name !== 'AbortError') {
+        const errObj = err as Error & { isHttpError?: boolean };
+        if (errObj.name !== 'AbortError') {
+          const isVisible = document.visibilityState === 'visible';
           if (
-            (knownJobId || streamStarted) &&
-            document.visibilityState === 'visible' &&
-            !retriedTurnsRef.current.has(turnId)
+            !errObj.isHttpError &&
+            (knownJobId || streamStarted || !isVisible || !retriedTurnsRef.current.has(turnId))
           ) {
-            window.setTimeout(() => {
-              void resumeJobStreamRef.current?.(projectId, turnId, knownJobId);
-            }, 600);
+            updateTurn(projectId, turnId, (t) =>
+              t.phase === 'complete' || t.phase === 'paused' || t.phase === 'error'
+                ? t
+                : {
+                    ...t,
+                    jobId: knownJobId || t.jobId,
+                    phaseLabel: isVisible
+                      ? 'Reconnecting to live build...'
+                      : 'Continuing in background...',
+                  }
+            );
+            if (isVisible) {
+              window.setTimeout(() => {
+                void resumeJobStreamRef.current?.(projectId, turnId, knownJobId);
+              }, 550);
+            }
             return;
           }
 
           const msg =
             err instanceof Error
               ? err.message
-              : 'Unable to reach free browser AI right now.';
+              : 'Unable to reach AI Craft engine right now.';
           updateTurn(projectId, turnId, (t) => ({
             ...t,
             phase: 'error',
@@ -2165,6 +2242,158 @@ export default function App() {
       publishProjectLive,
       syncBillingFromServer,
       triggerBannedLockout,
+      updateProjectTitle,
+      updateTurn,
+    ]
+  );
+
+  const notifyBackgroundJobCompletion = useCallback(
+    (
+      projectId: string,
+      turnId: string,
+      kind: TurnKind,
+      title?: string
+    ) => {
+      if (notifiedTurnIdsRef.current.has(turnId)) return;
+      notifiedTurnIdsRef.current.add(turnId);
+
+      const matchedProj = projectsRef.current.find((p) => p.id === projectId);
+      const projTitle = title || matchedProj?.title || 'AI Craft';
+      const notifBody =
+        kind === 'build'
+          ? 'Build complete — your app is ready to preview.'
+          : kind === 'media'
+            ? 'Your generated media is ready.'
+            : 'AI Craft finished replying to your message.';
+
+      if (notificationsEnabled) {
+        void sendAppCompletionNotification({
+          title: projTitle,
+          body: notifBody,
+          tag: `aicraft-${turnId}`,
+          projectId,
+          kind,
+        });
+      }
+
+      setInAppAlert({
+        id: turnId,
+        projectId,
+        title: projTitle,
+        body: notifBody,
+        kind,
+      });
+    },
+    [notificationsEnabled]
+  );
+
+  const applyJobSnapshotToTurn = useCallback(
+    (
+      projId: string,
+      turnId: string,
+      snap: {
+        status?: 'running' | 'paused' | 'complete' | 'error';
+        phase?: 'understanding' | 'building' | 'complete' | 'paused' | 'error';
+        phaseLabel?: string;
+        kind?: TurnKind;
+        aiText?: string;
+        previewHtml?: string;
+        media?: GeneratedMediaPayload;
+        files?: string[];
+        planSteps?: string[];
+        suggestions?: string[];
+        activeAction?: string;
+        activeFile?: string;
+        bytesBuilt?: number;
+        creditsUsed?: number;
+        billing?: BillingSummary | null;
+        logo?: Record<string, string>;
+        thoughtSeconds?: number;
+        modelId?: string;
+        modelName?: string;
+        provider?: string;
+        errorMessage?: string;
+        pausedReason?: BuilderTurn['pausedReason'];
+        pausedMessage?: string;
+        title?: string;
+      }
+    ) => {
+      if (snap.title) {
+        updateProjectTitle(projId, snap.title);
+      }
+
+      updateTurn(projId, turnId, (t) => ({
+        ...t,
+        kind: snap.kind ?? t.kind,
+        phase: snap.phase ?? t.phase,
+        phaseLabel: snap.phaseLabel ?? t.phaseLabel,
+        thoughtSeconds:
+          typeof snap.thoughtSeconds === 'number'
+            ? snap.thoughtSeconds
+            : t.thoughtSeconds,
+        aiText:
+          typeof snap.aiText === 'string' && snap.aiText.trim()
+            ? snap.aiText
+            : t.aiText,
+        previewHtml: snap.previewHtml || t.previewHtml,
+        media: snap.media ?? t.media,
+        files: Array.isArray(snap.files) ? snap.files : t.files,
+        planSteps: Array.isArray(snap.planSteps) ? snap.planSteps : t.planSteps,
+        suggestions: Array.isArray(snap.suggestions)
+          ? snap.suggestions
+          : t.suggestions,
+        activeAction: snap.activeAction ?? t.activeAction,
+        activeFile: snap.activeFile ?? t.activeFile,
+        bytesBuilt:
+          typeof snap.bytesBuilt === 'number' ? snap.bytesBuilt : t.bytesBuilt,
+        creditsUsed:
+          typeof snap.creditsUsed === 'number' ? snap.creditsUsed : t.creditsUsed,
+        modelId: snap.modelId ?? t.modelId,
+        modelName: snap.modelName ?? t.modelName,
+        modelProvider: snap.provider ?? t.modelProvider,
+        errorMessage: snap.errorMessage ?? t.errorMessage,
+        pausedReason: snap.pausedReason ?? t.pausedReason,
+        pausedMessage: snap.pausedMessage ?? t.pausedMessage,
+        pausedAt:
+          snap.status === 'paused'
+            ? t.pausedAt ?? new Date().toISOString()
+            : t.pausedAt,
+      }));
+
+      if (snap.status === 'complete') {
+        if (snap.billing) {
+          applyBillingSummary(snap.billing);
+        } else {
+          void syncBillingFromServer();
+        }
+        if (snap.kind !== 'media' && snap.previewHtml) {
+          void publishProjectLive(projId, snap.previewHtml, {
+            title: snap.title,
+            logo: snap.logo,
+          });
+        }
+        notifyBackgroundJobCompletion(
+          projId,
+          turnId,
+          snap.kind ?? (snap.previewHtml ? 'build' : 'chat'),
+          snap.title
+        );
+      } else if (
+        snap.status === 'paused' &&
+        snap.pausedReason !== 'STREAM_INTERRUPTED'
+      ) {
+        if (snap.billing) {
+          applyBillingSummary(snap.billing);
+        } else {
+          void syncBillingFromServer();
+        }
+      }
+    },
+    [
+      applyBillingSummary,
+      notifyBackgroundJobCompletion,
+      publishProjectLive,
+      syncBillingFromServer,
       updateProjectTitle,
       updateTurn,
     ]
@@ -2230,7 +2459,7 @@ export default function App() {
             ...t,
             phase: 'error',
             phaseLabel: 'Paused',
-            errorMessage: 'Stream connection ended early. Tap Continue / Retry below.',
+            errorMessage: 'Connection interrupted. Tap Continue / Retry below.',
           }));
         }
         return;
@@ -2240,19 +2469,18 @@ export default function App() {
       activeConnectionsRef.current.set(turnId, controller);
 
       try {
-        const response = await fetch(
-          `/api/craft/jobs/${encodeURIComponent(targetJobId)}?stream=1`,
+        // Step 1: Fast JSON snapshot check first so waking from background updates instantly
+        const snapRes = await fetch(
+          `/api/craft/jobs/${encodeURIComponent(targetJobId)}`,
           { signal: controller.signal }
         );
 
-        if (response.status === 404) {
+        if (snapRes.status === 404) {
           activeConnectionsRef.current.delete(turnId);
-          // Serverless cold start or expired job: automatically re-run once seamlessly
           if (!retriedTurnsRef.current.has(turnId)) {
             rerunTurnFromSavedProgress();
             return;
           }
-
           updateTurn(projectId, turnId, (t) => ({
             ...t,
             phase: 'error',
@@ -2262,23 +2490,50 @@ export default function App() {
           return;
         }
 
+        if (snapRes.ok) {
+          const snap = (await snapRes.json()) as Parameters<
+            typeof applyJobSnapshotToTurn
+          >[2];
+          applyJobSnapshotToTurn(projectId, turnId, snap);
+          if (
+            snap.status === 'complete' ||
+            snap.status === 'paused' ||
+            snap.status === 'error'
+          ) {
+            activeConnectionsRef.current.delete(turnId);
+            return;
+          }
+        }
+
+        // Step 2: Still running on server -> attach to live ?stream=1 SSE tail
+        const response = await fetch(
+          `/api/craft/jobs/${encodeURIComponent(targetJobId)}?stream=1`,
+          { signal: controller.signal }
+        );
+
         if (!response.ok || !response.body) {
           activeConnectionsRef.current.delete(turnId);
           return;
         }
 
-        await consumeSseStream(
+        const tailRes = await consumeSseStream(
           projectId,
           turnId,
           turn.startedAt ?? Date.now(),
           response
         );
         activeConnectionsRef.current.delete(turnId);
+
+        if (!tailRes.sawTerminalEvent && document.visibilityState === 'visible') {
+          window.setTimeout(() => {
+            void resumeJobStreamRef.current?.(projectId, turnId, targetJobId);
+          }, 900);
+        }
       } catch {
         activeConnectionsRef.current.delete(turnId);
       }
     },
-    [consumeSseStream, runBuilderStream, updateTurn]
+    [applyJobSnapshotToTurn, consumeSseStream, runBuilderStream, updateTurn]
   );
 
   const resumeJobStreamRef = useRef<
@@ -2286,7 +2541,7 @@ export default function App() {
   >(null);
   resumeJobStreamRef.current = resumeJobStream;
 
-  // Reconnect any unfinished background builds on app startup, visibility return, or network recovery
+  // Reconnect any unfinished background builds on app startup, visibility return, network recovery, or polling
   useEffect(() => {
     const syncUnfinishedJobs = (checkActiveSnapshots = false) => {
       for (const proj of projectsRef.current) {
@@ -2298,40 +2553,15 @@ export default function App() {
           if (!activeConnectionsRef.current.has(turn.id)) {
             void resumeJobStreamRef.current?.(proj.id, turn.id, turn.jobId);
           } else if (checkActiveSnapshots && turn.jobId) {
-            // Verify mobile Safari didn't silently freeze an active SSE socket while backgrounded
             void (async () => {
               try {
                 const res = await fetch(
                   `/api/craft/jobs/${encodeURIComponent(turn.jobId!)}`
                 );
                 if (!res.ok) return;
-                const snap = (await res.json()) as {
-                  status?: 'running' | 'paused' | 'complete' | 'error';
-                  phase?: 'understanding' | 'building' | 'complete' | 'paused' | 'error';
-                  phaseLabel?: string;
-                  kind?: TurnKind;
-                  aiText?: string;
-                  previewHtml?: string;
-                  media?: GeneratedMediaPayload;
-                  files?: string[];
-                  planSteps?: string[];
-                  suggestions?: string[];
-                  activeAction?: string;
-                  activeFile?: string;
-                  bytesBuilt?: number;
-                  creditsUsed?: number;
-                  thoughtSeconds?: number;
-                  modelId?: string;
-                  modelName?: string;
-                  provider?: string;
-                  errorMessage?: string;
-                  pausedReason?: BuilderTurn['pausedReason'];
-                  pausedMessage?: string;
-                  title?: string;
-                };
-                if (snap.title) {
-                  updateProjectTitle(proj.id, snap.title);
-                }
+                const snap = (await res.json()) as Parameters<
+                  typeof applyJobSnapshotToTurn
+                >[2];
                 if (
                   snap.status === 'complete' ||
                   snap.status === 'paused' ||
@@ -2339,61 +2569,9 @@ export default function App() {
                 ) {
                   activeConnectionsRef.current.get(turn.id)?.abort();
                   activeConnectionsRef.current.delete(turn.id);
-                  updateTurn(proj.id, turn.id, (t) => ({
-                    ...t,
-                    kind: snap.kind ?? t.kind,
-                    phase: snap.phase ?? t.phase,
-                    phaseLabel: snap.phaseLabel ?? t.phaseLabel,
-                    thoughtSeconds:
-                      typeof snap.thoughtSeconds === 'number'
-                        ? snap.thoughtSeconds
-                        : t.thoughtSeconds,
-                    aiText:
-                      typeof snap.aiText === 'string' && snap.aiText.trim()
-                        ? snap.aiText
-                        : t.aiText,
-                    previewHtml: snap.previewHtml || t.previewHtml,
-                    media: snap.media ?? t.media,
-                    files: Array.isArray(snap.files) ? snap.files : t.files,
-                    planSteps: Array.isArray(snap.planSteps)
-                      ? snap.planSteps
-                      : t.planSteps,
-                    suggestions: Array.isArray(snap.suggestions)
-                      ? snap.suggestions
-                      : t.suggestions,
-                    activeAction: snap.activeAction ?? t.activeAction,
-                    activeFile: snap.activeFile ?? t.activeFile,
-                    bytesBuilt:
-                      typeof snap.bytesBuilt === 'number'
-                        ? snap.bytesBuilt
-                        : t.bytesBuilt,
-                    creditsUsed:
-                      typeof snap.creditsUsed === 'number'
-                        ? snap.creditsUsed
-                        : t.creditsUsed,
-                    modelId: snap.modelId ?? t.modelId,
-                    modelName: snap.modelName ?? t.modelName,
-                    modelProvider: snap.provider ?? t.modelProvider,
-                    errorMessage: snap.errorMessage ?? t.errorMessage,
-                    pausedReason: snap.pausedReason ?? t.pausedReason,
-                    pausedMessage: snap.pausedMessage ?? t.pausedMessage,
-                    pausedAt:
-                      snap.status === 'paused'
-                        ? t.pausedAt ?? new Date().toISOString()
-                        : t.pausedAt,
-                  }));
-                  if (
-                    snap.status === 'complete' &&
-                    snap.kind !== 'media' &&
-                    snap.previewHtml
-                  ) {
-                    void publishProjectLive(proj.id, snap.previewHtml, {
-                      title: snap.title,
-                    });
-                  }
-                  if (snap.status === 'paused' && snap.pausedReason !== 'STREAM_INTERRUPTED') {
-                    void syncBillingFromServer();
-                  }
+                  applyJobSnapshotToTurn(proj.id, turn.id, snap);
+                } else {
+                  applyJobSnapshotToTurn(proj.id, turn.id, snap);
                 }
               } catch {
                 // ignore background check failure
@@ -2406,8 +2584,18 @@ export default function App() {
 
     syncUnfinishedJobs(false);
 
+    const pollTimer = window.setInterval(() => {
+      const hasWorking = projectsRef.current.some((p) =>
+        p.turns.some((t) => t.phase === 'understanding' || t.phase === 'building')
+      );
+      if (hasWorking) {
+        syncUnfinishedJobs(true);
+      }
+    }, 3500);
+
     const handleVisibility = () => {
       if (document.visibilityState === 'hidden') {
+        wasBackgroundedRef.current = true;
         if (persistTimerRef.current !== null) {
           window.clearTimeout(persistTimerRef.current);
           persistTimerRef.current = null;
@@ -2416,15 +2604,24 @@ export default function App() {
       } else if (document.visibilityState === 'visible') {
         syncUnfinishedJobs(true);
         void syncBillingFromServer();
+        window.setTimeout(() => {
+          wasBackgroundedRef.current = false;
+        }, 4000);
       }
     };
 
     const handlePageHide = () => {
+      wasBackgroundedRef.current = true;
       if (persistTimerRef.current !== null) {
         window.clearTimeout(persistTimerRef.current);
         persistTimerRef.current = null;
       }
       saveProjectsSafely(projectsRef.current);
+    };
+
+    const handlePageShow = () => {
+      syncUnfinishedJobs(true);
+      void syncBillingFromServer();
     };
 
     const handleOnline = () => {
@@ -2434,14 +2631,19 @@ export default function App() {
 
     document.addEventListener('visibilitychange', handleVisibility);
     window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('pageshow', handlePageShow);
+    window.addEventListener('focus', handlePageShow);
     window.addEventListener('online', handleOnline);
 
     return () => {
+      window.clearInterval(pollTimer);
       document.removeEventListener('visibilitychange', handleVisibility);
       window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('pageshow', handlePageShow);
+      window.removeEventListener('focus', handlePageShow);
       window.removeEventListener('online', handleOnline);
     };
-  }, [publishProjectLive, syncBillingFromServer, updateProjectTitle, updateTurn]);
+  }, [applyJobSnapshotToTurn, syncBillingFromServer]);
 
   // Automatically generate a live app link + custom logo for any active built project missing them
   const autoPublishedIdsRef = useRef<Set<string>>(new Set());
@@ -2526,6 +2728,9 @@ export default function App() {
     if (!checkCanConsumeCredit()) return;
 
     unlockSpeechSynthesis();
+    if (notificationsEnabled && getNotificationPermissionState() === 'default') {
+      void requestAppNotificationPermission();
+    }
 
     const now = Date.now();
     const projectId = `proj-${now}-${Math.random().toString(36).slice(2, 6)}`;
@@ -2591,6 +2796,9 @@ export default function App() {
     if (!checkCanConsumeCredit()) return;
 
     unlockSpeechSynthesis();
+    if (notificationsEnabled && getNotificationPermissionState() === 'default') {
+      void requestAppNotificationPermission();
+    }
 
     const now = Date.now();
     const turnId = `turn-${now}-${Math.random().toString(36).slice(2, 6)}`;
@@ -3627,6 +3835,72 @@ export default function App() {
       <BottomNav activeTab={activeTab} onChange={setActiveTab} />
         </div>
       )}
+
+      {/* Real-Time Completion Notification Toast */}
+      <AnimatePresence>
+        {inAppAlert && (
+          <motion.div
+            key={inAppAlert.id}
+            initial={{ opacity: 0, y: -16, scale: 0.96 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -12, scale: 0.96 }}
+            transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+            role="status"
+            aria-live="polite"
+            className="fixed top-3 inset-x-0 z-[95] px-4 flex justify-center pointer-events-none"
+          >
+            <div className="pointer-events-auto w-full max-w-[420px] rounded-2xl bg-[#0B0B0F] text-white shadow-[0_14px_34px_rgba(11,11,15,0.28)] border border-white/10 px-3.5 py-2.5 flex items-center gap-3">
+              <div className="w-8 h-8 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0">
+                {inAppAlert.kind === 'build' ? (
+                  <CheckCircle2 className="w-4 h-4" />
+                ) : (
+                  <Bell className="w-4 h-4" />
+                )}
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-[12.5px] font-semibold leading-tight truncate">
+                  {inAppAlert.title}
+                </p>
+                <p className="text-[11.5px] text-white/75 leading-snug truncate mt-0.5">
+                  {inAppAlert.body}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  const targetProj = projectsRef.current.find(
+                    (p) => p.id === inAppAlert.projectId
+                  );
+                  if (targetProj) {
+                    setActiveProjectId(targetProj.id);
+                    setMode(targetProj.mode);
+                    setViewMode('builder');
+                    if (inAppAlert.kind === 'build') {
+                      setProjectViews((prev) => ({
+                        ...prev,
+                        [targetProj.id]: 'preview',
+                      }));
+                    }
+                  }
+                  setInAppAlert(null);
+                }}
+                className="px-2.5 py-1 rounded-xl bg-white text-[#0B0B0F] text-[11.5px] font-semibold shrink-0 hover:bg-white/90 active:scale-95 transition-all"
+              >
+                {inAppAlert.kind === 'build' ? 'Preview' : 'View'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setInAppAlert(null)}
+                aria-label="Dismiss notification"
+                className="p-1 rounded-full text-white/60 hover:text-white hover:bg-white/10 shrink-0"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {headOverlayElement}
       {proModalElement}
     </>
