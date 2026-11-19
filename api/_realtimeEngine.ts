@@ -29,12 +29,48 @@ import {
 } from './_builderCore.js';
 import { GoogleGenAI, type GenerateContentResponse } from '@google/genai';
 import {
-  DEFAULT_POLLINATIONS_TEXT_URL,
+  GEMINI_BUILDER_MODELS,
   buildGatewayExecutionPlan,
-  getServerFreeAiKeys,
+  getServerGeminiApiKey,
   parseGatewayModelIdentifier,
-  resolveUsableGroqModels,
 } from './_aiGateways.js';
+
+export function createGeminiClient(apiKey: string): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+function formatGeminiApiError(err: unknown, modelName: string): string {
+  const rawMsg =
+    err instanceof Error
+      ? err.message
+      : typeof err === 'string'
+        ? err
+        : 'Gemini API request failed.';
+  const lower = rawMsg.toLowerCase();
+
+  if (
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
+    lower.includes('permission_denied') ||
+    lower.includes('403')
+  ) {
+    return 'Your GEMINI_API_KEY was rejected or is invalid. Please check GEMINI_API_KEY in Vercel Environment Variables (or Settings > Secrets).';
+  }
+  if (lower.includes('resource_exhausted') || lower.includes('429') || lower.includes('quota')) {
+    return `${modelName} reached its Gemini API quota or rate limit. Try switching to Gemini 4 Hydrogen or Gemini 3.1 Flash Lite, or check your Gemini API plan.`;
+  }
+  if (lower.includes('not_found') || lower.includes('404') || lower.includes('not found')) {
+    return `${modelName} is not available on this GEMINI_API_KEY yet. Try Gemini 4 Hydrogen, Gemini 3.1 Pro, Gemini 2.5 Pro, or Gemini 2.5 Flash.`;
+  }
+  return rawMsg.slice(0, 320);
+}
 
 export interface VisualHintsSpec {
   dominantColor?: string;
@@ -64,6 +100,7 @@ export interface PrepareRealtimeInput {
   visualHints?: VisualHintsSpec | null;
   reactEnabled?: boolean;
   backendEnabled?: boolean;
+  projectMemoryContext?: string;
 }
 
 export interface PreparedRealtimePrompt {
@@ -169,12 +206,13 @@ export async function prepareRealtimePrompt(
 
   const systemPrompt = buildCraftSystemPrompt({
     mediaKind,
-    requestedModel: input.requestedModel || 'auto::free-browser',
+    requestedModel: input.requestedModel || 'gemini::gemini-4-hydrogen',
     requestedModelLabel: executionPlan.requestedModelLabel,
     initialRoute,
     shouldGenerateTitle,
     timeContext,
     projectInfraContext,
+    projectMemoryContext: input.projectMemoryContext,
     webSearchContext,
     previewSummary,
     mode: input.mode,
@@ -274,9 +312,9 @@ export function finalizeRealtimeOutput(
   const cleanedRaw = stripReasoningTags(input.rawOutput || '');
   const startedAt = typeof input.startedAt === 'number' ? input.startedAt : Date.now();
   const thoughtSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-  const modelUsed = input.modelUsed || 'auto::free-browser';
-  const modelName = input.modelName || 'Free Browser AI';
-  const provider = input.provider || 'browser';
+  const modelUsed = input.modelUsed || 'gemini::gemini-4-hydrogen';
+  const modelName = input.modelName || 'Gemini 4 Hydrogen (Flash)';
+  const provider = input.provider || 'google';
 
   const explicitTitleMatch = /\[\[\s*TITLE\s*:\s*([^\]]+?)\s*\]\]/i.exec(cleanedRaw);
   const title = explicitTitleMatch?.[1]?.trim()
@@ -402,207 +440,57 @@ export async function streamServerFreeAiRealTime(params: {
   onReasoningChunk?: (reasoningText: string) => void;
   onContentChunk: (chunkText: string) => void;
 }): Promise<{ rawOutput: string; modelUsed: string; modelName: string; provider: string }> {
-  const { geminiKey, groqKey, openrouterKey } = getServerFreeAiKeys();
+  const geminiKey = getServerGeminiApiKey();
+  if (!geminiKey) {
+    throw new Error(
+      'GEMINI_API_KEY is not configured on the server yet. Add GEMINI_API_KEY in Vercel Environment Variables (or Settings > Secrets) and redeploy.'
+    );
+  }
+
   const parsedModel = parseGatewayModelIdentifier(params.requestedModel);
+  const matched =
+    GEMINI_BUILDER_MODELS.find(
+      (m) =>
+        m.id === params.requestedModel ||
+        m.upstreamModelId === parsedModel.upstreamModelId
+    ) ?? GEMINI_BUILDER_MODELS[0];
 
-  const tryOpenAiCompatibleStream = async (cfg: {
-    url: string;
-    apiKey: string;
-    model: string;
-    publicId: string;
-    modelName: string;
-    provider: string;
-    extraHeaders?: Record<string, string>;
-  }): Promise<string> => {
-    params.onModelMeta?.({
-      modelId: cfg.publicId,
-      modelName: cfg.modelName,
-      provider: cfg.provider,
-    });
-    const supportsImageUrl =
-      cfg.provider !== 'groq' || /llama-4|vision/i.test(cfg.model);
-    const userContent: unknown =
-      params.attachmentDataUrl &&
-      params.attachmentDataUrl.startsWith('data:image/') &&
-      supportsImageUrl
-        ? [
-            { type: 'text', text: params.userPrompt },
-            { type: 'image_url', image_url: { url: params.attachmentDataUrl } },
-          ]
-        : params.userPrompt;
+  params.onModelMeta?.({
+    modelId: matched.id,
+    modelName: matched.name,
+    provider: 'google',
+  });
 
-    const response = await fetch(cfg.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${cfg.apiKey}`,
-        ...(cfg.extraHeaders || {}),
-      },
-      body: JSON.stringify({
-        model: cfg.model,
-        stream: true,
-        max_tokens: 16384,
-        messages: [
-          { role: 'system', content: params.systemPrompt },
-          ...params.historyMessages,
-          { role: 'user', content: userContent },
-        ],
-      }),
-      signal: params.signal,
-    });
+  const ai = createGeminiClient(geminiKey);
 
-    if (!response.ok || !response.body) {
-      const errText = await response.text().catch(() => '');
-      throw new Error(
-        errText.slice(0, 220) || `${cfg.modelName} returned status ${response.status}`
-      );
-    }
+  const contents: Array<{
+    role: 'user' | 'model';
+    parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }>;
+  }> = params.historyMessages.map((m) => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }],
+  }));
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let fullContent = '';
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() ?? '';
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line.startsWith('data:')) continue;
-        const data = line.slice(5).trim();
-        if (!data || data === '[DONE]') continue;
-        try {
-          const parsed = JSON.parse(data) as {
-            choices?: Array<{
-              delta?: {
-                reasoning?: string;
-                reasoning_content?: string;
-                content?: string;
-              };
-            }>;
-          };
-          const delta = parsed?.choices?.[0]?.delta;
-          const reasoning = delta?.reasoning || delta?.reasoning_content;
-          if (reasoning) params.onReasoningChunk?.(reasoning);
-          if (typeof delta?.content === 'string' && delta.content.length > 0) {
-            fullContent += delta.content;
-            params.onContentChunk(delta.content);
-          }
-        } catch {
-          // ignore malformed SSE chunk
-        }
-      }
-    }
-
-    if (!fullContent.trim()) {
-      throw new Error(`${cfg.modelName} returned an empty response.`);
-    }
-    return fullContent;
-  };
-
-  // Prefer Groq directly if explicitly selected & usable
-  if (parsedModel.gateway === 'groq' && groqKey) {
-    const groqInfo = await resolveUsableGroqModels();
-    if (groqInfo.usable && groqInfo.bestModelId) {
-      const hasImage = Boolean(
-        params.attachmentDataUrl && params.attachmentDataUrl.startsWith('data:image/')
-      );
-      const chosenGroqModel =
-        hasImage && groqInfo.visionModelId
-          ? groqInfo.visionModelId
-          : /llama-4|vision/i.test(parsedModel.upstreamModelId) ||
-              parsedModel.upstreamModelId === groqInfo.bestModelId
-            ? parsedModel.upstreamModelId
-            : groqInfo.bestModelId;
-      try {
-        const out = await tryOpenAiCompatibleStream({
-          url: 'https://api.groq.com/openai/v1/chat/completions',
-          apiKey: groqKey,
-          model: chosenGroqModel,
-          publicId: `groq::${chosenGroqModel}`,
-          modelName: `${chosenGroqModel.split('/').pop()} (Free Server)`,
-          provider: 'groq',
-        });
-        return {
-          rawOutput: out,
-          modelUsed: `groq::${chosenGroqModel}`,
-          modelName: `${chosenGroqModel.split('/').pop()} (Free Server)`,
-          provider: 'groq',
-        };
-      } catch (groqErr) {
-        if (!geminiKey && !openrouterKey) {
-          throw groqErr;
-        }
-      }
-    }
-  }
-
-  // Prefer OpenRouter directly if explicitly selected & key exists
-  if (parsedModel.gateway === 'openrouter' && openrouterKey) {
-    const out = await tryOpenAiCompatibleStream({
-      url: 'https://openrouter.ai/api/v1/chat/completions',
-      apiKey: openrouterKey,
-      model: parsedModel.upstreamModelId,
-      publicId: `openrouter::${parsedModel.upstreamModelId}`,
-      modelName: 'Qwen3 Coder (Free Server)',
-      provider: 'openrouter',
-      extraHeaders: { 'X-Title': 'AI Craft' },
-    });
-    return {
-      rawOutput: out,
-      modelUsed: `openrouter::${parsedModel.upstreamModelId}`,
-      modelName: 'Qwen3 Coder (Free Server)',
-      provider: 'openrouter',
-    };
-  }
-
-  // Default & Primary Server Vision + Code Path: @google/genai (gemini-4-hydrogen)
-  if (geminiKey) {
-    params.onModelMeta?.({
-      modelId: 'gemini::gemini-4-hydrogen',
-      modelName: 'Gemini Flash (Vision · Free Server)',
-      provider: 'google',
-    });
-
-    const ai = new GoogleGenAI({
-      apiKey: geminiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
+  const userParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
+  if (params.attachmentDataUrl && params.attachmentDataUrl.startsWith('data:image/')) {
+    const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/.exec(
+      params.attachmentDataUrl
+    );
+    if (match?.[1] && match?.[2]) {
+      userParts.push({
+        inlineData: {
+          mimeType: match[1],
+          data: match[2],
         },
-      },
-    });
-
-    const contents: Array<{
-      role: 'user' | 'model';
-      parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }>;
-    }> = params.historyMessages.map((m) => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }],
-    }));
-
-    const userParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
-    if (params.attachmentDataUrl && params.attachmentDataUrl.startsWith('data:image/')) {
-      const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/.exec(
-        params.attachmentDataUrl
-      );
-      if (match?.[1] && match?.[2]) {
-        userParts.push({
-          inlineData: {
-            mimeType: match[1],
-            data: match[2],
-          },
-        });
-      }
+      });
     }
-    userParts.push({ text: params.userPrompt });
-    contents.push({ role: 'user', parts: userParts });
+  }
+  userParts.push({ text: params.userPrompt });
+  contents.push({ role: 'user', parts: userParts });
 
+  try {
     const streamResponse = await ai.models.generateContentStream({
-      model: 'gemini-4-hydrogen',
+      model: matched.upstreamModelId,
       contents,
       config: {
         systemInstruction: params.systemPrompt,
@@ -620,248 +508,17 @@ export async function streamServerFreeAiRealTime(params: {
       }
     }
 
-    if (fullContent.trim()) {
-      return {
-        rawOutput: fullContent,
-        modelUsed: 'gemini::gemini-4-hydrogen',
-        modelName: 'Gemini Flash (Vision · Free Server)',
-        provider: 'google',
-      };
+    if (!fullContent.trim()) {
+      throw new Error(`${matched.name} returned an empty response.`);
     }
-  }
 
-  if (groqKey) {
-    const groqInfo = await resolveUsableGroqModels();
-    if (groqInfo.usable && groqInfo.bestModelId) {
-      const hasImage = Boolean(
-        params.attachmentDataUrl && params.attachmentDataUrl.startsWith('data:image/')
-      );
-      const chosenGroqModel =
-        hasImage && groqInfo.visionModelId
-          ? groqInfo.visionModelId
-          : groqInfo.bestModelId;
-      const out = await tryOpenAiCompatibleStream({
-        url: 'https://api.groq.com/openai/v1/chat/completions',
-        apiKey: groqKey,
-        model: chosenGroqModel,
-        publicId: `groq::${chosenGroqModel}`,
-        modelName: `${chosenGroqModel.split('/').pop()} (Free Server)`,
-        provider: 'groq',
-      });
-      return {
-        rawOutput: out,
-        modelUsed: `groq::${chosenGroqModel}`,
-        modelName: `${chosenGroqModel.split('/').pop()} (Free Server)`,
-        provider: 'groq',
-      };
-    }
-  }
-
-  if (openrouterKey) {
-    const out = await tryOpenAiCompatibleStream({
-      url: 'https://openrouter.ai/api/v1/chat/completions',
-      apiKey: openrouterKey,
-      model: 'qwen/qwen3-coder:free',
-      publicId: 'openrouter::qwen/qwen3-coder:free',
-      modelName: 'Qwen3 Coder (Free Server)',
-      provider: 'openrouter',
-      extraHeaders: { 'X-Title': 'AI Craft' },
-    });
     return {
-      rawOutput: out,
-      modelUsed: 'openrouter::qwen/qwen3-coder:free',
-      modelName: 'Qwen3 Coder (Free Server)',
-      provider: 'openrouter',
+      rawOutput: fullContent,
+      modelUsed: matched.id,
+      modelName: matched.name,
+      provider: 'google',
     };
-  }
-
-  const fallbackOut = await streamPollinationsRealTime({
-    systemPrompt: params.systemPrompt,
-    historyMessages: params.historyMessages,
-    userPrompt: params.userPrompt,
-    signal: params.signal,
-    onReasoningChunk: params.onReasoningChunk,
-    onContentChunk: params.onContentChunk,
-  });
-
-  return {
-    rawOutput: fallbackOut,
-    modelUsed: params.requestedModel || 'puter::gemini-2.5-flash',
-    modelName: 'Free Vision & Code Builder',
-    provider: 'browser',
-  };
-}
-
-export async function streamPollinationsRealTime(params: {
-  systemPrompt: string;
-  historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
-  userPrompt: string;
-  signal?: AbortSignal;
-  onReasoningChunk?: (reasoningText: string) => void;
-  onContentChunk: (chunkText: string) => void;
-}): Promise<string> {
-  const controller = new AbortController();
-  let timedOutReason = '';
-
-  const forwardAbort = () => {
-    if (!controller.signal.aborted) controller.abort();
-  };
-  if (params.signal) {
-    if (params.signal.aborted) forwardAbort();
-    else params.signal.addEventListener('abort', forwardAbort, { once: true });
-  }
-
-  let watchdog: ReturnType<typeof setTimeout> | null = null;
-  const resetWatchdog = (ms: number, reason: string) => {
-    if (watchdog) clearTimeout(watchdog);
-    watchdog = setTimeout(() => {
-      timedOutReason = reason;
-      if (!controller.signal.aborted) controller.abort();
-    }, ms);
-  };
-
-  resetWatchdog(22_000, 'Free Browser AI timed out before responding.');
-
-  let fullContent = '';
-
-  try {
-    const response = await fetch(`${DEFAULT_POLLINATIONS_TEXT_URL}/openai`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'openai-fast',
-        stream: true,
-        temperature: 0.45,
-        messages: [
-          { role: 'system', content: params.systemPrompt },
-          ...params.historyMessages,
-          { role: 'user', content: params.userPrompt },
-        ],
-      }),
-      signal: controller.signal,
-    });
-
-    if (!response.ok || !response.body) {
-      let errMsg = `Free AI gateway returned status ${response.status}`;
-      try {
-        const errJson = (await response.json()) as {
-          error?: { message?: string; code?: string } | string;
-          message?: string;
-        };
-        if (typeof errJson?.error === 'object' && errJson.error?.message) {
-          errMsg = errJson.error.message;
-        } else if (typeof errJson?.error === 'string') {
-          errMsg = errJson.error;
-        } else if (errJson?.message) {
-          errMsg = errJson.message;
-        }
-      } catch {
-        // ignore parse failure
-      }
-      throw new Error(errMsg);
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    resetWatchdog(25_000, 'Free AI stream stalled mid-response.');
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-
-      resetWatchdog(25_000, 'Free AI stream stalled mid-response.');
-      buffer += decoder.decode(value, { stream: true });
-
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() ?? '';
-
-      for (const rawLine of lines) {
-        const trimmedLine = rawLine.trim();
-        if (!trimmedLine || trimmedLine.startsWith(':')) continue;
-
-        const subFrames = trimmedLine.includes('}data:')
-          ? trimmedLine.split(/(?=data:\s*)/)
-          : [trimmedLine];
-
-        for (const frame of subFrames) {
-          const line = frame.trim();
-          if (!line.startsWith('data:')) continue;
-          const data = line.slice(5).trim();
-          if (!data || data === '[DONE]') continue;
-
-          try {
-            const parsed = JSON.parse(data) as {
-              error?: { message?: string };
-              choices?: Array<{
-                delta?: {
-                  reasoning?: string;
-                  reasoning_content?: string;
-                  content?: string | Array<{ type?: string; text?: string }>;
-                };
-              }>;
-            };
-            if (parsed?.error?.message) {
-              throw new Error(parsed.error.message);
-            }
-            const delta = parsed?.choices?.[0]?.delta;
-            const reasoningPart = delta?.reasoning || delta?.reasoning_content;
-            if (typeof reasoningPart === 'string' && reasoningPart.length > 0) {
-              params.onReasoningChunk?.(reasoningPart);
-            }
-            const content = delta?.content;
-            if (typeof content === 'string' && content.length > 0) {
-              fullContent += content;
-              params.onContentChunk(content);
-            } else if (Array.isArray(content)) {
-              for (const part of content) {
-                if (typeof part?.text === 'string' && part.text.length > 0) {
-                  fullContent += part.text;
-                  params.onContentChunk(part.text);
-                }
-              }
-            }
-          } catch (innerErr) {
-            if (innerErr instanceof SyntaxError) continue;
-            throw innerErr;
-          }
-        }
-      }
-    }
-
-    if (buffer.trim().startsWith('data:')) {
-      const tailFrames = buffer.trim().split(/(?=data:\s*)/);
-      for (const frame of tailFrames) {
-        const data = frame.trim().slice(5).trim();
-        if (!data || data === '[DONE]') continue;
-        try {
-          const parsed = JSON.parse(data) as {
-            choices?: Array<{ delta?: { content?: string } }>;
-          };
-          const content = parsed?.choices?.[0]?.delta?.content;
-          if (typeof content === 'string' && content.length > 0) {
-            fullContent += content;
-            params.onContentChunk(content);
-          }
-        } catch {
-          // ignore incomplete tail
-        }
-      }
-    }
-
-    return fullContent;
   } catch (err) {
-    if (timedOutReason) {
-      throw new Error(timedOutReason);
-    }
-    throw err;
-  } finally {
-    if (watchdog) clearTimeout(watchdog);
-    if (params.signal) {
-      params.signal.removeEventListener('abort', forwardAbort);
-    }
+    throw new Error(formatGeminiApiError(err, matched.name));
   }
 }

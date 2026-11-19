@@ -26,6 +26,14 @@
       "destination": "/api/payments?__route=$1"
     },
     {
+      "source": "/api/memory",
+      "destination": "/api/route?__memory=1"
+    },
+    {
+      "source": "/api/memory/(.*)",
+      "destination": "/api/route?__memory=1"
+    },
+    {
       "source": "/api/:match*",
       "destination": "/api/:match*"
     },

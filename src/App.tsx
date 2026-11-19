@@ -28,9 +28,7 @@ import { unlockSpeechSynthesis } from './hooks/useSpeechNarration';
 import {
   analyzeAttachmentVisualHints,
   normalizeBuilderModelId,
-  streamRealTimeBrowserAi,
 } from './utils/browserAi';
-import { inspectBuiltAppCompleteness } from './utils/screenExtractor';
 import { buildProjectSecretHints } from './utils/secretHints';
 import {
   deriveSmartProjectTitle,
@@ -443,7 +441,6 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState<string>(() =>
     normalizeBuilderModelId(loadSavedString(STORAGE_MODEL_KEY))
   );
-  const [serverFreeAiReady, setServerFreeAiReady] = useState<boolean>(false);
   const [modelsLoading, setModelsLoading] = useState<boolean>(true);
   const [modelsError, setModelsError] = useState<string | null>(null);
   const [transactions, setTransactions] = useState<PaymentTransaction[]>(() => {
@@ -922,6 +919,47 @@ export default function App() {
       }).catch(() => {
         // ignore background sync failure
       });
+
+      // Also persist structured per-project AI Brain memory snapshot to /api/memory
+      const activeSyncProj =
+        compactProjects.find((p) => p.id === activeProjectId) ?? compactProjects[0];
+      if (activeSyncProj && !isProjectWorking(activeSyncProj)) {
+        void fetch('/api/memory', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...headers,
+          },
+          body: JSON.stringify({
+            action: 'save',
+            projectId: activeSyncProj.id,
+            title: activeSyncProj.title,
+            mode: activeSyncProj.mode,
+            databaseSchema: activeSyncProj.databaseConfig?.tables || [],
+            turns: activeSyncProj.turns.slice(-20).map((t) => ({
+              id: t.id,
+              kind: t.kind,
+              userMessage: t.userMessage,
+              aiText: t.aiText,
+              phase: t.phase,
+              phaseLabel: t.phaseLabel,
+              activeAction: t.activeAction,
+              activeFile: t.activeFile,
+              files: t.files,
+              planSteps: t.planSteps,
+              previewHtml: t.previewHtml,
+              bytesBuilt: t.bytesBuilt,
+              modelId: t.modelId,
+              pausedReason: t.pausedReason,
+              pausedMessage: t.pausedMessage,
+              pausedAt: t.pausedAt,
+              errorMessage: t.errorMessage,
+            })),
+          }),
+        }).catch(() => {
+          // non-fatal background memory persistence
+        });
+      }
     }, working ? 4500 : 1400);
 
     return () => {
@@ -930,7 +968,7 @@ export default function App() {
         cloudSyncTimerRef.current = null;
       }
     };
-  }, [authUser, cloudHydratedTick, projects, projectViews, publishedProjects, userProfile]);
+  }, [authUser, cloudHydratedTick, activeProjectId, projects, projectViews, publishedProjects, userProfile]);
 
   useEffect(() => {
     try {
@@ -1014,28 +1052,22 @@ export default function App() {
       }
       const data = (await response.json()) as {
         models?: OpenRouterModel[];
-        serverFreeAiReady?: boolean;
         error?: string;
       };
-      setServerFreeAiReady(Boolean(data?.serverFreeAiReady));
       const fetched = Array.isArray(data?.models) ? data.models : [];
       if (fetched.length > 0) {
         setModels(fetched);
         setSelectedModel((prev) => {
           const normalizedPrev = normalizeBuilderModelId(prev);
           const matched = fetched.find((m) => m.id === normalizedPrev);
-          if (data?.serverFreeAiReady && (!matched || matched.id.startsWith('puter::'))) {
-            const serverFirst = fetched.find((m) => !m.id.startsWith('puter::'));
-            if (serverFirst) return serverFirst.id;
-          }
           return matched ? matched.id : fetched[0].id;
         });
       } else if (!response.ok || data?.error) {
-        setModelsError(data?.error || 'Unable to load free browser AI models.');
+        setModelsError(data?.error || 'Unable to load Gemini models.');
       }
     } catch (err) {
       setModelsError(
-        err instanceof Error ? err.message : 'Unable to load free browser AI models.'
+        err instanceof Error ? err.message : 'Unable to load Gemini models.'
       );
     } finally {
       setModelsLoading(false);
@@ -2037,6 +2069,8 @@ export default function App() {
             ...getStoredAuthHeaders(),
           },
           body: JSON.stringify({
+            projectId,
+            turnId,
             message,
             mode: targetMode,
             model: modelToUse || undefined,
@@ -2091,422 +2125,10 @@ export default function App() {
       };
 
       try {
-        const clientTimeZone =
-          Intl.DateTimeFormat().resolvedOptions().timeZone || '';
-        const clientTime = new Date().toLocaleString();
-        const matchedModel = models.find((m) => m.id === modelToUse);
         const visualHints = await analyzeAttachmentVisualHints(
           options.attachmentDataUrl
         );
-
-        const normalizedModel = normalizeBuilderModelId(modelToUse);
-        const shouldUseServerFreeAi =
-          normalizedModel.startsWith('gemini::') ||
-          normalizedModel.startsWith('groq::') ||
-          normalizedModel.startsWith('openrouter::') ||
-          (serverFreeAiReady && !normalizedModel.startsWith('puter::'));
-
-        if (shouldUseServerFreeAi) {
-          await runServerSseStream(visualHints);
-          return;
-        }
-
-        // 1. Prepare live grounded prompt (checks moderation, billing, live clinic/web search & photography)
-        const prepareRes = await fetch('/api/route', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...getStoredAuthHeaders(),
-          },
-          body: JSON.stringify({
-            action: 'prepare',
-            message,
-            mode: targetMode,
-            model: modelToUse || undefined,
-            gateway: matchedModel?.gateway || undefined,
-            clientTime,
-            clientTimeZone,
-            previousHtml,
-            history,
-            visualHints,
-            options,
-          }),
-          signal: controller.signal,
-        });
-
-        if (!prepareRes.ok) {
-          await handleHttpFailureResponse(
-            prepareRes,
-            'Unable to prepare free browser AI request.'
-          );
-        }
-
-        const prepared = (await prepareRes.json()) as {
-          ok?: boolean;
-          initialRoute?: 'chat' | 'build' | 'auto';
-          mediaKind?: 'image' | 'music' | 'video' | null;
-          naturalMediaIntent?: 'image' | 'music' | 'video' | null;
-          requestedModelLabel?: string;
-          shouldGenerateTitle?: boolean;
-          systemPrompt: string;
-          userPrompt: string;
-          historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
-          searchData?: {
-            query?: string;
-            results?: Array<{ title: string; url: string; snippet: string }>;
-            images?: Array<{ url: string; title: string; source: string }>;
-          };
-          billing?: BillingSummary | null;
-        };
-
-        if (prepared.billing) {
-          applyBillingSummary(prepared.billing);
-        }
-
-        // 2. True Real-Time Vision & Code Streaming (Claude Sonnet 4.6 / Gemini 2.5 Flash via Puter)
-        const hasSearchHits = Boolean(prepared.searchData?.results?.length);
-        updateTurn(projectId, turnId, (t) => ({
-          ...t,
-          kind: prepared.initialRoute === 'build' ? 'build' : t.kind,
-          phase: 'understanding',
-          phaseLabel: hasSearchHits
-            ? 'Searched live web · Planning multi-screen architecture...'
-            : 'Thinking step by step...',
-        }));
-
-        const streamTurnCallbacks = {
-          onModelSelected: (info: { modelId: string; modelName: string; provider: string }) => {
-            updateTurn(projectId, turnId, (t) => ({
-              ...t,
-              modelId: info.modelId,
-              modelName: info.modelName,
-              modelProvider: info.provider,
-            }));
-          },
-          onReasoning: () => {
-            updateTurn(projectId, turnId, (t) =>
-              t.phase === 'understanding'
-                ? {
-                    ...t,
-                    phaseLabel: 'Checking real-time structure & design...',
-                  }
-                : t
-            );
-          },
-          onTitle: (title: string) => {
-            updateProjectTitle(projectId, title);
-          },
-          onPlanSteps: (steps: string[]) => {
-            updateTurn(projectId, turnId, (t) => ({
-              ...t,
-              planSteps: steps,
-            }));
-          },
-          onDbTables: (tables: IncomingSchemaTable[]) => {
-            setProjects((prev) =>
-              prev.map((p) =>
-                p.id === projectId
-                  ? {
-                      ...p,
-                      databaseConfig: mergeIncomingDbSchema(
-                        p.databaseConfig,
-                        tables
-                      ),
-                    }
-                  : p
-              )
-            );
-            window.dispatchEvent(
-              new CustomEvent('aicraft:db-updated', { detail: { projectId } })
-            );
-          },
-          onPhaseChange: (phase: 'understanding' | 'building', label: string) => {
-            updateTurn(projectId, turnId, (t) => ({
-              ...t,
-              kind: phase === 'building' ? 'build' : t.kind,
-              phase,
-              phaseLabel: label,
-            }));
-          },
-          onProseUpdate: (proseText: string) => {
-            updateTurn(projectId, turnId, (t) => ({
-              ...t,
-              aiText: proseText,
-            }));
-          },
-          onBuildProgress: (progress: {
-            files: string[];
-            activeAction: string;
-            activeFile: string;
-            bytesBuilt: number;
-            partialHtml?: string;
-          }) => {
-            updateTurn(projectId, turnId, (t) => ({
-              ...t,
-              kind: 'build',
-              phase: 'building',
-              phaseLabel: progress.partialHtml
-                ? `Drawing screens & wiring ${progress.activeFile}...`
-                : `Building ${progress.activeFile}...`,
-              files: progress.files,
-              activeAction: progress.activeAction,
-              activeFile: progress.activeFile,
-              bytesBuilt: progress.bytesBuilt,
-              previewHtml: progress.partialHtml || t.previewHtml,
-            }));
-          },
-        };
-
-        let browserResult: Awaited<ReturnType<typeof streamRealTimeBrowserAi>> | null =
-          null;
-        let browserStreamError: Error | null = null;
-
-        try {
-          browserResult = await streamRealTimeBrowserAi({
-            modelId: normalizeBuilderModelId(modelToUse),
-            systemPrompt: prepared.systemPrompt,
-            historyMessages: prepared.historyMessages,
-            userPrompt: prepared.userPrompt,
-            previousHtml,
-            attachmentDataUrl: options.attachmentDataUrl,
-            signal: controller.signal,
-            ...streamTurnCallbacks,
-          });
-        } catch (err) {
-          if ((err as Error)?.name === 'AbortError') {
-            throw err;
-          }
-          browserStreamError =
-            err instanceof Error
-              ? err
-              : new Error('Unable to reach Vision & Code AI right now.');
-        }
-
-        if (!browserResult || !browserResult.rawOutput.trim()) {
-          if (browserStreamError) {
-            throw browserStreamError;
-          }
-          throw new Error('Vision & Code AI did not return any output. Please retry.');
-        }
-
-        type FinalizedPayload = {
-          ok?: boolean;
-          kind: TurnKind;
-          title?: string;
-          aiText: string;
-          previewHtml?: string;
-          files: string[];
-          planSteps?: string[];
-          dbTables?: IncomingSchemaTable[];
-          suggestions?: string[];
-          logo?: Record<string, string> | null;
-          thoughtSeconds?: number;
-          bytesBuilt?: number;
-          creditsUsed?: number;
-          billing?: BillingSummary | null;
-          modelUsed?: string;
-          modelName?: string;
-          provider?: string;
-        };
-
-        const runFinalizePass = async (
-          rawText: string,
-          meta: { modelUsed: string; modelName: string; provider: string }
-        ): Promise<FinalizedPayload> => {
-          const finalizeRes = await fetch('/api/route', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...getStoredAuthHeaders(),
-            },
-            body: JSON.stringify({
-              action: 'finalize',
-              rawOutput: rawText,
-              message,
-              mode: targetMode,
-              previousHtml,
-              modelUsed: meta.modelUsed,
-              modelName: meta.modelName,
-              provider: meta.provider,
-              startedAt,
-            }),
-            signal: controller.signal,
-          });
-          if (!finalizeRes.ok) {
-            await handleHttpFailureResponse(
-              finalizeRes,
-              'Failed to finalize built app.'
-            );
-          }
-          return (await finalizeRes.json()) as FinalizedPayload;
-        };
-
-        // 4. Finalize Pass 1
-        let finalized = await runFinalizePass(browserResult.rawOutput, browserResult);
-
-        // 5. Calm Self-Inspection & Expansion Pass 2:
-        //    Inspect what the AI actually built in Preview; on Puter (which has no 45s-per-reply IP limit),
-        //    if Pass 1 rushed out only 1-2 screens or < 12 KB, keep Pass 1 screens visible while adding remaining layers.
-        if (
-          finalized.kind === 'build' &&
-          finalized.previewHtml &&
-          browserResult.modelUsed.startsWith('puter::')
-        ) {
-          const audit = inspectBuiltAppCompleteness(finalized.previewHtml, message);
-          if (audit.needsExpansionPass && !controller.signal.aborted) {
-            updateTurn(projectId, turnId, (t) => ({
-              ...t,
-              kind: 'build',
-              phase: 'building',
-              phaseLabel: `Checking ${audit.screenCount || 1} built screen${
-                audit.screenCount === 1 ? '' : 's'
-              } · Adding remaining screens & layers...`,
-              previewHtml: finalized.previewHtml,
-              files: finalized.files.length > 0 ? finalized.files : t.files,
-            }));
-
-            try {
-              const expansionPrompt = [
-                `CURRENT BUILT PREVIEW HTML (${(finalized.previewHtml.length / 1024).toFixed(1)} KB):\n\`\`\`html\n${finalized.previewHtml.slice(0, 120000)}\n\`\`\``,
-                audit.critiquePrompt,
-              ].join('\n\n');
-
-              const pass2Result = await streamRealTimeBrowserAi({
-                modelId: normalizeBuilderModelId(browserResult.modelUsed || modelToUse),
-                systemPrompt: prepared.systemPrompt,
-                historyMessages: prepared.historyMessages,
-                userPrompt: expansionPrompt,
-                previousHtml: finalized.previewHtml,
-                attachmentDataUrl: options.attachmentDataUrl,
-                signal: controller.signal,
-                ...streamTurnCallbacks,
-              });
-
-              if (pass2Result?.rawOutput?.trim()) {
-                const pass2Finalized = await runFinalizePass(
-                  pass2Result.rawOutput,
-                  pass2Result
-                );
-                if (
-                  pass2Finalized.kind === 'build' &&
-                  pass2Finalized.previewHtml &&
-                  pass2Finalized.previewHtml.length >= finalized.previewHtml.length * 0.85
-                ) {
-                  finalized = pass2Finalized;
-                  browserResult = pass2Result;
-                }
-              }
-            } catch (pass2Err) {
-              if ((pass2Err as Error)?.name === 'AbortError') {
-                throw pass2Err;
-              }
-              // Keep Pass 1 valid build cleanly if Pass 2 provider hit a temporary cooldown
-            }
-          }
-        }
-
-        activeConnectionsRef.current.delete(turnId);
-
-        if (finalized.title) {
-          updateProjectTitle(projectId, finalized.title);
-        }
-
-        const finalSeconds = Math.max(
-          1,
-          finalized.thoughtSeconds ?? Math.round((Date.now() - startedAt) / 1000)
-        );
-        const resolvedKind: TurnKind = finalized.kind === 'build' ? 'build' : 'chat';
-
-        updateTurn(projectId, turnId, (t) => ({
-          ...t,
-          kind: resolvedKind,
-          phase: 'complete',
-          phaseLabel:
-            resolvedKind === 'build' ? 'Build complete' : 'Answered',
-          thoughtSeconds: finalSeconds,
-          aiText: finalized.aiText || t.aiText,
-          previewHtml:
-            resolvedKind === 'build' ? finalized.previewHtml || t.previewHtml : '',
-          files:
-            Array.isArray(finalized.files) && finalized.files.length > 0
-              ? finalized.files
-              : t.files,
-          planSteps:
-            Array.isArray(finalized.planSteps) && finalized.planSteps.length > 0
-              ? finalized.planSteps
-              : t.planSteps,
-          suggestions: Array.isArray(finalized.suggestions)
-            ? finalized.suggestions
-            : t.suggestions,
-          activeAction: resolvedKind === 'build' ? 'Built' : 'Answered',
-          activeFile: finalized.files?.[0] ?? t.activeFile,
-          bytesBuilt:
-            typeof finalized.bytesBuilt === 'number'
-              ? finalized.bytesBuilt
-              : t.bytesBuilt,
-          creditsUsed:
-            typeof finalized.creditsUsed === 'number'
-              ? finalized.creditsUsed
-              : 0,
-          modelId: finalized.modelUsed ?? browserResult.modelUsed,
-          modelName: finalized.modelName ?? browserResult.modelName,
-          modelProvider: finalized.provider ?? browserResult.provider,
-        }));
-
-        if (resolvedKind === 'build' && finalized.previewHtml) {
-          void publishProjectLive(projectId, finalized.previewHtml, {
-            title: finalized.title,
-            logo: finalized.logo || undefined,
-          });
-        }
-
-        if (Array.isArray(finalized.dbTables) && finalized.dbTables.length > 0) {
-          const finalTables = finalized.dbTables;
-          setProjects((prev) =>
-            prev.map((p) =>
-              p.id === projectId
-                ? {
-                    ...p,
-                    databaseConfig: mergeIncomingDbSchema(
-                      p.databaseConfig,
-                      finalTables
-                    ),
-                  }
-                : p
-            )
-          );
-          window.dispatchEvent(
-            new CustomEvent('aicraft:db-updated', { detail: { projectId } })
-          );
-        }
-
-        if (finalized.billing) {
-          applyBillingSummary(finalized.billing);
-        } else if (typeof finalized.creditsUsed === 'number' && finalized.creditsUsed > 0) {
-          adjustLocalCredits(-finalized.creditsUsed);
-          void syncBillingFromServer();
-        }
-
-        if (
-          notificationsEnabled &&
-          document.visibilityState === 'hidden' &&
-          typeof Notification !== 'undefined' &&
-          Notification.permission === 'granted'
-        ) {
-          try {
-            const matchedProj = projectsRef.current.find(
-              (p) => p.id === projectId
-            );
-            new Notification(matchedProj?.title || 'AI Craft', {
-              body:
-                resolvedKind === 'build'
-                  ? 'Your real-time app build is finished and ready to preview.'
-                  : 'AI Craft finished answering your question.',
-            });
-          } catch {
-            // ignore notification errors
-          }
-        }
+        await runServerSseStream(visualHints);
       } catch (err) {
         activeConnectionsRef.current.delete(turnId);
         if ((err as Error).name !== 'AbortError') {

@@ -1,12 +1,9 @@
 import crypto from 'node:crypto';
 import {
-  DEFAULT_POLLINATIONS_IMAGE_URL,
-  DEFAULT_POLLINATIONS_TEXT_URL,
-  buildCandidateCooldownKey,
-  isGatewayCandidateCoolingDown,
-  markGatewayCandidateCooldown,
+  getServerGeminiApiKey,
   parseGatewayModelIdentifier,
 } from './_aiGateways.js';
+import { createGeminiClient } from './_realtimeEngine.js';
 import { runLiveBrowserSearch } from './_builderCore.js';
 import { isTextToSpeechModel } from './_openrouterModels.js';
 
@@ -18,7 +15,7 @@ export interface GeneratedMediaResult {
   dataUrl: string;
   mimeType: string;
   modelId: string;
-  gateway: 'pollinations' | 'web-search' | 'browser';
+  gateway: 'gemini' | 'web-search' | 'browser';
   lyrics?: string;
 }
 
@@ -563,35 +560,23 @@ async function composeArrangementWithAi(
     }
   };
 
-  // Keyless Pollinations composition brain (zero API keys) -> automatic rich prompt-seeded DSP fallback
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4500);
-  try {
-    const res = await fetch(`${DEFAULT_POLLINATIONS_TEXT_URL}/openai`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'openai-fast',
-        temperature: 0.95,
-        stream: false,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: prompt },
-        ],
-      }),
-      signal: controller.signal,
-    });
-    if (res.ok) {
-      const data = (await res.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const plan = parseAiPlan(data?.choices?.[0]?.message?.content || '');
+  const geminiKey = getServerGeminiApiKey();
+  if (geminiKey) {
+    try {
+      const ai = createGeminiClient(geminiKey);
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: prompt,
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: 'application/json',
+        },
+      });
+      const plan = parseAiPlan(response.text || '');
       if (plan) return plan;
+    } catch {
+      // use deterministic prompt-seeded plan
     }
-  } catch {
-    // use rich deterministic prompt-seeded plan
-  } finally {
-    clearTimeout(timer);
   }
 
   return fallback;
@@ -1066,7 +1051,7 @@ async function generateKeylessAiMusic(prompt: string): Promise<GeneratedMediaRes
     dataUrl: bufferToDataUrl(wavBuffer, 'audio/wav'),
     mimeType: 'audio/wav',
     modelId: `aicraft::music-${arrangement.groove}-${arrangement.bpm}bpm`,
-    gateway: 'pollinations',
+    gateway: 'gemini',
   };
 }
 
@@ -1091,71 +1076,7 @@ export async function generateMediaAsset(params: {
     return generateKeylessAiMusic(cleanPrompt);
   }
 
-  if (parsed.gateway === 'web-search') {
-    const webImg = await fetchVerifiedWebImageFallback(cleanPrompt);
-    if (webImg) return webImg;
-  }
-
-  const imageModelCandidates = Array.from(
-    new Set([
-      parsed.gateway === 'pollinations' && parsed.upstreamModelId
-        ? parsed.upstreamModelId
-        : 'flux',
-      'flux',
-      'sana',
-    ])
-  );
-
-  for (const imgModel of imageModelCandidates) {
-    const cooldownKey = buildCandidateCooldownKey('pollinations', '', imgModel);
-    if (isGatewayCandidateCoolingDown(cooldownKey)) continue;
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 14000);
-    try {
-      const seed = crypto.randomInt(1, 10_000_000);
-      const url = `${DEFAULT_POLLINATIONS_IMAGE_URL}/prompt/${encodeURIComponent(
-        cleanPrompt
-      )}?model=${encodeURIComponent(imgModel)}&width=1024&height=1024&seed=${seed}&nologo=true`;
-      const res = await fetch(url, {
-        method: 'GET',
-        signal: controller.signal,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; AICraft/1.0)',
-          Accept: 'image/*,*/*;q=0.8',
-        },
-      });
-      if (!res.ok) {
-        if (res.status === 429 || res.status === 503 || res.status === 402) {
-          markGatewayCandidateCooldown(cooldownKey, 45_000);
-        }
-        throw new Error(`Image generator unavailable (${res.status})`);
-      }
-      const contentType =
-        (res.headers.get('content-type') || '').split(';')[0]?.trim() || 'image/jpeg';
-      if (!contentType.startsWith('image/')) {
-        throw new Error(`Unexpected response content type: ${contentType}`);
-      }
-      const buf = new Uint8Array(await res.arrayBuffer());
-      if (buf.byteLength < 512) {
-        throw new Error('Empty image payload received.');
-      }
-      return {
-        kind: params.kind,
-        prompt: cleanPrompt,
-        dataUrl: bufferToDataUrl(buf, contentType),
-        mimeType: contentType,
-        modelId: `pollinations::${imgModel}`,
-        gateway: 'pollinations',
-      };
-    } catch {
-      // try next free image model or web image grounding
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  // Real Google / Bing / Wikimedia web image search fallback
+  // Real Google / Bing / Wikimedia web image search
   const webImg = await fetchVerifiedWebImageFallback(cleanPrompt);
   if (webImg) {
     return {

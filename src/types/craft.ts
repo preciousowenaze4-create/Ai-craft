@@ -80,15 +80,9 @@ export interface OpenRouterModel {
   isFree: boolean;
   gateway?:
     | 'auto'
-    | 'puter'
-    | 'pollinations'
-    | 'browser'
-    | 'web-search'
     | 'gemini'
-    | 'groq'
-    | 'openrouter'
-    | 'huggingface'
-    | 'ngrok';
+    | 'web-search'
+    | 'browser';
   upstreamModelId?: string;
   tierLabel?: string;
   capabilities?: string[];
@@ -208,6 +202,31 @@ export interface CraftProject {
   secrets?: ProjectSecret[];
   databaseConfig?: ProjectDatabaseConfig;
   deployment?: ProjectDeploymentConfig;
+  completedTasks?: Array<{
+    id: string;
+    title: string;
+    status: 'completed' | 'unfinished';
+    turnId?: string;
+    updatedAt: string;
+  }>;
+  unfinishedTasks?: Array<{
+    id: string;
+    title: string;
+    status: 'completed' | 'unfinished';
+    turnId?: string;
+    updatedAt: string;
+  }>;
+  lastStoppedPoint?: {
+    turnId: string;
+    phase: BuildPhase | 'idle';
+    phaseLabel: string;
+    pausedReason?: string;
+    pausedMessage?: string;
+    activeFile?: string;
+    activeAction?: string;
+    bytesBuilt: number;
+    stoppedAt: string;
+  } | null;
 }
 
 export interface ModeThemeConfig {

@@ -26,9 +26,16 @@ import {
   streamServerFreeAiRealTime,
   type VisualHintsSpec,
 } from '../_realtimeEngine.js';
+import {
+  getProjectMemory,
+  recordBuildCheckpoint,
+  saveProjectMemorySnapshot,
+} from '../_projectMemory.js';
 
 export async function POST(request: Request): Promise<Response> {
   let body: {
+    projectId?: string;
+    turnId?: string;
     message?: string;
     mode?: string;
     model?: string;
@@ -62,6 +69,11 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: 'Invalid JSON request body.' }, { status: 400 });
   }
 
+  const projectId = typeof body?.projectId === 'string' ? body.projectId.trim() : '';
+  const turnId =
+    typeof body?.turnId === 'string' && body.turnId.trim()
+      ? body.turnId.trim()
+      : `turn_${Date.now()}`;
   const message = typeof body?.message === 'string' ? body.message.trim() : '';
   const mode = body?.mode === 'web' ? 'web' : 'mobile';
   const requestedModel = typeof body?.model === 'string' ? body.model.trim() : '';
@@ -190,6 +202,21 @@ export async function POST(request: Request): Promise<Response> {
           label: 'Searching live web & thinking...',
         });
 
+        const memAuth =
+          projectId && creditCheck.context?.user?.id
+            ? {
+                userId: creditCheck.context.user.id,
+                email: creditCheck.context.user.email || '',
+                accessToken: creditCheck.context.accessToken,
+              }
+            : null;
+        const retrievedMemory = memAuth
+          ? await getProjectMemory(memAuth, projectId).catch(() => ({
+              brainContext: '',
+              memory: null,
+            }))
+          : { brainContext: '', memory: null };
+
         const prepared = await prepareRealtimePrompt({
           message,
           mode,
@@ -211,15 +238,16 @@ export async function POST(request: Request): Promise<Response> {
           clientTime,
           clientTimeZone,
           visualHints,
+          projectMemoryContext: retrievedMemory.brainContext || '',
         });
 
         sendEvent({
           type: 'meta',
           kind: prepared.naturalMediaIntent ? 'media' : 'chat',
           modelId: requestedModel || 'gemini::gemini-4-hydrogen',
-          modelName: prepared.requestedModelLabel || 'Free Server AI',
-          provider: requestedGateway || 'server',
-          gateway: requestedGateway || 'server',
+          modelName: prepared.requestedModelLabel || 'Gemini 4 Hydrogen (Flash)',
+          provider: 'google',
+          gateway: 'gemini',
           isFallback: false,
         });
 
@@ -257,8 +285,8 @@ export async function POST(request: Request): Promise<Response> {
             creditsUsed: 0,
             billing: creditCheck.billing,
             media: mediaResult,
-            modelUsed: mediaResult.modelId || 'pollinations::sana',
-            modelName: prepared.requestedModelLabel || 'Free Browser AI Studio',
+            modelUsed: mediaResult.modelId || 'gemini::gemini-4-hydrogen',
+            modelName: prepared.requestedModelLabel || 'Gemini Studio',
             provider: mediaResult.gateway,
           });
           closeStream();
@@ -278,8 +306,8 @@ export async function POST(request: Request): Promise<Response> {
         let emittedReasoningPhase = false;
 
         let activeModelUsed = requestedModel || 'gemini::gemini-4-hydrogen';
-        let activeModelName = prepared.requestedModelLabel || 'Gemini Flash (Vision · Free Server)';
-        let activeProvider = requestedGateway || 'google';
+        let activeModelName = prepared.requestedModelLabel || 'Gemini 4 Hydrogen (Flash)';
+        let activeProvider = 'google';
 
         await streamServerFreeAiRealTime({
           requestedModel,
@@ -422,6 +450,25 @@ export async function POST(request: Request): Promise<Response> {
         });
 
         if (finalized.kind === 'chat') {
+          if (memAuth) {
+            void saveProjectMemorySnapshot(memAuth, {
+              projectId,
+              title: finalized.title || undefined,
+              mode,
+              lastModelUsed: finalized.modelUsed,
+              turns: [
+                {
+                  id: turnId,
+                  kind: 'chat',
+                  userMessage: message,
+                  aiText: finalized.aiText,
+                  phase: 'complete',
+                  phaseLabel: 'Answered',
+                  modelId: finalized.modelUsed,
+                },
+              ],
+            }).catch(() => {});
+          }
           sendEvent({
             type: 'done',
             kind: 'chat',
@@ -462,7 +509,7 @@ export async function POST(request: Request): Promise<Response> {
             creditsUsed: 0,
             billing: creditCheck.billing,
             media: mediaResult,
-            modelUsed: mediaResult.modelId || 'pollinations::sana',
+            modelUsed: mediaResult.modelId || 'gemini::gemini-4-hydrogen',
             modelName: prepared.requestedModelLabel,
             provider: mediaResult.gateway,
           });
@@ -493,6 +540,34 @@ export async function POST(request: Request): Promise<Response> {
             )) ?? creditCheck.billing;
         }
 
+        if (memAuth) {
+          void saveProjectMemorySnapshot(memAuth, {
+            projectId,
+            title: finalized.title || undefined,
+            mode,
+            status: 'complete',
+            lastModelUsed: finalized.modelUsed,
+            databaseSchema: finalized.dbTables,
+            turns: [
+              {
+                id: turnId,
+                kind: 'build',
+                userMessage: message,
+                aiText: finalized.aiText,
+                phase: 'complete',
+                phaseLabel: 'Build complete',
+                activeAction: 'Built',
+                activeFile: finalized.files[0] || 'index.html',
+                files: finalized.files,
+                planSteps: finalized.planSteps,
+                previewHtml: finalized.previewHtml,
+                bytesBuilt: finalized.bytesBuilt,
+                modelId: finalized.modelUsed,
+              },
+            ],
+          }).catch(() => {});
+        }
+
         sendEvent({
           type: 'done',
           kind: 'build',
@@ -516,6 +591,25 @@ export async function POST(request: Request): Promise<Response> {
           err instanceof Error
             ? err.message
             : 'Unable to reach free AI engine right now.';
+        if (projectId && creditCheck.context?.user?.id) {
+          void recordBuildCheckpoint(
+            {
+              userId: creditCheck.context.user.id,
+              email: creditCheck.context.user.email || '',
+              accessToken: creditCheck.context.accessToken,
+            },
+            {
+              projectId,
+              mode,
+              turnId,
+              phase: 'error',
+              phaseLabel: 'Paused on error',
+              pausedReason: 'STREAM_ERROR',
+              pausedMessage: errorMessage,
+              unfinishedTaskTitle: message.slice(0, 120),
+            }
+          ).catch(() => {});
+        }
         sendEvent({
           type: 'error',
           message: errorMessage,

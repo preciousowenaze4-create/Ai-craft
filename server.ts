@@ -59,9 +59,10 @@ const PORT = Number(process.env.PORT || 3000);
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 import {
+  GEMINI_BUILDER_MODELS,
   buildGatewayExecutionPlan,
   fetchAllGatewayModels,
-  getActiveTwoBuilderModels,
+  getServerGeminiApiKey,
   hasServerFreeAiKey,
 } from './api/_aiGateways.js';
 import {
@@ -91,11 +92,18 @@ import {
   stripReasoningTags,
 } from './api/_builderCore.js';
 import {
+  createGeminiClient,
   finalizeRealtimeOutput,
   prepareRealtimePrompt,
   streamServerFreeAiRealTime,
   type VisualHintsSpec,
 } from './api/_realtimeEngine.js';
+import { handleMemoryRequest } from './api/_memoryHandler.js';
+import {
+  getProjectMemory,
+  recordBuildCheckpoint,
+  saveProjectMemorySnapshot,
+} from './api/_projectMemory.js';
 
 
 
@@ -506,9 +514,7 @@ async function startServer() {
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       ok: true,
-      keylessBrowserAi: true,
-      puterJsEnabled: true,
-      pollinationsEnabled: true,
+      geminiConfigured: Boolean(getServerGeminiApiKey()),
       supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
       paymentsConfigured: Boolean(getPaymentSecretKey()),
     });
@@ -1911,21 +1917,63 @@ async function startServer() {
 
   app.post('/api/transcribe', async (req, res) => {
     try {
-      const body = req.body as { audioBase64?: string } | undefined;
+      const body = req.body as {
+        audioBase64?: string;
+        mimeType?: string;
+        language?: string;
+      } | undefined;
       const audioBase64 =
         typeof body?.audioBase64 === 'string' ? body.audioBase64.trim() : '';
+      const mimeType =
+        typeof body?.mimeType === 'string' && body.mimeType.startsWith('audio/')
+          ? body.mimeType.split(';')[0].trim()
+          : 'audio/webm';
 
       if (!audioBase64) {
         res.status(400).json({ error: 'Audio data is required.' });
         return;
       }
 
-      res.status(422).json({
-        error:
-          'Voice typing runs directly in your browser without API keys. Please allow microphone permission in Chrome, Edge, or Safari.',
+      const geminiKey = getServerGeminiApiKey();
+      if (!geminiKey) {
+        res.status(422).json({
+          error:
+            'GEMINI_API_KEY is required for server-side voice transcription, or allow microphone permission in Chrome, Edge, or Safari.',
+        });
+        return;
+      }
+
+      const ai = createGeminiClient(geminiKey);
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.5-transcribe',
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType,
+                data: audioBase64,
+              },
+            },
+            {
+              text: `Transcribe this audio cleanly into plain text${
+                body?.language ? ` (spoken language hint: ${body.language})` : ''
+              }. Return only the spoken words.`,
+            },
+          ],
+        },
       });
-    } catch {
-      res.status(400).json({ error: 'Unable to process audio input.' });
+
+      const text = (response.text || '').trim();
+      if (!text) {
+        res.status(422).json({ error: 'No speech detected in audio recording.' });
+        return;
+      }
+
+      res.json({ text });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Unable to process audio input.',
+      });
     }
   });
 
@@ -1939,19 +1987,21 @@ async function startServer() {
       res.json({
         models: result.models,
         gateways: result.gateways,
-        pollinationsConfigured: false,
-        puterConfigured: true,
+        geminiConfigured: result.geminiConfigured,
         serverFreeAiReady: result.serverFreeAiReady,
-        keyless: !result.serverFreeAiReady,
+        pollinationsConfigured: false,
+        puterConfigured: false,
+        keyless: false,
         freeOnly: true,
       });
     } catch {
       res.status(200).json({
-        models: getActiveTwoBuilderModels(),
-        pollinationsConfigured: false,
-        puterConfigured: true,
+        models: GEMINI_BUILDER_MODELS,
+        geminiConfigured: hasServerFreeAiKey(),
         serverFreeAiReady: hasServerFreeAiKey(),
-        keyless: !hasServerFreeAiKey(),
+        pollinationsConfigured: false,
+        puterConfigured: false,
+        keyless: false,
         freeOnly: true,
       });
     }
@@ -2013,6 +2063,40 @@ async function startServer() {
       const message =
         err instanceof Error ? err.message : 'Unable to generate media.';
       res.status(502).json({ error: message });
+    }
+  });
+
+  app.all('/api/memory', async (req, res) => {
+    try {
+      const baseUrl = getAppBaseUrl(req);
+      const fullUrl = `${baseUrl}${req.originalUrl || '/api/memory'}`;
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (typeof v === 'string') headers.set(k, v);
+        else if (Array.isArray(v)) headers.set(k, v.join(','));
+      }
+      const method = req.method.toUpperCase();
+      const hasBody = method !== 'GET' && method !== 'HEAD';
+      const bodyStr = hasBody && req.body && Object.keys(req.body).length > 0
+        ? JSON.stringify(req.body)
+        : undefined;
+      const webReq = new Request(fullUrl, {
+        method,
+        headers,
+        body: bodyStr,
+      });
+      const webRes = await handleMemoryRequest(webReq);
+      res.status(webRes.status);
+      webRes.headers.forEach((val, key) => {
+        res.setHeader(key, val);
+      });
+      const text = await webRes.text();
+      res.send(text);
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Memory endpoint error.',
+      });
     }
   });
 
@@ -2091,6 +2175,8 @@ async function startServer() {
 
       const body = (req.body || {}) as {
         action?: 'prepare' | 'finalize';
+        projectId?: string;
+        turnId?: string;
         message?: string;
         mode?: string;
         model?: string;
@@ -2124,6 +2210,14 @@ async function startServer() {
       const opts = (body.options || {}) as Record<string, unknown>;
       const message = typeof body.message === 'string' ? body.message.trim() : '';
       const mode = body.mode === 'web' ? 'web' : 'mobile';
+      const projectId =
+        typeof body.projectId === 'string' && body.projectId.trim()
+          ? body.projectId.trim()
+          : '';
+      const turnId =
+        typeof body.turnId === 'string' && body.turnId.trim()
+          ? body.turnId.trim()
+          : `turn_${Date.now()}`;
 
       if (body.action === 'finalize') {
         const rawOutput = typeof body.rawOutput === 'string' ? body.rawOutput : '';
@@ -2161,6 +2255,41 @@ async function startServer() {
                 () => null
               )) ?? initialBillingSummary;
           }
+        }
+
+        if (projectId && generationCreditContext?.user?.id) {
+          void saveProjectMemorySnapshot(
+            {
+              userId: generationCreditContext.user.id,
+              email: generationCreditContext.user.email || '',
+              accessToken: generationCreditContext.accessToken,
+            },
+            {
+              projectId,
+              title: finalized.title || undefined,
+              mode,
+              status: 'complete',
+              lastModelUsed: finalized.modelUsed,
+              databaseSchema: finalized.dbTables,
+              turns: [
+                {
+                  id: turnId,
+                  kind: finalized.kind,
+                  userMessage: message || 'App build',
+                  aiText: finalized.aiText,
+                  phase: 'complete',
+                  phaseLabel: finalized.kind === 'build' ? 'Build complete' : 'Answered',
+                  activeAction: finalized.kind === 'build' ? 'Built' : 'Answered',
+                  activeFile: finalized.files[0] || 'index.html',
+                  files: finalized.files,
+                  planSteps: finalized.planSteps,
+                  previewHtml: finalized.previewHtml,
+                  bytesBuilt: finalized.bytesBuilt,
+                  modelId: finalized.modelUsed,
+                },
+              ],
+            }
+          ).catch(() => {});
         }
 
         res.setHeader('Cache-Control', 'no-store');
@@ -2209,6 +2338,19 @@ async function startServer() {
         }
       }
 
+      let routeProjectMemoryContext = '';
+      if (projectId && generationCreditContext?.user?.id) {
+        const memRes = await getProjectMemory(
+          {
+            userId: generationCreditContext.user.id,
+            email: generationCreditContext.user.email || '',
+            accessToken: generationCreditContext.accessToken,
+          },
+          projectId
+        ).catch(() => ({ brainContext: '' }));
+        routeProjectMemoryContext = memRes.brainContext || '';
+      }
+
       const prepared = await prepareRealtimePrompt({
         message,
         mode,
@@ -2245,6 +2387,7 @@ async function startServer() {
         clientTime: body.clientTime,
         clientTimeZone: body.clientTimeZone,
         visualHints: (body.visualHints ?? opts.visualHints ?? null) as VisualHintsSpec | null,
+        projectMemoryContext: routeProjectMemoryContext,
       });
 
       if (body.action === 'prepare') {
@@ -2300,6 +2443,8 @@ async function startServer() {
     res.setTimeout?.(0);
 
     const body = req.body as {
+      projectId?: string;
+      turnId?: string;
       message?: string;
       mode?: string;
       model?: string;
@@ -2329,6 +2474,11 @@ async function startServer() {
       };
     };
 
+    const projectId = typeof body?.projectId === 'string' ? body.projectId.trim() : '';
+    const turnId =
+      typeof body?.turnId === 'string' && body.turnId.trim()
+        ? body.turnId.trim()
+        : `turn_${Date.now()}`;
     const message = typeof body?.message === 'string' ? body.message.trim() : '';
     const mode = body?.mode === 'web' ? 'web' : 'mobile';
     const requestedModel =
@@ -2556,6 +2706,21 @@ async function startServer() {
         label: 'Searching live web & thinking...',
       });
 
+      const memAuth =
+        projectId && generationCreditContext?.user?.id
+          ? {
+              userId: generationCreditContext.user.id,
+              email: generationCreditContext.user.email || '',
+              accessToken: generationCreditContext.accessToken,
+            }
+          : null;
+      const retrievedMemory = memAuth
+        ? await getProjectMemory(memAuth, projectId).catch(() => ({
+            brainContext: '',
+            memory: null,
+          }))
+        : { brainContext: '', memory: null };
+
       const visualHints = body?.visualHints ?? options.visualHints ?? null;
       const prepared = await prepareRealtimePrompt({
         message,
@@ -2578,15 +2743,16 @@ async function startServer() {
         clientTime,
         clientTimeZone,
         visualHints,
+        projectMemoryContext: retrievedMemory.brainContext || '',
       });
 
       sendEvent({
         type: 'meta',
         kind: prepared.naturalMediaIntent ? 'media' : 'chat',
         modelId: requestedModel || 'gemini::gemini-4-hydrogen',
-        modelName: prepared.requestedModelLabel || 'Free Server AI',
-        provider: requestedGateway || 'server',
-        gateway: requestedGateway || 'server',
+        modelName: prepared.requestedModelLabel || 'Gemini 4 Hydrogen (Flash)',
+        provider: 'google',
+        gateway: 'gemini',
         isFallback: false,
       });
 
@@ -2624,8 +2790,8 @@ async function startServer() {
           creditsUsed: 0,
           billing: initialBillingSummary,
           media: mediaResult,
-          modelUsed: mediaResult.modelId || 'pollinations::sana',
-          modelName: prepared.requestedModelLabel || 'Free Browser AI Studio',
+          modelUsed: mediaResult.modelId || 'gemini::gemini-4-hydrogen',
+          modelName: prepared.requestedModelLabel || 'Gemini Studio',
           provider: mediaResult.gateway,
           startedAt: job.startedAt,
         });
@@ -2644,8 +2810,8 @@ async function startServer() {
       let emittedReasoningPhase = false;
 
       let activeModelUsed = requestedModel || 'gemini::gemini-4-hydrogen';
-      let activeModelName = prepared.requestedModelLabel || 'Gemini Flash (Vision · Free Server)';
-      let activeProvider = requestedGateway || 'google';
+      let activeModelName = prepared.requestedModelLabel || 'Gemini 4 Hydrogen (Flash)';
+      let activeProvider = 'google';
 
       await streamServerFreeAiRealTime({
         requestedModel,
@@ -2786,6 +2952,25 @@ async function startServer() {
       });
 
       if (finalized.kind === 'chat') {
+        if (memAuth) {
+          void saveProjectMemorySnapshot(memAuth, {
+            projectId,
+            title: finalized.title || undefined,
+            mode,
+            lastModelUsed: finalized.modelUsed,
+            turns: [
+              {
+                id: turnId,
+                kind: 'chat',
+                userMessage: message,
+                aiText: finalized.aiText,
+                phase: 'complete',
+                phaseLabel: 'Answered',
+                modelId: finalized.modelUsed,
+              },
+            ],
+          }).catch(() => {});
+        }
         sendEvent({
           type: 'done',
           kind: 'chat',
@@ -2826,7 +3011,7 @@ async function startServer() {
           creditsUsed: 0,
           billing: initialBillingSummary,
           media: mediaResult,
-          modelUsed: mediaResult.modelId || 'pollinations::sana',
+          modelUsed: mediaResult.modelId || 'gemini::gemini-4-hydrogen',
           modelName: prepared.requestedModelLabel,
           provider: mediaResult.gateway,
           startedAt: job.startedAt,
@@ -2858,6 +3043,34 @@ async function startServer() {
           ).catch(() => null)) ?? initialBillingSummary;
       }
 
+      if (memAuth) {
+        void saveProjectMemorySnapshot(memAuth, {
+          projectId,
+          title: finalized.title || undefined,
+          mode,
+          status: 'complete',
+          lastModelUsed: finalized.modelUsed,
+          databaseSchema: finalized.dbTables,
+          turns: [
+            {
+              id: turnId,
+              kind: 'build',
+              userMessage: message,
+              aiText: finalized.aiText,
+              phase: 'complete',
+              phaseLabel: 'Build complete',
+              activeAction: 'Built',
+              activeFile: finalized.files[0] || 'index.html',
+              files: finalized.files,
+              planSteps: finalized.planSteps,
+              previewHtml: finalized.previewHtml,
+              bytesBuilt: finalized.bytesBuilt,
+              modelId: finalized.modelUsed,
+            },
+          ],
+        }).catch(() => {});
+      }
+
       sendEvent({
         type: 'done',
         kind: 'build',
@@ -2880,6 +3093,25 @@ async function startServer() {
       clearInterval(keepAlive);
       const errorMessage =
         err instanceof Error ? err.message : 'Unable to reach free AI engine right now.';
+      if (projectId && generationCreditContext?.user?.id) {
+        void recordBuildCheckpoint(
+          {
+            userId: generationCreditContext.user.id,
+            email: generationCreditContext.user.email || '',
+            accessToken: generationCreditContext.accessToken,
+          },
+          {
+            projectId,
+            mode,
+            turnId,
+            phase: 'error',
+            phaseLabel: 'Paused on error',
+            pausedReason: 'STREAM_ERROR',
+            pausedMessage: errorMessage,
+            unfinishedTaskTitle: message.slice(0, 120),
+          }
+        ).catch(() => {});
+      }
       sendEvent({
         type: 'error',
         message: errorMessage,

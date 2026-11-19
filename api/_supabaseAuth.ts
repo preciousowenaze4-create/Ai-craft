@@ -101,6 +101,24 @@ export function createBackendSupabaseClient(useImplicitFlow = false) {
   });
 }
 
+export function createUserScopedSupabaseClient(accessToken: string) {
+  const { url, anonKey } = getSupabaseConfig();
+  const cleanToken = typeof accessToken === 'string' ? accessToken.trim() : '';
+  if (!url || !anonKey || !cleanToken) return null;
+  return createClient(url, anonKey, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${cleanToken}`,
+      },
+    },
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+      detectSessionInUrl: false,
+    },
+  });
+}
+
 export function getRequestBaseUrl(request: Request): string {
   const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
 

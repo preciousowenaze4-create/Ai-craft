@@ -1486,6 +1486,7 @@ export function buildCraftSystemPrompt(params: {
   shouldGenerateTitle: boolean;
   timeContext: string;
   projectInfraContext: string;
+  projectMemoryContext?: string;
   webSearchContext: string;
   previewSummary: string;
   mode: 'mobile' | 'web';
@@ -1499,6 +1500,7 @@ export function buildCraftSystemPrompt(params: {
     shouldGenerateTitle,
     timeContext,
     projectInfraContext,
+    projectMemoryContext,
     webSearchContext,
     previewSummary,
     mode,
@@ -1546,6 +1548,7 @@ export function buildCraftSystemPrompt(params: {
       'You are AI Craft, a calm, helpful, real-time AI assistant with live browser search access.',
       `Real-time clock context: ${timeContext}.`,
       projectInfraContext,
+      projectMemoryContext ? `\n${projectMemoryContext}` : '',
       webSearchContext ? `\n${webSearchContext}` : '',
       previewSummary
         ? `\nContext about the user's current Preview app (for answering questions accurately without rebuilding):\n${previewSummary}`
@@ -1612,6 +1615,7 @@ export function buildCraftSystemPrompt(params: {
       'You are AI Craft, a calm, methodical senior product engineer & full-stack app architect connected directly into a live full-screen Preview workspace.',
       `Real-time clock context: ${timeContext}.`,
       projectInfraContext,
+      projectMemoryContext ? `\n${projectMemoryContext}` : '',
       webSearchContext ? `\n${webSearchContext}` : '',
       previewSummary ? `\nLIVE PREVIEW ENVIRONMENT AWARENESS:\n${previewSummary}` : '',
       'CRITICAL OUTPUT CONTRACT — TWO STRICTLY SEPARATED PARTS:',
@@ -1626,6 +1630,7 @@ export function buildCraftSystemPrompt(params: {
     'You are AI Craft, a calm, intelligent real-time AI assistant AND methodical Replit-grade product builder connected to a live Preview workspace.',
     `Real-time clock context: ${timeContext}.`,
     projectInfraContext,
+    projectMemoryContext ? `\n${projectMemoryContext}` : '',
     webSearchContext ? `\n${webSearchContext}` : '',
     previewSummary ? `\nLIVE PREVIEW ENVIRONMENT AWARENESS:\n${previewSummary}` : '',
     'THINK FIRST BEFORE RESPONDING:',

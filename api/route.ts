@@ -12,8 +12,36 @@ import {
   streamServerFreeAiRealTime,
   type VisualHintsSpec,
 } from './_realtimeEngine.js';
+import { handleMemoryRequest } from './_memoryHandler.js';
+import { getProjectMemory, saveProjectMemorySnapshot } from './_projectMemory.js';
+
+function isMemorySubroute(request: Request): boolean {
+  try {
+    const u = new URL(request.url);
+    return u.searchParams.get('__memory') === '1' || u.pathname.startsWith('/api/memory');
+  } catch {
+    return false;
+  }
+}
+
+export async function GET(request: Request): Promise<Response> {
+  if (isMemorySubroute(request)) {
+    return handleMemoryRequest(request);
+  }
+  return Response.json({ ok: true, service: 'ai-craft-router' }, { status: 200 });
+}
+
+export async function DELETE(request: Request): Promise<Response> {
+  if (isMemorySubroute(request)) {
+    return handleMemoryRequest(request);
+  }
+  return Response.json({ error: 'Method not allowed.' }, { status: 405 });
+}
 
 export async function POST(request: Request): Promise<Response> {
+  if (isMemorySubroute(request)) {
+    return handleMemoryRequest(request);
+  }
   try {
     const modCheck = await authenticateRequestForModeration(request);
     if (modCheck.flags?.banned) {
@@ -41,6 +69,8 @@ export async function POST(request: Request): Promise<Response> {
 
     const body = (await request.json().catch(() => ({}))) as {
       action?: 'prepare' | 'finalize';
+      projectId?: string;
+      turnId?: string;
       message?: string;
       mode?: string;
       model?: string;
@@ -74,6 +104,14 @@ export async function POST(request: Request): Promise<Response> {
     const opts = (body.options || {}) as Record<string, unknown>;
     const message = typeof body?.message === 'string' ? body.message.trim() : '';
     const mode = body?.mode === 'web' ? 'web' : 'mobile';
+    const projectId =
+      typeof body?.projectId === 'string' && body.projectId.trim()
+        ? body.projectId.trim()
+        : '';
+    const turnId =
+      typeof body?.turnId === 'string' && body.turnId.trim()
+        ? body.turnId.trim()
+        : `turn_${Date.now()}`;
 
     if (body.action === 'finalize') {
       const rawOutput = typeof body.rawOutput === 'string' ? body.rawOutput : '';
@@ -125,6 +163,39 @@ export async function POST(request: Request): Promise<Response> {
               () => null
             )) ?? creditCheck.billing;
         }
+      }
+
+      if (projectId && creditCheck.context?.user?.id) {
+        const memAuth = {
+          userId: creditCheck.context.user.id,
+          email: creditCheck.context.user.email || '',
+          accessToken: creditCheck.context.accessToken,
+        };
+        void saveProjectMemorySnapshot(memAuth, {
+          projectId,
+          title: finalized.title || undefined,
+          mode,
+          status: 'complete',
+          lastModelUsed: finalized.modelUsed,
+          databaseSchema: finalized.dbTables,
+          turns: [
+            {
+              id: turnId,
+              kind: finalized.kind,
+              userMessage: message || 'App build',
+              aiText: finalized.aiText,
+              phase: 'complete',
+              phaseLabel: finalized.kind === 'build' ? 'Build complete' : 'Answered',
+              activeAction: finalized.kind === 'build' ? 'Built' : 'Answered',
+              activeFile: finalized.files[0] || 'index.html',
+              files: finalized.files,
+              planSteps: finalized.planSteps,
+              previewHtml: finalized.previewHtml,
+              bytesBuilt: finalized.bytesBuilt,
+              modelId: finalized.modelUsed,
+            },
+          ],
+        }).catch(() => {});
       }
 
       return Response.json(
@@ -179,6 +250,19 @@ export async function POST(request: Request): Promise<Response> {
       );
     }
 
+    let projectMemoryContext = '';
+    if (projectId && creditCheck.context?.user?.id) {
+      const memRes = await getProjectMemory(
+        {
+          userId: creditCheck.context.user.id,
+          email: creditCheck.context.user.email || '',
+          accessToken: creditCheck.context.accessToken,
+        },
+        projectId
+      ).catch(() => ({ brainContext: '' }));
+      projectMemoryContext = memRes.brainContext || '';
+    }
+
     const prepared = await prepareRealtimePrompt({
       message,
       mode,
@@ -215,6 +299,7 @@ export async function POST(request: Request): Promise<Response> {
       clientTime: body.clientTime,
       clientTimeZone: body.clientTimeZone,
       visualHints: (body.visualHints ?? opts.visualHints ?? null) as VisualHintsSpec | null,
+      projectMemoryContext,
     });
 
     if (body.action === 'prepare') {

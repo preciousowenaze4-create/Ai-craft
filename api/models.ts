@@ -1,6 +1,6 @@
 import {
+  GEMINI_BUILDER_MODELS,
   fetchAllGatewayModels,
-  getActiveTwoBuilderModels,
   hasServerFreeAiKey,
 } from './_aiGateways.js';
 
@@ -16,10 +16,11 @@ export async function GET(request: Request): Promise<Response> {
       {
         models: result.models,
         gateways: result.gateways,
-        pollinationsConfigured: false,
-        puterConfigured: true,
+        geminiConfigured: result.geminiConfigured,
         serverFreeAiReady: result.serverFreeAiReady,
-        keyless: !result.serverFreeAiReady,
+        pollinationsConfigured: false,
+        puterConfigured: false,
+        keyless: false,
         freeOnly: true,
       },
       {
@@ -31,11 +32,12 @@ export async function GET(request: Request): Promise<Response> {
   } catch {
     return Response.json(
       {
-        models: getActiveTwoBuilderModels(),
-        pollinationsConfigured: false,
-        puterConfigured: true,
+        models: GEMINI_BUILDER_MODELS,
+        geminiConfigured: hasServerFreeAiKey(),
         serverFreeAiReady: hasServerFreeAiKey(),
-        keyless: !hasServerFreeAiKey(),
+        pollinationsConfigured: false,
+        puterConfigured: false,
+        keyless: false,
         freeOnly: true,
       },
       {

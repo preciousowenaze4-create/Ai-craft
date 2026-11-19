@@ -10,28 +10,16 @@ function resolveProviderKey(provider?: string, modelId?: string): string {
   const raw = (provider || modelId?.split('/')[0] || 'aicraft')
     .toLowerCase()
     .trim();
-  if (
-    raw === 'auto' ||
-    raw.includes('aicraft') ||
-    modelId === 'auto::free-browser' ||
-    modelId === 'auto::architect'
-  ) {
+  if (raw === 'auto' || raw.includes('aicraft') || modelId === 'auto::architect') {
     return 'aicraft';
   }
-  if (raw.includes('puter') || modelId?.startsWith('puter::')) {
-    if (modelId?.includes('claude')) return 'anthropic';
-    if (modelId?.includes('gpt')) return 'openai';
-    if (modelId?.includes('gemini')) return 'google';
-    if (modelId?.includes('deepseek')) return 'deepseek';
-    if (modelId?.includes('llama') || modelId?.includes('meta')) return 'meta';
-    if (modelId?.includes('qwen')) return 'qwen';
-    return 'puter';
+  if (raw.includes('gemini') || raw.includes('google') || modelId?.startsWith('gemini::')) {
+    return 'google';
   }
   if (raw.includes('web-search') || modelId?.startsWith('web-search::')) return 'perplexity';
   if (raw.includes('browser') || modelId?.startsWith('browser::')) return 'browser';
   if (raw.includes('openai')) return 'openai';
   if (raw.includes('anthropic')) return 'anthropic';
-  if (raw.includes('google')) return 'google';
   if (raw.includes('meta')) return 'meta';
   if (raw.includes('deepseek')) return 'deepseek';
   if (raw.includes('mistral')) return 'mistral';
@@ -47,7 +35,6 @@ function resolveProviderKey(provider?: string, modelId?: string): string {
   if (raw.includes('bytedance')) return 'bytedance';
   if (raw.includes('minimax')) return 'minimax';
   if (raw.includes('z-ai') || raw.includes('zai') || raw.includes('thudm')) return 'zai';
-  if (raw.includes('pollinations') || modelId?.startsWith('pollinations::')) return 'pollinations';
   return raw;
 }
 
