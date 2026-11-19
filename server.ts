@@ -1292,6 +1292,8 @@ async function startServer() {
         amountNgn: conv.amountNgn,
         amountKobo: conv.amountKobo,
         monthlyCredits: plan.monthlyCredits,
+        annualCycles: plan.annualCycles,
+        dailyLimit: plan.dailyLimit,
         cadenceText: plan.cadenceText,
       };
     });

@@ -9,7 +9,7 @@ export interface BillingPlanConfig {
   amountUsd: number;
   dailyLimit: number | null;
   monthlyCredits: number;
-  annualCycles: number; // total 30-day cycles covered (1 for monthly, 12 for annual)
+  annualCycles: number; // total 30-day cycles covered (1 for monthly, 10 for annual)
   cadenceText: string;
 }
 
@@ -34,36 +34,36 @@ export const FREE_TIER_CONFIG: BillingPlanConfig = {
   name: 'Free',
   amountUsd: 0,
   dailyLimit: null,
-  monthlyCredits: 300,
+  monthlyCredits: 150,
   annualCycles: 1,
-  cadenceText: 'every 30 days',
+  cadenceText: 'per month',
 };
 
 export const BILLING_PLANS: Record<PaidTierId, BillingPlanConfig> = {
   starter: {
     id: 'starter',
     name: 'Starter',
-    amountUsd: 25,
+    amountUsd: 26,
     dailyLimit: null,
-    monthlyCredits: 100000,
+    monthlyCredits: 1500,
     annualCycles: 1,
     cadenceText: 'per month',
   },
   plus: {
     id: 'plus',
     name: 'Plus',
-    amountUsd: 48,
+    amountUsd: 65,
     dailyLimit: null,
-    monthlyCredits: 250000,
+    monthlyCredits: 4000,
     annualCycles: 1,
     cadenceText: 'per month',
   },
   studio: {
     id: 'studio',
     name: 'Studio',
-    amountUsd: 70,
+    amountUsd: 120,
     dailyLimit: null,
-    monthlyCredits: 500000,
+    monthlyCredits: 7500,
     annualCycles: 1,
     cadenceText: 'per month',
   },
@@ -72,9 +72,9 @@ export const BILLING_PLANS: Record<PaidTierId, BillingPlanConfig> = {
     name: 'Annual',
     amountUsd: 600,
     dailyLimit: null,
-    monthlyCredits: 1000000,
-    annualCycles: 12,
-    cadenceText: 'per year',
+    monthlyCredits: 10000,
+    annualCycles: 10,
+    cadenceText: '10 months',
   },
 };
 

@@ -91,22 +91,27 @@ export function parseRawBillingState(
       ? Date.parse(obj.dailyResetAt)
       : nowMs + DAY_MS;
 
-  const monthlyCreditsRemaining =
+  const rawCredits =
     typeof obj.monthlyCreditsRemaining === 'number' &&
     Number.isFinite(obj.monthlyCreditsRemaining)
       ? Math.max(0, Math.floor(obj.monthlyCreditsRemaining))
       : plan.monthlyCredits;
+  const monthlyCreditsRemaining =
+    tier === 'free'
+      ? Math.min(FREE_TIER_CONFIG.monthlyCredits, rawCredits)
+      : rawCredits;
   const monthlyResetMs =
     typeof obj.monthlyResetAt === 'string' && !Number.isNaN(Date.parse(obj.monthlyResetAt))
       ? Date.parse(obj.monthlyResetAt)
       : nowMs + MONTH_MS;
 
+  const maxAnnualFollowupCycles = Math.max(0, BILLING_PLANS.annual.annualCycles - 1);
   const annualCyclesRemaining =
     typeof obj.annualCyclesRemaining === 'number' &&
     Number.isFinite(obj.annualCyclesRemaining)
-      ? Math.max(0, Math.min(11, Math.floor(obj.annualCyclesRemaining)))
+      ? Math.max(0, Math.min(maxAnnualFollowupCycles, Math.floor(obj.annualCyclesRemaining)))
       : tier === 'annual'
-        ? 11
+        ? maxAnnualFollowupCycles
         : 0;
 
   const subscriptionExpiresAt =
@@ -175,8 +180,8 @@ export function normalizeBillingState(
         updatedAt: new Date(nowMs).toISOString(),
       };
     } else if (state.tier === 'annual') {
-      const withinYear = expiresMs === null || nowMs < expiresMs;
-      if (withinYear && state.annualCyclesRemaining >= cyclesElapsed) {
+      const withinTerm = expiresMs === null || nowMs < expiresMs;
+      if (withinTerm && state.annualCyclesRemaining >= cyclesElapsed) {
         state = {
           ...state,
           tier: 'annual',
@@ -188,7 +193,7 @@ export function normalizeBillingState(
           updatedAt: new Date(nowMs).toISOString(),
         };
       } else {
-        // Annual 12 cycles / 365 days completed without renewal -> revert to Free
+        // Annual 10 monthly cycles completed without recharging -> revert to Free
         state = {
           ...state,
           tier: 'free',
@@ -257,7 +262,8 @@ export function applyPaidUpgradeToState(
   const plan = BILLING_PLANS[tx.planId];
   const paidMs = Date.parse(tx.paidAt);
   const effectiveNow = !Number.isNaN(paidMs) && paidMs <= nowMs ? paidMs : nowMs;
-  const durationMs = tx.planId === 'annual' ? YEAR_MS : MONTH_MS;
+  const durationMs =
+    tx.planId === 'annual' ? plan.annualCycles * MONTH_MS + DAY_MS : MONTH_MS;
 
   // If the payment happened in a past expired period, normalize after setting
   const upgradedRaw: BillingAccountState = {
@@ -266,7 +272,8 @@ export function applyPaidUpgradeToState(
     dailyResetAt: new Date(nowMs + DAY_MS).toISOString(),
     monthlyCreditsRemaining: plan.monthlyCredits,
     monthlyResetAt: new Date(effectiveNow + MONTH_MS).toISOString(),
-    annualCyclesRemaining: tx.planId === 'annual' ? 11 : 0,
+    annualCyclesRemaining:
+      tx.planId === 'annual' ? Math.max(0, plan.annualCycles - 1) : 0,
     subscriptionExpiresAt: new Date(effectiveNow + durationMs).toISOString(),
     creditedRefs: [tx.reference, ...input.creditedRefs].slice(0, 25),
     updatedAt: new Date(nowMs).toISOString(),
@@ -295,8 +302,8 @@ export function consumeBillingCredit(
       code: 'MONTHLY_LIMIT_REACHED',
       error:
         state.tier === 'free'
-          ? 'You have used all 300 free credits for this 30-day cycle. Upgrade to a paid plan or wait for your monthly refresh.'
-          : `You have reached your ${plan.monthlyCredits.toLocaleString()} monthly credit cap on ${plan.name}. Wait for your 30-day cycle refresh or upgrade your plan.`,
+          ? `You have used all ${FREE_TIER_CONFIG.monthlyCredits.toLocaleString()} free tokens for this 30-day cycle. Upgrade to a paid plan or wait for your monthly refresh.`
+          : `You have reached your ${plan.monthlyCredits.toLocaleString()} monthly token cap on ${plan.name}. Wait for your 30-day cycle refresh or upgrade your plan.`,
       state,
     };
   }
@@ -592,9 +599,9 @@ export async function upgradeUserAccountFromTransaction(params: {
   return upgraded.state;
 }
 
-export const MIN_CHAT_CREDITS_THRESHOLD = 30;
-export const BYTES_PER_BUILD_CREDIT = 250;
-export const MAX_CREDITS_PER_BUILD = 300;
+export const MIN_CHAT_CREDITS_THRESHOLD = 5;
+export const BYTES_PER_BUILD_CREDIT = 2500;
+export const MAX_CREDITS_PER_BUILD = 35;
 
 export function calculateBuildCreditsForBytes(
   bytesBuilt: number,
@@ -604,11 +611,11 @@ export function calculateBuildCreditsForBytes(
   const baseFromCode = Math.max(1, Math.round(bytesBuilt / BYTES_PER_BUILD_CREDIT));
   const filesBonus =
     details?.filesCount && Number.isFinite(details.filesCount)
-      ? Math.max(0, Math.min(12, Math.floor(details.filesCount))) * 2
+      ? Math.floor(Math.max(0, Math.min(12, Math.floor(details.filesCount))) / 3)
       : 0;
   const dbBonus =
     details?.dbTablesCount && Number.isFinite(details.dbTablesCount)
-      ? Math.max(0, Math.min(10, Math.floor(details.dbTablesCount))) * 4
+      ? Math.max(0, Math.min(5, Math.floor(details.dbTablesCount)))
       : 0;
   return Math.min(MAX_CREDITS_PER_BUILD, Math.max(1, baseFromCode + filesBonus + dbBonus));
 }
@@ -640,8 +647,8 @@ export function getCreditExhaustionInfo(
       code: 'MONTHLY_LIMIT_REACHED',
       error:
         state.tier === 'free'
-          ? 'Your 300 free credits for this 30-day cycle have finished. Building is paused until your monthly refresh or plan upgrade.'
-          : `All ${plan.monthlyCredits.toLocaleString()} credits for this 30-day cycle on ${plan.name} are used up. Building is paused until your cycle resets or you upgrade.`,
+          ? `Your ${FREE_TIER_CONFIG.monthlyCredits.toLocaleString()} free tokens for this 30-day cycle have finished. Building is paused until your monthly refresh or plan upgrade.`
+          : `All ${plan.monthlyCredits.toLocaleString()} tokens for this 30-day cycle on ${plan.name} are used up. Building is paused until your cycle resets or you upgrade.`,
     };
   }
   return {

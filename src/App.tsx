@@ -241,11 +241,11 @@ function saveProjectsSafely(projects: CraftProject[]) {
 function loadSavedCredits(): number {
   try {
     const raw = window.localStorage.getItem(STORAGE_CREDITS_KEY);
-    if (!raw) return 300;
+    if (!raw) return 150;
     const n = Number(raw);
-    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 300;
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 150;
   } catch {
-    return 300;
+    return 150;
   }
 }
 
@@ -346,9 +346,9 @@ function mergeProjectsFromCloud(
   return Array.from(mergedMap.values()).map(normalizeProjectTitle);
 }
 
-const CLIENT_MIN_CHAT_CREDITS = 30;
-const CLIENT_BYTES_PER_BUILD_CREDIT = 250;
-const CLIENT_MAX_CREDITS_PER_BUILD = 300;
+const CLIENT_MIN_CHAT_CREDITS = 5;
+const CLIENT_BYTES_PER_BUILD_CREDIT = 2500;
+const CLIENT_MAX_CREDITS_PER_BUILD = 35;
 
 function calculateClientBuildCredits(
   bytesBuilt: number,
@@ -357,8 +357,8 @@ function calculateClientBuildCredits(
 ): number {
   if (!Number.isFinite(bytesBuilt) || bytesBuilt <= 0) return 0;
   const baseFromCode = Math.max(1, Math.round(bytesBuilt / CLIENT_BYTES_PER_BUILD_CREDIT));
-  const filesBonus = Math.max(0, Math.min(12, Math.floor(filesCount))) * 2;
-  const dbBonus = Math.max(0, Math.min(10, Math.floor(dbTablesCount))) * 4;
+  const filesBonus = Math.floor(Math.max(0, Math.min(12, Math.floor(filesCount))) / 3);
+  const dbBonus = Math.max(0, Math.min(5, Math.floor(dbTablesCount)));
   return Math.min(CLIENT_MAX_CREDITS_PER_BUILD, Math.max(1, baseFromCode + filesBonus + dbBonus));
 }
 
@@ -815,7 +815,7 @@ export default function App() {
       setTransactions([]);
       setBilling(null);
       setProPlanId(null);
-      setCredits(300);
+      setCredits(150);
     }
 
     void syncBillingFromServer();
@@ -3075,7 +3075,7 @@ export default function App() {
     cloudHydratedUserRef.current = null;
     setBilling(null);
     setProPlanId(null);
-    setCredits(300);
+    setCredits(150);
     setShowProUpgrade(false);
     setViewMode('home');
     setActiveTab('create');

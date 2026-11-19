@@ -49,6 +49,8 @@ export async function GET(request: Request): Promise<Response> {
         amountNgn: conv.amountNgn,
         amountKobo: conv.amountKobo,
         monthlyCredits: plan.monthlyCredits,
+        annualCycles: plan.annualCycles,
+        dailyLimit: plan.dailyLimit,
         cadenceText: plan.cadenceText,
       };
     });

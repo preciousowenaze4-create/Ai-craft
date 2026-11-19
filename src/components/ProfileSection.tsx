@@ -578,10 +578,10 @@ export function ProfileSection({
                     {isOwner
                       ? 'Owner · Free unlimited app builds'
                       : proPlanId
-                        ? billing?.dailyLimit
-                          ? `${activePlanName} · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today · ${credits.toLocaleString()} left`
-                          : `${activePlanName} plan · ${credits.toLocaleString()} credits`
-                        : `Free (300/30d) · ${credits.toLocaleString()} left${cycleResetLabel ? ` · resets ${cycleResetLabel}` : ''}`}
+                        ? billing?.tier === 'annual'
+                          ? `${activePlanName} · ${credits.toLocaleString()} tokens · ${billing.annualCyclesRemaining} refills left`
+                          : `${activePlanName} plan · ${credits.toLocaleString()} tokens`
+                        : `Free (150/mo) · ${credits.toLocaleString()} left${cycleResetLabel ? ` · resets ${cycleResetLabel}` : ''}`}
                   </p>
                 </div>
               </div>
@@ -662,14 +662,14 @@ export function ProfileSection({
                     ? 'Owner · Free Unlimited'
                     : proPlanId
                       ? `AI Craft ${activePlanName}`
-                      : 'Free Plan (300 / 30 days)'}
+                      : 'Free Plan (150 tokens / month)'}
                 </p>
                 <p className="text-[10.5px] text-[#71717A] tabular-nums mt-0.5 truncate">
                   {isOwner
                     ? 'Unlimited app builds unlocked for app owner'
-                    : billing?.dailyLimit
-                      ? `${credits.toLocaleString()}/${billing.monthlyLimit.toLocaleString()} cycle · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today`
-                      : `${credits.toLocaleString()} credits available${cycleResetLabel ? ` · resets ${cycleResetLabel}` : ''}`}
+                    : billing?.tier === 'annual'
+                      ? `${credits.toLocaleString()}/${billing.monthlyLimit.toLocaleString()} tokens · ${billing.annualCyclesRemaining + 1}/10 mo left${cycleResetLabel ? ` · next ${cycleResetLabel}` : ''}`
+                      : `${credits.toLocaleString()} tokens available${cycleResetLabel ? ` · resets ${cycleResetLabel}` : ''}`}
                 </p>
               </div>
             </div>

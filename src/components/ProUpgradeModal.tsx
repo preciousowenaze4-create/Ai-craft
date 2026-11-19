@@ -40,43 +40,43 @@ export const PRO_PLANS: ProPlanOption[] = [
   {
     id: 'starter',
     name: 'Starter',
-    subtitle: '100,000 credits / month · No daily limit',
-    priceText: '$25.00',
-    amountUsd: 25,
+    subtitle: '1,500 tokens / month · Monthly plan',
+    priceText: '$26.00',
+    amountUsd: 26,
     cadenceText: 'per month',
     dailyLimit: null,
-    creditsToAdd: 100000,
+    creditsToAdd: 1500,
   },
   {
     id: 'plus',
     name: 'Plus',
-    subtitle: '250,000 credits / month · No daily limit',
-    priceText: '$48.00',
-    amountUsd: 48,
+    subtitle: '4,000 tokens / month · Monthly plan',
+    priceText: '$65.00',
+    amountUsd: 65,
     cadenceText: 'per month',
     dailyLimit: null,
-    creditsToAdd: 250000,
+    creditsToAdd: 4000,
   },
   {
     id: 'studio',
     name: 'Studio',
-    subtitle: '500,000 credits / month · No daily limit',
-    priceText: '$70.00',
-    amountUsd: 70,
+    subtitle: '7,500 tokens / month · Monthly plan',
+    priceText: '$120.00',
+    amountUsd: 120,
     cadenceText: 'per month',
     dailyLimit: null,
-    creditsToAdd: 500000,
+    creditsToAdd: 7500,
   },
   {
     id: 'annual',
     name: 'Annual',
-    subtitle: '1,000,000 credits / mo · 12 months',
+    subtitle: '10,000 tokens / mo · 10-month cycle',
     priceText: '$600.00',
     amountUsd: 600,
-    cadenceText: 'per year',
+    cadenceText: '10 months',
     dailyLimit: null,
-    creditsToAdd: 1000000,
-    badgeText: 'PRO YEARLY',
+    creditsToAdd: 10000,
+    badgeText: '10 MO CYCLE',
   },
 ];
 
@@ -107,7 +107,7 @@ const PRO_FEATURES = [
   { id: 'agents', Icon: Bot, label: 'Create your agents' },
   { id: 'db', Icon: Database, label: 'Databases' },
   { id: 'host', Icon: Globe, label: 'Publish and host live apps' },
-  { id: 'credits', Icon: DollarSign, label: 'Monthly usage credits' },
+  { id: 'credits', Icon: DollarSign, label: 'Monthly usage tokens' },
 ];
 
 async function safeParseJson<T>(response: Response): Promise<T | null> {
@@ -526,21 +526,23 @@ export function ProUpgradeModal({
                 <span className="text-[11px] font-medium text-[#71717A] tabular-nums">
                   {isOwner
                     ? 'Owner · Free unlimited builds'
-                    : billing?.dailyLimit
-                      ? `${credits.toLocaleString()} left · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today`
-                      : `${credits.toLocaleString()} credits · Free 300/30d`}
+                    : billing && billing.tier === 'annual'
+                      ? `${credits.toLocaleString()} tokens · ${billing.annualCyclesRemaining + 1}/10 mo left`
+                      : billing && billing.tier !== 'free'
+                        ? `${credits.toLocaleString()} / ${billing.monthlyLimit.toLocaleString()} tokens/mo`
+                        : `${credits.toLocaleString()} tokens · Free 150/mo`}
                 </span>
               </div>
 
-              {(statusNotice || (!isOwner && credits <= 30) || isOwner) && (
+              {(statusNotice || (!isOwner && credits <= 5) || isOwner) && (
                 <div
                   role={
-                    statusNotice?.type === 'error' || (!isOwner && credits <= 30)
+                    statusNotice?.type === 'error' || (!isOwner && credits <= 5)
                       ? 'alert'
                       : 'status'
                   }
                   className={`mb-1.5 rounded-xl px-3 py-1.5 text-[11px] font-medium ${
-                    statusNotice?.type === 'error' || (!statusNotice && !isOwner && credits <= 30)
+                    statusNotice?.type === 'error' || (!statusNotice && !isOwner && credits <= 5)
                       ? 'bg-red-50 border border-red-200 text-red-700'
                       : 'bg-[#EEF4FF] border border-[#0D5BFF]/20 text-[#0B3AC7]'
                   }`}
@@ -549,7 +551,7 @@ export function ProUpgradeModal({
                     ? statusNotice.text
                     : isOwner
                       ? 'Owner account active — you can build and deploy apps for free with no credit limits.'
-                      : `Minimum 31 tokens required to chat or build (${credits.toLocaleString()} remaining). Pay to top up or choose a plan below.`}
+                      : `Minimum 6 tokens required to chat or build (${credits.toLocaleString()} remaining). Top up or choose a plan below.`}
                 </div>
               )}
 
@@ -708,7 +710,7 @@ export function ProUpgradeModal({
             >
               <p>
                 {legalSheet === 'terms'
-                  ? 'AI Craft Pro plans renew per selected billing cycle (Monthly or Annual) and can be managed or cancelled anytime from Profile.'
+                  ? 'Monthly plans refresh every 30 days. The $600 Annual plan delivers 10,000 tokens per month across 10 monthly cycles, then resets for recharge.'
                   : 'AI Craft stores your plan status, transaction receipts, and projects securely without exposing private credentials.'}
               </p>
               <button
