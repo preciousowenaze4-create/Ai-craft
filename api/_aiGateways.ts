@@ -39,7 +39,7 @@ export interface GatewayExecutionCandidate {
 export const SERVER_GEMINI_MODEL_ID = 'gemini::gemini-4-hydrogen';
 export const DEFAULT_BUILDER_MODEL_ID = 'gemini::gemini-4-hydrogen';
 export const SECONDARY_BUILDER_MODEL_ID = 'gemini::gemini-3.1-pro-preview';
-export const BACKEND_DESIGNER_MODEL_ID = 'gemini-2.5-pro';
+export const BACKEND_DESIGNER_MODEL_ID = 'gemini-2.5-flash';
 
 export function getServerGeminiApiKey(): string {
   return cleanEnvKey(process.env.GEMINI_API_KEY, [
@@ -66,8 +66,8 @@ export const BACKEND_GEMINI_FAILOVER_CHAIN: ReadonlyArray<{
   { upstreamModelId: 'gemini-2.5-pro', label: 'AI Craft Pro Engine (2.5 Pro)' },
   { upstreamModelId: 'gemini-2.5-flash', label: 'AI Craft 2.5 Flash' },
   { upstreamModelId: 'gemini-3.1-pro-preview', label: 'AI Craft 3.1 Pro' },
+  { upstreamModelId: 'gemini-3-flash-preview', label: 'AI Craft 3 Flash' },
   { upstreamModelId: 'gemini-3.1-flash-lite-preview', label: 'AI Craft 3.1 Mini Preview' },
-  { upstreamModelId: 'gemini-3.1-flash-lite', label: 'AI Craft 3.1 Lite' },
   { upstreamModelId: 'gemini-2.5-flash-lite', label: 'AI Craft 2.5 Lite' },
   { upstreamModelId: 'gemini-2.0-flash', label: 'AI Craft 2.0 Flash' },
 ];

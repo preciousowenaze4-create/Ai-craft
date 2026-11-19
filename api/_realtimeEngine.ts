@@ -26,6 +26,7 @@ import {
   type ParsedDbTable,
   type SearchImageItem,
   type SearchResultItem,
+  type SearchVideoItem,
 } from './_builderCore.js';
 import { GoogleGenAI, type GenerateContentResponse } from '@google/genai';
 import {
@@ -172,6 +173,7 @@ export interface PrepareRealtimeInput {
   reactEnabled?: boolean;
   backendEnabled?: boolean;
   projectMemoryContext?: string;
+  projectMemoryPromise?: Promise<{ brainContext: string; memory?: unknown }>;
   onStage?: (stage: PrepareRealtimeStageEvent) => void;
 }
 
@@ -188,6 +190,7 @@ export interface PreparedRealtimePrompt {
     query: string;
     results: SearchResultItem[];
     images: SearchImageItem[];
+    videos: SearchVideoItem[];
   };
   timeContext: string;
   designBlueprint?: string;
@@ -255,11 +258,11 @@ async function runBackendDesignArchitect(params: {
   });
 
   const timeoutPromise = new Promise<string>((resolve) => {
-    setTimeout(() => resolve(''), 9500);
+    setTimeout(() => resolve(''), 4200);
   });
 
   const generatePromise = (async () => {
-    const designerModels = [BACKEND_DESIGNER_MODEL_ID, 'gemini-2.5-flash'];
+    const designerModels = [BACKEND_DESIGNER_MODEL_ID, 'gemini-2.5-flash-lite', 'gemini-2.0-flash'];
     for (const designerModel of designerModels) {
       try {
         const response = await ai.models.generateContent({
@@ -326,49 +329,54 @@ export async function prepareRealtimePrompt(
         Boolean(input.attachmentDataUrl)
       );
 
+  const focusedSearchQuery = buildFocusedSearchQuery(message);
   const wantsSearch =
     input.webSearchEnabled !== false &&
     (initialRoute !== 'chat' || shouldRunChatSearch(message, hasPreviousHtml));
 
-  if (wantsSearch) {
-    input.onStage?.({
-      phase: 'understanding',
-      kind: initialRoute === 'build' ? 'build' : 'chat',
-      action: 'Searching',
-      label: 'Searching live web & references...',
-    });
-  }
-
-  const searchData = wantsSearch
-    ? await runLiveBrowserSearch(buildFocusedSearchQuery(message))
-    : { query: '', results: [], images: [] };
-
-  const webSearchContext = formatWebSearchContext(searchData);
   const previewSummary = extractPreviewStructureSummary(previousHtml);
-
   const shouldRunDesignEngine =
     !input.forceChat &&
     !naturalMediaIntent &&
+    Boolean(getServerGeminiApiKey()) &&
     (initialRoute === 'build' || (initialRoute === 'auto' && message.length >= 10));
 
-  let designBlueprint = '';
-  if (shouldRunDesignEngine && getServerGeminiApiKey()) {
+  if (wantsSearch || shouldRunDesignEngine) {
     input.onStage?.({
       phase: 'understanding',
       kind: initialRoute === 'build' ? 'build' : 'chat',
-      action: 'Designing',
-      label: 'Designing UI layout & visual architecture...',
-    });
-    designBlueprint = await runBackendDesignArchitect({
-      message,
-      mode: input.mode,
-      hasPreviousHtml,
-      previewSummary,
-      attachmentDataUrl: input.attachmentDataUrl,
-      visualHints: input.visualHints,
-      searchQuery: searchData.query,
+      action: wantsSearch ? 'Searching' : 'Designing',
+      label:
+        wantsSearch && shouldRunDesignEngine
+          ? 'Searching live web & designing visual architecture...'
+          : wantsSearch
+            ? 'Searching live web & references...'
+            : 'Designing UI layout & visual architecture...',
     });
   }
+
+  const [searchData, designBlueprint, resolvedMem] = await Promise.all([
+    wantsSearch
+      ? runLiveBrowserSearch(focusedSearchQuery)
+      : Promise.resolve({ query: '', results: [], images: [], videos: [] }),
+    shouldRunDesignEngine
+      ? runBackendDesignArchitect({
+          message,
+          mode: input.mode,
+          hasPreviousHtml,
+          previewSummary,
+          attachmentDataUrl: input.attachmentDataUrl,
+          visualHints: input.visualHints,
+          searchQuery: focusedSearchQuery,
+        })
+      : Promise.resolve(''),
+    input.projectMemoryPromise
+      ? input.projectMemoryPromise.catch(() => ({ brainContext: '' }))
+      : Promise.resolve({ brainContext: input.projectMemoryContext || '' }),
+  ]);
+
+  const effectiveMemoryContext = resolvedMem.brainContext || input.projectMemoryContext || '';
+  const webSearchContext = formatWebSearchContext(searchData);
 
   input.onStage?.({
     phase: 'understanding',
@@ -426,7 +434,7 @@ export async function prepareRealtimePrompt(
     shouldGenerateTitle,
     timeContext,
     projectInfraContext,
-    projectMemoryContext: input.projectMemoryContext,
+    projectMemoryContext: effectiveMemoryContext,
     designBlueprint,
     webSearchContext,
     previewSummary,
@@ -744,13 +752,19 @@ export async function streamServerFreeAiRealTime(params: {
     let lastTotalTokens = 0;
 
     try {
-      const streamResponse = await ai.models.generateContentStream({
-        model: candidate.upstreamModelId,
-        contents,
-        config: {
-          systemInstruction: params.systemPrompt,
-        },
-      });
+      const streamConnectTimeoutMs = 15000;
+      const streamResponse = await Promise.race([
+        ai.models.generateContentStream({
+          model: candidate.upstreamModelId,
+          contents,
+          config: {
+            systemInstruction: params.systemPrompt,
+          },
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`${candidate.label} stream timed out waiting for first byte.`)), streamConnectTimeoutMs)
+        ),
+      ]);
 
       for await (const chunk of streamResponse) {
         if (params.signal?.aborted) break;
@@ -826,4 +840,54 @@ export async function streamServerFreeAiRealTime(params: {
     }).catch(() => undefined);
   }
   throw new Error(formatGeminiApiError(lastError, flagshipModel.name));
+}
+
+/**
+ * Fast single-pass repair if initial HTML failed script syntax or completeness validation.
+ */
+export async function repairIncompleteBuildHtml(params: {
+  brokenHtml: string;
+  validationReason: string;
+  userMessage: string;
+  mode: 'mobile' | 'web';
+}): Promise<string> {
+  const geminiKey = getServerGeminiApiKey();
+  if (!geminiKey || !params.brokenHtml.trim()) return '';
+
+  const ai = createGeminiClient(geminiKey);
+  const repairPrompt = [
+    `The built ${params.mode} app HTML for "${params.userMessage.slice(0, 200)}" failed validation: ${params.validationReason}`,
+    'Fix ONLY the broken/truncated HTML, CSS, or <script> syntax and ensure the main screen content renders immediately with working buttons and zero empty blank viewports.',
+    'Output ONLY the complete corrected <!DOCTYPE html>...</html> inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>.',
+    '```html',
+    params.brokenHtml.slice(0, 70000),
+    '```',
+  ].join('\n');
+
+  const repairPromise = (async () => {
+    for (const modelId of ['gemini-2.5-flash', 'gemini-2.5-flash-lite']) {
+      try {
+        const res = await ai.models.generateContent({
+          model: modelId,
+          contents: [{ role: 'user', parts: [{ text: repairPrompt }] }],
+        });
+        const raw = (res.text || '').trim();
+        const extracted = extractPreviewHtmlFromRaw(raw) || finalizePartialPreviewHtml(raw);
+        if (extracted) {
+          const hardened = sanitizeAndHardenPreviewHtml(extracted);
+          if (validateBuiltAppHtml(hardened).valid) {
+            return hardened;
+          }
+        }
+      } catch {
+        // try next fast repair model
+      }
+    }
+    return '';
+  })();
+
+  return Promise.race([
+    repairPromise,
+    new Promise<string>((resolve) => setTimeout(() => resolve(''), 12000)),
+  ]);
 }

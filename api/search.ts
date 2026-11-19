@@ -16,6 +16,13 @@ interface SearchImageItem {
   source: string;
 }
 
+interface SearchVideoItem {
+  title: string;
+  videoUrl: string;
+  posterUrl?: string;
+  source: string;
+}
+
 async function fetchWithTimeout(
   url: string,
   timeoutMs = 3000,
@@ -41,16 +48,19 @@ export async function runLiveBrowserSearch(query: string): Promise<{
   query: string;
   results: SearchResultItem[];
   images: SearchImageItem[];
+  videos: SearchVideoItem[];
 }> {
   const cleanQuery = query.trim();
   if (!cleanQuery) {
-    return { query: '', results: [], images: [] };
+    return { query: '', results: [], images: [], videos: [] };
   }
 
   const results: SearchResultItem[] = [];
   const images: SearchImageItem[] = [];
+  const videos: SearchVideoItem[] = [];
   const seenUrls = new Set<string>();
   const seenImages = new Set<string>();
+  const seenVideos = new Set<string>();
 
   const addResult = (item: SearchResultItem) => {
     if (!item.snippet.trim() && !item.title.trim()) return;
@@ -68,10 +78,27 @@ export async function runLiveBrowserSearch(query: string): Promise<{
     images.push({ title: title || cleanQuery, imageUrl, source });
   };
 
+  const addVideo = (
+    title: string,
+    videoUrl: string | undefined,
+    posterUrl: string | undefined,
+    source: string
+  ) => {
+    if (!videoUrl || !/^https:\/\//i.test(videoUrl)) return;
+    if (seenVideos.has(videoUrl)) return;
+    seenVideos.add(videoUrl);
+    videos.push({
+      title: title || cleanQuery,
+      videoUrl,
+      ...(posterUrl && /^https:\/\//i.test(posterUrl) ? { posterUrl } : {}),
+      source,
+    });
+  };
+
   const ddgTask = (async () => {
     try {
       const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(cleanQuery)}&format=json&no_html=1&skip_disambig=1`;
-      const res = await fetchWithTimeout(ddgUrl, 2800);
+      const res = await fetchWithTimeout(ddgUrl, 2500);
       if (!res.ok) return;
       const data = (await res.json()) as {
         Heading?: string;
@@ -145,7 +172,7 @@ export async function runLiveBrowserSearch(query: string): Promise<{
       const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
         cleanQuery
       )}&gsrlimit=4&prop=pageimages|extracts&pithumbsize=720&exintro=1&explaintext=1&exchars=240&format=json`;
-      const res = await fetchWithTimeout(wikiUrl, 2800);
+      const res = await fetchWithTimeout(wikiUrl, 2500);
       if (!res.ok) return;
       const data = (await res.json()) as {
         query?: {
@@ -190,7 +217,7 @@ export async function runLiveBrowserSearch(query: string): Promise<{
       const commonsUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(
         cleanQuery
       )}&gsrlimit=5&prop=imageinfo&iiprop=url|mime&iiurlwidth=720&format=json`;
-      const res = await fetchWithTimeout(commonsUrl, 2800);
+      const res = await fetchWithTimeout(commonsUrl, 2500);
       if (!res.ok) return;
       const data = (await res.json()) as {
         query?: {
@@ -207,14 +234,65 @@ export async function runLiveBrowserSearch(query: string): Promise<{
       for (const page of pages) {
         const info = page.imageinfo?.[0];
         const mime = info?.mime || '';
-        if (!/^image\/(jpeg|png|webp)$/i.test(mime)) continue;
-        const imgUrl = info?.thumburl || info?.url;
         const cleanTitle = (page.title || cleanQuery)
           .replace(/^File:/i, '')
           .replace(/\.[a-z0-9]+$/i, '')
           .replace(/[_-]+/g, ' ')
           .trim();
-        addImage(cleanTitle, imgUrl, 'Wikimedia Commons');
+        if (/^video\/(mp4|webm)$/i.test(mime) && info?.url) {
+          addVideo(cleanTitle, info.url, info.thumburl, 'Wikimedia Commons Video');
+        } else if (/^image\/(jpeg|png|webp)$/i.test(mime)) {
+          addImage(cleanTitle, info?.thumburl || info?.url, 'Wikimedia Commons');
+        }
+      }
+    } catch {
+      // ignore timeout or network failure
+    }
+  })();
+
+  const commonsVideoTask = (async () => {
+    try {
+      const videoQuery =
+        cleanQuery
+          .replace(/\b(tiktok|reels|shorts|youtube|app|build|create|make|like|video|videos)\b/gi, '')
+          .trim() || 'city nature dance';
+      const fetchCommonsVideos = async (qStr: string) => {
+        const url = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(
+          qStr
+        )}&gsrlimit=6&prop=imageinfo&iiprop=url|mime&iiurlwidth=720&format=json`;
+        const res = await fetchWithTimeout(url, 2200);
+        if (!res.ok) return [];
+        const data = (await res.json()) as {
+          query?: {
+            pages?: Record<
+              string,
+              {
+                title?: string;
+                imageinfo?: Array<{ thumburl?: string; url?: string; mime?: string }>;
+              }
+            >;
+          };
+        };
+        return data?.query?.pages ? Object.values(data.query.pages) : [];
+      };
+
+      let pages = await fetchCommonsVideos(`filemime:video/webm ${videoQuery}`);
+      if (pages.length === 0) {
+        pages = await fetchCommonsVideos('filemime:video/webm timelapse');
+      }
+      for (const page of pages) {
+        const info = page.imageinfo?.[0];
+        const mime = info?.mime || '';
+        const vidUrl = info?.url || '';
+        if (!/^video\/(webm|mp4)/i.test(mime) && !/\.(?:webm|mp4)(?:\?|$)/i.test(vidUrl)) {
+          continue;
+        }
+        const cleanTitle = (page.title || cleanQuery)
+          .replace(/^File:/i, '')
+          .replace(/\.[a-z0-9]+$/i, '')
+          .replace(/[_-]+/g, ' ')
+          .trim();
+        addVideo(cleanTitle, vidUrl, info?.thumburl, 'Wikimedia Commons Video');
       }
     } catch {
       // ignore timeout or network failure
@@ -228,7 +306,7 @@ export async function runLiveBrowserSearch(query: string): Promise<{
       )}&async=content&first=1&count=12`;
       const res = await fetchWithTimeout(
         bingUrl,
-        3200,
+        2800,
         'text/html,application/xhtml+xml'
       );
       if (!res.ok) return;
@@ -256,11 +334,18 @@ export async function runLiveBrowserSearch(query: string): Promise<{
     }
   })();
 
-  await Promise.allSettled([ddgTask, bingImagesTask, wikiTask, commonsTask]);
+  await Promise.allSettled([
+    ddgTask,
+    bingImagesTask,
+    wikiTask,
+    commonsTask,
+    commonsVideoTask,
+  ]);
   return {
     query: cleanQuery,
     results: results.slice(0, 8),
     images: images.slice(0, 8),
+    videos: videos.slice(0, 6),
   };
 }
 
@@ -268,7 +353,7 @@ export async function GET(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const q = (url.searchParams.get('q') || '').trim();
   if (!q) {
-    return Response.json({ query: '', results: [], images: [] });
+    return Response.json({ query: '', results: [], images: [], videos: [] });
   }
   const data = await runLiveBrowserSearch(q);
   return Response.json(data);
@@ -279,7 +364,7 @@ export async function POST(request: Request): Promise<Response> {
     const body = (await request.json()) as { query?: string; q?: string };
     const q = (body?.query || body?.q || '').trim();
     if (!q) {
-      return Response.json({ query: '', results: [], images: [] });
+      return Response.json({ query: '', results: [], images: [], videos: [] });
     }
     const data = await runLiveBrowserSearch(q);
     return Response.json(data);

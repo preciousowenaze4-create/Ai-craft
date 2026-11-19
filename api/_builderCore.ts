@@ -19,6 +19,13 @@ export interface SearchImageItem {
   source: string;
 }
 
+export interface SearchVideoItem {
+  title: string;
+  videoUrl: string;
+  posterUrl?: string;
+  source: string;
+}
+
 export interface LiveBuildArtifact {
   path: string;
   action: string;
@@ -87,16 +94,19 @@ export async function runLiveBrowserSearch(query: string): Promise<{
   query: string;
   results: SearchResultItem[];
   images: SearchImageItem[];
+  videos: SearchVideoItem[];
 }> {
   const cleanQuery = query.trim().slice(0, 260);
   if (!cleanQuery) {
-    return { query: '', results: [], images: [] };
+    return { query: '', results: [], images: [], videos: [] };
   }
 
   const results: SearchResultItem[] = [];
   const images: SearchImageItem[] = [];
+  const videos: SearchVideoItem[] = [];
   const seenUrls = new Set<string>();
   const seenImages = new Set<string>();
+  const seenVideos = new Set<string>();
 
   const addResult = (item: SearchResultItem) => {
     if (!item.snippet.trim() && !item.title.trim()) return;
@@ -112,6 +122,23 @@ export async function runLiveBrowserSearch(query: string): Promise<{
     if (seenImages.has(imageUrl)) return;
     seenImages.add(imageUrl);
     images.push({ title: title || cleanQuery, imageUrl, source });
+  };
+
+  const addVideo = (
+    title: string,
+    videoUrl: string | undefined,
+    posterUrl: string | undefined,
+    source: string
+  ) => {
+    if (!videoUrl || !/^https:\/\//i.test(videoUrl)) return;
+    if (seenVideos.has(videoUrl)) return;
+    seenVideos.add(videoUrl);
+    videos.push({
+      title: title || cleanQuery,
+      videoUrl,
+      ...(posterUrl && /^https:\/\//i.test(posterUrl) ? { posterUrl } : {}),
+      source,
+    });
   };
 
   const ddgTask = (async () => {
@@ -238,7 +265,7 @@ export async function runLiveBrowserSearch(query: string): Promise<{
       const commonsUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(
         cleanQuery
       )}&gsrlimit=5&prop=imageinfo&iiprop=url|mime&iiurlwidth=800&format=json`;
-      const res = await fetchWithTimeout(commonsUrl, 2600);
+      const res = await fetchWithTimeout(commonsUrl, 2400);
       if (!res.ok) return;
       const data = (await res.json()) as {
         query?: {
@@ -255,14 +282,65 @@ export async function runLiveBrowserSearch(query: string): Promise<{
       for (const page of pages) {
         const info = page.imageinfo?.[0];
         const mime = info?.mime || '';
-        if (!/^image\/(jpeg|png|webp)$/i.test(mime)) continue;
-        const imgUrl = info?.thumburl || info?.url;
         const cleanTitle = (page.title || cleanQuery)
           .replace(/^File:/i, '')
           .replace(/\.[a-z0-9]+$/i, '')
           .replace(/[_-]+/g, ' ')
           .trim();
-        addImage(cleanTitle, imgUrl, 'Wikimedia Commons');
+        if (/^video\/(mp4|webm)$/i.test(mime) && info?.url) {
+          addVideo(cleanTitle, info.url, info.thumburl, 'Wikimedia Commons Video');
+        } else if (/^image\/(jpeg|png|webp)$/i.test(mime)) {
+          addImage(cleanTitle, info?.thumburl || info?.url, 'Wikimedia Commons');
+        }
+      }
+    } catch {
+      // ignore timeout or network failure
+    }
+  })();
+
+  const commonsVideoTask = (async () => {
+    try {
+      const videoQuery =
+        cleanQuery
+          .replace(/\b(tiktok|reels|shorts|youtube|app|build|create|make|like|video|videos)\b/gi, '')
+          .trim() || 'city nature dance';
+      const fetchCommonsVideos = async (qStr: string) => {
+        const url = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(
+          qStr
+        )}&gsrlimit=6&prop=imageinfo&iiprop=url|mime&iiurlwidth=720&format=json`;
+        const res = await fetchWithTimeout(url, 2200);
+        if (!res.ok) return [];
+        const data = (await res.json()) as {
+          query?: {
+            pages?: Record<
+              string,
+              {
+                title?: string;
+                imageinfo?: Array<{ thumburl?: string; url?: string; mime?: string }>;
+              }
+            >;
+          };
+        };
+        return data?.query?.pages ? Object.values(data.query.pages) : [];
+      };
+
+      let pages = await fetchCommonsVideos(`filemime:video/webm ${videoQuery}`);
+      if (pages.length === 0) {
+        pages = await fetchCommonsVideos('filemime:video/webm timelapse');
+      }
+      for (const page of pages) {
+        const info = page.imageinfo?.[0];
+        const mime = info?.mime || '';
+        const vidUrl = info?.url || '';
+        if (!/^video\/(webm|mp4)/i.test(mime) && !/\.(?:webm|mp4)(?:\?|$)/i.test(vidUrl)) {
+          continue;
+        }
+        const cleanTitle = (page.title || cleanQuery)
+          .replace(/^File:/i, '')
+          .replace(/\.[a-z0-9]+$/i, '')
+          .replace(/[_-]+/g, ' ')
+          .trim();
+        addVideo(cleanTitle, vidUrl, info?.thumburl, 'Wikimedia Commons Video');
       }
     } catch {
       // ignore timeout or network failure
@@ -274,7 +352,7 @@ export async function runLiveBrowserSearch(query: string): Promise<{
       const bingUrl = `https://www.bing.com/images/async?q=${encodeURIComponent(
         cleanQuery
       )}&async=content&first=1&count=12`;
-      const res = await fetchWithTimeout(bingUrl, 3200, 'text/html,application/xhtml+xml');
+      const res = await fetchWithTimeout(bingUrl, 2600, 'text/html,application/xhtml+xml');
       if (!res.ok) return;
       const html = await res.text();
       const matches = Array.from(
@@ -301,7 +379,7 @@ export async function runLiveBrowserSearch(query: string): Promise<{
       const ddgHtmlUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(
         cleanQuery
       )}`;
-      const res = await fetchWithTimeout(ddgHtmlUrl, 2800, 'text/html,application/xhtml+xml');
+      const res = await fetchWithTimeout(ddgHtmlUrl, 2500, 'text/html,application/xhtml+xml');
       if (!res.ok) return;
       const html = await res.text();
       const blocks = html.split(/class="result__body"/i).slice(1, 6);
@@ -336,11 +414,19 @@ export async function runLiveBrowserSearch(query: string): Promise<{
     }
   })();
 
-  await Promise.allSettled([ddgTask, ddgHtmlTask, wikiTask, commonsTask, bingImgTask]);
+  await Promise.allSettled([
+    ddgTask,
+    ddgHtmlTask,
+    wikiTask,
+    commonsTask,
+    commonsVideoTask,
+    bingImgTask,
+  ]);
   return {
     query: cleanQuery,
     results: results.slice(0, 8),
     images: images.slice(0, 8),
+    videos: videos.slice(0, 6),
   };
 }
 
@@ -348,6 +434,7 @@ export function formatWebSearchContext(searchData: {
   query: string;
   results: SearchResultItem[];
   images?: SearchImageItem[];
+  videos?: SearchVideoItem[];
 }): string {
   const sections: string[] = [];
 
@@ -372,9 +459,21 @@ export function formatWebSearchContext(searchData: {
     );
   }
 
+  if (searchData.videos && searchData.videos.length > 0) {
+    const vidLines = searchData.videos.map(
+      (vid, idx) =>
+        `${idx + 1}. ${vid.title} (${vid.source}): video=${vid.videoUrl}${
+          vid.posterUrl ? ` | poster=${vid.posterUrl}` : ''
+        }`
+    );
+    sections.push(
+      `Verified Video Search Results (real playable HTTPS WebM/MP4 URLs + posters — wire directly into <video src="..." poster="..." playsinline muted loop> with poster/artwork fallback if relevant):\n${vidLines.join('\n')}`
+    );
+  }
+
   if (sections.length === 0) return '';
   sections.push(
-    'Use these verified real-world facts and real images naturally in your design and app data when relevant.'
+    'Use these verified real-world facts, real images, and real playable videos naturally in your design and app data when relevant.'
   );
   return sections.join('\n\n');
 }
@@ -924,6 +1023,9 @@ export function sanitizeAndHardenPreviewHtml(html: string): string {
   let out = html.trim();
   if (!out) return out;
 
+  // Normalize rigid 100vh in CSS declarations to 100dvh so mobile safe-areas never leave a white strip
+  out = out.replace(/(:\s*)(100vh\b)/gi, '$1100dvh');
+
   if (!/<meta\b[^>]*name=["']viewport["']/i.test(out)) {
     const vpTag =
       '<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />';
@@ -935,7 +1037,8 @@ export function sanitizeAndHardenPreviewHtml(html: string): string {
   const hasSafetyMarker = out.includes('data-aicraft-safety');
   if (!hasSafetyMarker) {
     const safetyStyle = `<style data-aicraft-safety="1">
-html, body { max-width: 100%; overflow-x: hidden; -webkit-tap-highlight-color: transparent; }
+html { width: 100%; height: 100%; min-height: 100%; margin: 0; padding: 0; max-width: 100%; overflow-x: hidden; -webkit-tap-highlight-color: transparent; }
+body { width: 100%; min-height: 100%; margin: 0; padding: 0; max-width: 100%; overflow-x: hidden; }
 *, *::before, *::after { box-sizing: border-box; }
 nav[class*="bottom"], .bottom-nav, footer.app-nav, #bottom-nav { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
 </style>`;
@@ -945,6 +1048,34 @@ nav[class*="bottom"], .bottom-nav, footer.app-nav, #bottom-nav { padding-bottom:
 
     const safetyScript = `<script data-aicraft-safety-js="1">
 (function(){
+  function isOpaqueColor(c) {
+    return Boolean(c && c !== 'transparent' && c !== 'rgba(0, 0, 0, 0)' && !/^rgba\\([^)]*,\\s*0(\\.0+)?\\s*\\)$/i.test(c));
+  }
+  function syncDocumentSurface() {
+    try {
+      var bg = '';
+      var candidates = [
+        document.body,
+        document.querySelector('[data-screen].active, [data-view].active, main, #app, #root, .app, .app-shell')
+      ];
+      for (var i = 0; i < candidates.length; i += 1) {
+        var node = candidates[i];
+        if (!node) continue;
+        var computed = window.getComputedStyle(node).backgroundColor;
+        if (isOpaqueColor(computed)) { bg = computed; break; }
+      }
+      if (!bg) {
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta && meta.getAttribute('content')) bg = meta.getAttribute('content');
+      }
+      if (bg && document.documentElement) {
+        document.documentElement.style.backgroundColor = bg;
+        try {
+          window.parent.postMessage({ type: 'aicraft:surface', color: bg }, '*');
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
   function patchBrokenImages() {
     var imgs = document.querySelectorAll('img');
     for (var i = 0; i < imgs.length; i += 1) {
@@ -966,6 +1097,51 @@ nav[class*="bottom"], .bottom-nav, footer.app-nav, #bottom-nav { padding-bottom:
           label + '</text></svg>';
         this.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
       });
+    }
+  }
+  function patchBrokenVideos() {
+    var videos = document.querySelectorAll('video');
+    for (var i = 0; i < videos.length; i += 1) {
+      var vid = videos[i];
+      if (vid.dataset.aicraftVidBound) continue;
+      vid.dataset.aicraftVidBound = '1';
+      vid.setAttribute('playsinline', '');
+      vid.setAttribute('webkit-playsinline', '');
+      var showPosterFallback = function(v) {
+        if (!v || v.dataset.aicraftVidFallback) return;
+        v.dataset.aicraftVidFallback = '1';
+        var poster = v.getAttribute('poster') || '';
+        if (poster) {
+          v.style.backgroundImage = 'url("' + poster.replace(/"/g, '') + '")';
+          v.style.backgroundSize = 'cover';
+          v.style.backgroundPosition = 'center';
+        } else {
+          v.style.background = 'radial-gradient(circle at 30% 25%, #312E81 0%, #0F172A 65%, #020617 100%)';
+        }
+      };
+      vid.addEventListener('error', function() { showPosterFallback(this); });
+      if (!vid.getAttribute('src') && !vid.querySelector('source[src]')) {
+        showPosterFallback(vid);
+      }
+    }
+  }
+  function ensureVisibleScreen() {
+    var screens = document.querySelectorAll('[data-screen], [data-view], [data-tab]');
+    if (!screens.length) return;
+    var anyVisible = false;
+    for (var i = 0; i < screens.length; i += 1) {
+      var st = window.getComputedStyle(screens[i]);
+      if (st.display !== 'none' && st.visibility !== 'hidden' && screens[i].offsetHeight > 0) {
+        anyVisible = true;
+        break;
+      }
+    }
+    if (!anyVisible && screens[0]) {
+      screens[0].classList.add('active');
+      screens[0].style.display = 'flex';
+      if (!screens[0].style.flexDirection) screens[0].style.flexDirection = 'column';
+      if (!screens[0].style.flex) screens[0].style.flex = '1 1 auto';
+      if (!screens[0].style.minHeight) screens[0].style.minHeight = '0';
     }
   }
   function patchLucidePlaceholders() {
@@ -999,17 +1175,24 @@ nav[class*="bottom"], .bottom-nav, footer.app-nav, #bottom-nav { padding-bottom:
       }
     }, 350);
   }
+  function runAllPatches() {
+    syncDocumentSurface();
+    patchBrokenImages();
+    patchBrokenVideos();
+  }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function() {
-      patchBrokenImages();
+      runAllPatches();
       patchLucidePlaceholders();
+      setTimeout(function() { syncDocumentSurface(); ensureVisibleScreen(); }, 450);
     });
   } else {
-    patchBrokenImages();
+    runAllPatches();
     patchLucidePlaceholders();
+    setTimeout(function() { syncDocumentSurface(); ensureVisibleScreen(); }, 450);
   }
   if (typeof MutationObserver !== 'undefined') {
-    var obs = new MutationObserver(function() { patchBrokenImages(); });
+    var obs = new MutationObserver(function() { runAllPatches(); });
     if (document.documentElement) obs.observe(document.documentElement, { childList: true, subtree: true });
   }
 })();
@@ -1474,7 +1657,7 @@ export function buildProjectInfraContext(params: {
     '- REAL SUPABASE + GOOGLE LOGIN + REAL DATABASE WIRING: When Supabase secrets are configured in Secrets OR requested by the user: load `@supabase/supabase-js@2` via `<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>`, initialize `window.supabase.createClient(sbUrl, sbKey)` using Secrets (`getSecret` + `findSecret` fallback), wire `supabaseClient.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } })` + `onAuthStateChange` + real `supabaseClient.from(table).select/insert/update/delete`, AND sync records into `window.AICraft.db` while emitting `[[DB_SCHEMA: ...]]` lines.',
     '- BUILT-IN REAL-TIME DATABASE API: For every app with data persistence, wire ALL views cleanly to `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, and `await window.AICraft.db.remove("table", id)`. Re-render the DOM immediately after every mutation — NEVER hardcode static mock cards that bypass the database.',
     '- CLEAN WEB/APP DELIVERY & OPT-IN LOGO / PWA: Deliver clean, responsive apps inside the browser by default WITHOUT injecting any unsolicited app logo, custom SVG emblem, or PWA "Add to Home Screen" manifest/install UI. ONLY create a brand logo (`[[LOGO:...]]`) or enable PWA Home Screen installability (`<meta name="aicraft-pwa" content="enabled" />`) when the user explicitly asks for a logo/icon, snaps/attaches a logo picture to add to the app, or explicitly asks to make the app installable / Add to Home Screen.',
-    '- LIVE SEARCH & MEDIA GENERATION IN APPS: Inside generated apps, you can call `await window.AICraft.search(query)` (live web & image results), `await window.AICraft.ask(prompt)`, `await window.AICraft.generateImage(prompt)`, or `await window.AICraft.generateMusic(prompt)`.',
+    '- LIVE SEARCH & MEDIA GENERATION IN APPS: Inside generated apps, you can call `await window.AICraft.search(query)` (returns `{ query, results, images, videos }` with real web facts, HTTPS images, AND playable HTTPS MP4/WebM video URLs + poster images!), `await window.AICraft.ask(prompt)`, `await window.AICraft.generateImage(prompt)`, or `await window.AICraft.generateMusic(prompt)`.',
   ].join('\n');
 }
 
@@ -1600,12 +1783,14 @@ export function buildCraftSystemPrompt(params: {
     'MANDATORY REAL-APP COMPLETENESS & DYNAMIC ENGINEERING RULES FOR PART 2:',
     `1. TARGET EXPERIENCE: Engineer a complete, genuinely functional ${targetLabel}. NEVER stop after building one screen or static non-working cards! Build 4 to 6 distinct, fully interactive screens using semantic containers: \`<section data-screen="<id>" data-screen-title="<Screen Name>">...</section>\`. Every screen must render real state dynamically via JS functions and respond to user clicks, inputs, filters, edits, and deletions.`,
     '2. ZERO FRAGILE EXTERNAL CDNs FOR STYLING OR ICONS: Write ALL layout, spacing, typography, cards, feeds, modals, and animations cleanly inside `<style>...</style>`. DO NOT depend on `cdn.tailwindcss.com`, `unpkg.com/lucide`, React/Babel `<script type="text/babel">`, or icon font CDNs — use PURE INLINE `<svg>` paths (`width="20" height="20" viewBox="0 0 24 24"`) on EVERY icon button so icons never disappear!',
-    '3. ANDROID + IOS + LAPTOP/PC + TV VIEWPORT & BOTTOM CLEARANCE MATH: Use `html, body { margin: 0; padding: 0; height: 100dvh; width: 100%; overflow: hidden; }` for app shells with sticky headers/bottom bars, and center app content cleanly inside a responsive container (`width: 100%; max-width: 1120px; margin: 0 auto;` for desktop/laptop/TV views, keeping full width on phones). On Android (`html[data-platform="android"]`) give bottom navigation bars `padding-bottom: max(18px, calc(env(safe-area-inset-bottom, 0px) + 10px))` so Android system nav buttons NEVER overlap or sink into the bottom nav labels, while keeping iOS (`env(safe-area-inset-bottom)`) crisp and natural.',
-    '4. CLEAN `<head>` METADATA (NO UNSOLICITED LOGO OR PWA TAGS): Only include `<meta name="theme-color" content="#HEX" />` if matching the surface palette. Only include `<meta name="aicraft-logo" ...>` or header logo artwork if the user explicitly requested a logo or attached a logo image, and only include `<meta name="aicraft-pwa" content="enabled" />` if the user explicitly asked for Add to Home Screen / PWA installability.',
-    '5. REAL-TIME DATABASE PERSISTENCE (`window.AICraft.db`): Every stateful entity in your app MUST live inside `window.AICraft.db` (`list`, `insert`, `update`, `remove`). Inside `DOMContentLoaded`, check `const existing = await window.AICraft.db.list("table");` — when empty, call `await window.AICraft.db.insert("table", { ... })` with 4–6 rich domain-accurate starter records using real plain object literals so the Database inspector immediately captures real structured records, then render ALL UI dynamically from those stored rows and re-render cleanly after every insert/update/remove. Wire Supabase secrets automatically if configured via `window.AICraft.findSecret(...)`.',
-    '6. WORKING DOMAIN FEATURES & REAL SEARCHED IMAGES: Use verified HTTPS image URLs returned by search results (with clean CSS gradient/initials fallbacks on `onerror`). Build genuine screen switching, live search (`window.AICraft.search` + live DB filtering), working create/edit/delete forms, validation feedback, toast confirmations, and instant state persistence.',
-    '7. ERROR-FREE VANILLA JAVASCRIPT: Write clean vanilla JS inside `<script>...</script>`, wrap initialization cleanly in `DOMContentLoaded` + `try/catch`, null-check DOM lookups, escape dynamic text safely, bind event listeners cleanly (prefer delegation or direct binding after render), verify all braces/parentheses match cleanly, and ensure every clickable button works immediately on tap.',
-    '8. FINAL ENGINEERING SELF-AUDIT BEFORE ENDING: Before outputting `<<<END_AICRAFT_APP_HTML>>>` or `<<<END_PATCH>>>`, verify that NO screen relies on hardcoded fake static cards, every `[[DB_SCHEMA: ...]]` table is actively read and written via `window.AICraft.db`, every form & button mutates real state, and zero unsolicited logos or PWA Home Screen tags were injected.',
+    '3. ZERO BLANK SCREEN / ZERO EMPTY BLACK FEED & FULL-BLEED VIEWPORT MATH: Use `html, body { margin: 0; padding: 0; width: 100%; height: 100%; min-height: 100dvh; overflow: hidden; background: <matching app surface color>; }` for fixed-nav shells (NO mismatched outer board or bottom white strip!). Every middle scrollable area or feed between top bar & bottom nav MUST have `flex: 1; min-height: 0; overflow-y: auto;` so it NEVER collapses to 0px height! ALWAYS show the default primary screen visible immediately in CSS (`[data-screen].active, [data-screen]:first-of-type { display: flex; }`) BEFORE JavaScript runs, so the screen is NEVER empty!',
+    '4. PLAYABLE VIDEO & RICH MEDIA APPS (NO EMPTY BLACK VIDEO BOXES): Whenever building any video feed, reels, short-video, streaming, or discovery app, use real playable HTTPS video URLs from `Verified Video Search Results` AND live `await window.AICraft.search(topic)` (`{ videos, images, results }`). Always set `poster`, `playsinline`, `muted`, `loop`, interactive tap-to-play/pause + mute/unmute controls, swipe/snap scrolling (`scroll-snap-type: y mandatory`), real author overlays, working likes/comments/bookmarks in `window.AICraft.db`, and graceful `poster` + animated canvas/artwork fallback if any clip is still buffering — NEVER leave an empty black center!',
+    '5. ANDROID + IOS + LAPTOP/PC + TV SAFE AREA: Center wide desktop/TV layouts cleanly inside a responsive container (`width: 100%; max-width: 1120px; margin: 0 auto;` for desktop/laptop/TV views, full width on mobile). Give bottom navigation bars `padding-bottom: max(14px, env(safe-area-inset-bottom))` and `html[data-platform="android"]` extra clearance so bottom labels never clip.',
+    '6. CLEAN `<head>` METADATA (NO UNSOLICITED LOGO OR PWA TAGS): Only include `<meta name="theme-color" content="#HEX" />` matching the app surface. Only include `<meta name="aicraft-logo" ...>` or header logo artwork if the user explicitly requested a logo or attached a logo image, and only include `<meta name="aicraft-pwa" content="enabled" />` if the user explicitly asked for Add to Home Screen / PWA installability.',
+    '7. REAL-TIME DATABASE PERSISTENCE (`window.AICraft.db`): Every stateful entity in your app MUST live inside `window.AICraft.db` (`list`, `insert`, `update`, `remove`). Inside `DOMContentLoaded`, check `const existing = await window.AICraft.db.list("table");` — when empty, call `await window.AICraft.db.insert("table", { ... })` with 4–6 rich domain-accurate starter records using real plain object literals so the Database inspector immediately captures real structured records, then render ALL UI dynamically from those stored rows and re-render cleanly after every insert/update/remove. Wire Supabase secrets automatically if configured via `window.AICraft.findSecret(...)`.',
+    '8. WORKING DOMAIN FEATURES & REAL SEARCHED IMAGES: Use verified HTTPS image/video URLs returned by search results (with clean CSS gradient/initials fallbacks on `onerror`). Build genuine screen switching, live search (`window.AICraft.search` + live DB filtering), working create/edit/delete forms, validation feedback, toast confirmations, and instant state persistence.',
+    '9. ERROR-FREE VANILLA JAVASCRIPT: Write clean vanilla JS inside `<script>...</script>`, wrap initialization cleanly in `DOMContentLoaded` + `try/catch`, null-check DOM lookups, escape dynamic text safely, bind event listeners cleanly (prefer delegation or direct binding after render), verify all braces/parentheses match cleanly, and ensure every clickable button works immediately on tap.',
+    '10. FINAL ENGINEERING SELF-AUDIT BEFORE ENDING: Before outputting `<<<END_AICRAFT_APP_HTML>>>` or `<<<END_PATCH>>>`, verify that NO screen relies on hardcoded fake static cards, NO center viewport can collapse or stay blank/black, every `[[DB_SCHEMA: ...]]` table is actively read and written via `window.AICraft.db`, every form & button mutates real state, and zero unsolicited logos or PWA Home Screen tags were injected.',
     'PART 3 (Next Suggested Upgrades): Immediately AFTER <<<END_AICRAFT_APP_HTML>>> or <<<END_PATCH>>>, output:',
     '[[SUGGESTIONS]]',
     '<Short, specific, immediately tappable upgrade prompt 1>',

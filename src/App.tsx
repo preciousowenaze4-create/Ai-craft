@@ -465,7 +465,7 @@ export default function App() {
 
   // Track active network readers per turnId (never globally aborted when switching projects)
   const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
-  const retriedTurnsRef = useRef<Set<string>>(new Set());
+  const retriedTurnsRef = useRef<Map<string, number>>(new Map());
   const notifiedTurnIdsRef = useRef<Set<string>>(new Set());
   const wasBackgroundedRef = useRef<boolean>(false);
   const projectsRef = useRef<CraftProject[]>(projects);
@@ -1721,6 +1721,7 @@ export default function App() {
                 scheduleBufferedFlush();
               } else if (evt.type === 'done') {
                 sawTerminalEvent = true;
+                retriedTurnsRef.current.delete(turnId);
                 stopCreditTicker();
                 flushBuffered();
                 const finalKind: TurnKind =
@@ -2158,7 +2159,8 @@ export default function App() {
         if (!result.sawTerminalEvent) {
           const reconnectJobId = result.latestJobId || knownJobId;
           const isVisible = document.visibilityState === 'visible';
-          if (reconnectJobId || !isVisible || !retriedTurnsRef.current.has(turnId)) {
+          const retryCount = retriedTurnsRef.current.get(turnId) ?? 0;
+          if (reconnectJobId || !isVisible || retryCount < 3) {
             updateTurn(projectId, turnId, (t) =>
               t.phase === 'complete' || t.phase === 'paused' || t.phase === 'error'
                 ? t
@@ -2171,7 +2173,10 @@ export default function App() {
                   }
             );
             if (isVisible) {
-              void resumeJobStreamRef.current?.(projectId, turnId, reconnectJobId);
+              const delayMs = retryCount === 0 ? 500 : retryCount === 1 ? 1200 : 2000;
+              window.setTimeout(() => {
+                void resumeJobStreamRef.current?.(projectId, turnId, reconnectJobId);
+              }, delayMs);
             }
           } else {
             updateTurn(projectId, turnId, (t) =>
@@ -2198,9 +2203,10 @@ export default function App() {
         const errObj = err as Error & { isHttpError?: boolean };
         if (errObj.name !== 'AbortError') {
           const isVisible = document.visibilityState === 'visible';
+          const retryCount = retriedTurnsRef.current.get(turnId) ?? 0;
           if (
             !errObj.isHttpError &&
-            (knownJobId || streamStarted || !isVisible || !retriedTurnsRef.current.has(turnId))
+            (knownJobId || streamStarted || !isVisible || retryCount < 3)
           ) {
             updateTurn(projectId, turnId, (t) =>
               t.phase === 'complete' || t.phase === 'paused' || t.phase === 'error'
@@ -2214,9 +2220,10 @@ export default function App() {
                   }
             );
             if (isVisible) {
+              const delayMs = retryCount === 0 ? 600 : retryCount === 1 ? 1300 : 2200;
               window.setTimeout(() => {
                 void resumeJobStreamRef.current?.(projectId, turnId, knownJobId);
-              }, 550);
+              }, delayMs);
             }
             return;
           }
@@ -2410,7 +2417,8 @@ export default function App() {
       if (turn.phase === 'complete' || turn.phase === 'paused' || turn.phase === 'error') return;
 
       const rerunTurnFromSavedProgress = () => {
-        retriedTurnsRef.current.add(turnId);
+        const prevCount = retriedTurnsRef.current.get(turnId) ?? 0;
+        retriedTurnsRef.current.set(turnId, prevCount + 1);
         const idx = project.turns.findIndex((t) => t.id === turnId);
         const priorTurns = idx > 0 ? project.turns.slice(0, idx) : [];
         const history = priorTurns.flatMap((t) => [
@@ -2451,9 +2459,10 @@ export default function App() {
         );
       };
 
+      const retryCount = retriedTurnsRef.current.get(turnId) ?? 0;
       const targetJobId = jobId || turn.jobId;
       if (!targetJobId) {
-        if (!retriedTurnsRef.current.has(turnId)) {
+        if (retryCount < 3) {
           rerunTurnFromSavedProgress();
         } else {
           updateTurn(projectId, turnId, (t) => ({
@@ -2478,7 +2487,7 @@ export default function App() {
 
         if (snapRes.status === 404) {
           activeConnectionsRef.current.delete(turnId);
-          if (!retriedTurnsRef.current.has(turnId)) {
+          if (retryCount < 3) {
             rerunTurnFromSavedProgress();
             return;
           }

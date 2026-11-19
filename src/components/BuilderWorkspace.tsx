@@ -198,6 +198,7 @@ export function BuilderWorkspace({
   const [copiedCode, setCopiedCode] = useState(false);
   const [activeCodeTab, setActiveCodeTab] = useState<'index.html' | 'styles.css' | 'app.js'>('index.html');
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [previewSurfaceBg, setPreviewSurfaceBg] = useState<string>('#ffffff');
 
   const hasWorkingTurn = useMemo(
     () => turns.some((t) => t.phase === 'understanding' || t.phase === 'building'),
@@ -282,6 +283,40 @@ export function BuilderWorkspace({
   const latestPreviewHtml = latestBuiltTurn?.previewHtml ?? '';
   const hasBuiltApp = latestPreviewHtml.length > 0;
 
+  useEffect(() => {
+    if (!latestPreviewHtml.trim()) {
+      setPreviewSurfaceBg('#070B14');
+      return;
+    }
+    const themeMatch = /<meta\b[^>]*name=["']theme-color["'][^>]*content=["']([^"']+)["']/i.exec(
+      latestPreviewHtml
+    );
+    if (themeMatch?.[1]?.trim()) {
+      setPreviewSurfaceBg(themeMatch[1].trim());
+      return;
+    }
+    const bodyBgMatch = /\bbody\b[^}]*\{[^}]*background(?:-color)?\s*:\s*([^;!}]+)/i.exec(
+      latestPreviewHtml
+    );
+    if (bodyBgMatch?.[1]?.trim() && !/var\(/i.test(bodyBgMatch[1])) {
+      setPreviewSurfaceBg(bodyBgMatch[1].trim());
+      return;
+    }
+    setPreviewSurfaceBg('#ffffff');
+  }, [latestPreviewHtml]);
+
+  useEffect(() => {
+    if (activeView === 'preview') {
+      const targetBg = hasBuiltApp ? previewSurfaceBg : '#070B14';
+      document.documentElement.style.backgroundColor = targetBg;
+      return () => {
+        document.documentElement.style.backgroundColor = '#ffffff';
+      };
+    }
+    document.documentElement.style.backgroundColor = '#ffffff';
+    return undefined;
+  }, [activeView, hasBuiltApp, previewSurfaceBg]);
+
   const codeParts = useMemo(() => {
     if (!latestPreviewHtml) {
       return [{ id: 'index.html' as const, label: 'index.html', content: '' }];
@@ -318,6 +353,187 @@ export function BuilderWorkspace({
 
   const databaseConfigRef = useRef(databaseConfig);
   databaseConfigRef.current = databaseConfig;
+
+  // Real-time pre-hydration: extract AICraft.db tables and literal starter inserts from generated HTML
+  // so opening Database directly from the chat tab immediately reflects real built tables & records.
+  useEffect(() => {
+    if (!latestPreviewHtml || !projectId) return;
+    if (isStreaming) return;
+
+    const cleanIdent = (raw: string) =>
+      raw
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+
+    const tryParseObjectLiteral = (objText: string): Record<string, unknown> | null => {
+      try {
+        let jsonish = objText
+          .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')
+          .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')
+          .replace(/'((?:\\.|[^'\\])*)'/g, (_, inner: string) =>
+            JSON.stringify(inner.replace(/\\'/g, "'"))
+          )
+          .replace(/,\s*([}\]])/g, '$1');
+        const parsed = JSON.parse(jsonish) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Ignore dynamic JS expressions that require runtime iframe execution
+      }
+      return null;
+    };
+
+    const tableSeeds = new Map<string, Record<string, unknown>[]>();
+    const detectedColsByTable = new Map<string, Map<string, ProjectDatabaseColumn>>();
+
+    const recordColumn = (tableName: string, key: string, sampleVal?: unknown) => {
+      const col = cleanIdent(key);
+      if (!col) return;
+      let colMap = detectedColsByTable.get(tableName);
+      if (!colMap) {
+        colMap = new Map();
+        detectedColsByTable.set(tableName, colMap);
+      }
+      if (colMap.has(col)) return;
+      const inferredType: ProjectDatabaseColumn['type'] =
+        typeof sampleVal === 'number'
+          ? 'number'
+          : typeof sampleVal === 'boolean'
+            ? 'boolean'
+            : sampleVal !== null && typeof sampleVal === 'object'
+              ? 'json'
+              : col === 'created_at' || col === 'updated_at' || col.endsWith('_at')
+                ? 'timestamp'
+                : 'text';
+      colMap.set(col, { name: col, type: inferredType, required: col === 'id' });
+    };
+
+    // Match direct AICraft.db.insert('table', { ... }) calls
+    const insertRegex = /AICraft\.db\.insert\(\s*['"`]([a-zA-Z0-9_-]+)['"`]\s*,\s*\{/g;
+    let m: RegExpExecArray | null;
+    while ((m = insertRegex.exec(latestPreviewHtml)) !== null) {
+      const tableName = cleanIdent(m[1] || '');
+      if (!tableName) continue;
+      const startBrace = m.index + m[0].length - 1;
+      let depth = 0;
+      let endIdx = -1;
+      let inStr: string | null = null;
+      for (let i = startBrace; i < Math.min(latestPreviewHtml.length, startBrace + 2500); i += 1) {
+        const ch = latestPreviewHtml[i];
+        if (inStr) {
+          if (ch === '\\') {
+            i += 1;
+            continue;
+          }
+          if (ch === inStr) inStr = null;
+          continue;
+        }
+        if (ch === '"' || ch === "'" || ch === '`') {
+          inStr = ch;
+          continue;
+        }
+        if (ch === '{') depth += 1;
+        else if (ch === '}') {
+          depth -= 1;
+          if (depth === 0) {
+            endIdx = i;
+            break;
+          }
+        }
+      }
+      if (endIdx === -1) continue;
+      const rawObj = latestPreviewHtml.slice(startBrace, endIdx + 1);
+      const parsedObj = tryParseObjectLiteral(rawObj);
+      recordColumn(tableName, 'id', 'text');
+      if (parsedObj) {
+        for (const [k, v] of Object.entries(parsedObj)) {
+          recordColumn(tableName, k, v);
+        }
+        const list = tableSeeds.get(tableName) ?? [];
+        list.push({
+          id:
+            typeof parsedObj.id === 'string' && parsedObj.id
+              ? parsedObj.id
+              : `seed_${tableName}_${list.length + 1}`,
+          created_at:
+            typeof parsedObj.created_at === 'string' && parsedObj.created_at
+              ? parsedObj.created_at
+              : new Date().toISOString(),
+          ...parsedObj,
+        });
+        tableSeeds.set(tableName, list);
+      }
+      recordColumn(tableName, 'created_at', 'timestamp');
+    }
+
+    // Also capture any AICraft.db.list/update/remove table schemas
+    const callRegex = /AICraft\.db\.\w+\(\s*['"`]([a-zA-Z0-9_-]+)['"`]/g;
+    for (const callMatch of latestPreviewHtml.matchAll(callRegex)) {
+      const tableName = cleanIdent(callMatch[1] || '');
+      if (!tableName) continue;
+      recordColumn(tableName, 'id', 'text');
+      recordColumn(tableName, 'created_at', 'timestamp');
+    }
+
+    let dbMutated = false;
+    try {
+      for (const [tableName, rows] of tableSeeds.entries()) {
+        if (rows.length === 0) continue;
+        const storageKey = `aicraft_db_${projectId}_${tableName}`;
+        const existingRaw = window.localStorage.getItem(storageKey);
+        const existingParsed = existingRaw ? (JSON.parse(existingRaw) as unknown) : null;
+        if (!Array.isArray(existingParsed) || existingParsed.length === 0) {
+          window.localStorage.setItem(storageKey, JSON.stringify(rows));
+          dbMutated = true;
+        }
+      }
+    } catch {
+      // ignore storage quota errors
+    }
+
+    if (detectedColsByTable.size > 0) {
+      const currentDb = databaseConfigRef.current;
+      let changed = false;
+      const nextTables = [...currentDb.tables];
+      for (const [tableName, colMap] of detectedColsByTable.entries()) {
+        const existingIdx = nextTables.findIndex((t) => t.name === tableName);
+        if (existingIdx === -1) {
+          nextTables.push({
+            id: `tbl-${tableName}`,
+            name: tableName,
+            columns: Array.from(colMap.values()),
+          });
+          changed = true;
+        } else {
+          const existing = nextTables[existingIdx];
+          const seen = new Set(existing.columns.map((c) => c.name));
+          const extra = Array.from(colMap.values()).filter((c) => !seen.has(c.name));
+          if (extra.length > 0) {
+            nextTables[existingIdx] = {
+              ...existing,
+              columns: [...existing.columns, ...extra],
+            };
+            changed = true;
+          }
+        }
+      }
+      if (changed) {
+        onUpdateDatabase({
+          ...currentDb,
+          enabled: true,
+          tables: nextTables,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    if (dbMutated) {
+      window.dispatchEvent(new CustomEvent('aicraft:db-updated', { detail: { projectId } }));
+    }
+  }, [latestPreviewHtml, projectId, isStreaming, onUpdateDatabase]);
 
   // Real-time pre-hydration: extract AICraft.db tables and literal starter inserts from generated HTML
   // so opening Database directly from the chat tab immediately reflects real built tables & records.
@@ -1174,6 +1390,14 @@ export function BuilderWorkspace({
         return;
       }
 
+      if (data.type === 'aicraft:surface') {
+        const surfaceColor = (event.data as { color?: string })?.color;
+        if (typeof surfaceColor === 'string' && surfaceColor.trim()) {
+          setPreviewSurfaceBg(surfaceColor.trim());
+        }
+        return;
+      }
+
       if (data.type === 'aicraft:search' && data.id && data.query?.trim()) {
         const replyTarget = previewIframeRef.current?.contentWindow;
         try {
@@ -1184,6 +1408,7 @@ export function BuilderWorkspace({
             query?: string;
             results?: Array<{ title: string; snippet: string; url: string; source: string; imageUrl?: string }>;
             images?: Array<{ title: string; imageUrl: string; source: string }>;
+            videos?: Array<{ title: string; videoUrl: string; posterUrl?: string; source: string }>;
           };
           replyTarget?.postMessage(
             {
@@ -1193,6 +1418,7 @@ export function BuilderWorkspace({
                 query: json.query ?? data.query.trim(),
                 results: Array.isArray(json.results) ? json.results : [],
                 images: Array.isArray(json.images) ? json.images : [],
+                videos: Array.isArray(json.videos) ? json.videos : [],
               },
             },
             '*'
@@ -1496,7 +1722,10 @@ export function BuilderWorkspace({
   // plus the draggable right-side round blue AI Craft logo button
   if (activeView === 'preview') {
     return (
-      <div className="fixed inset-0 w-full h-dvh max-h-dvh overflow-hidden">
+      <div
+        className="fixed inset-0 w-full h-full overflow-hidden"
+        style={{ backgroundColor: hasBuiltApp ? previewSurfaceBg : '#070B14' }}
+      >
         {hasBuiltApp ? (
           <iframe
             ref={previewIframeRef}
@@ -1504,7 +1733,7 @@ export function BuilderWorkspace({
             title={`${projectTitle} Preview`}
             srcDoc={connectedPreviewHtml}
             sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads"
-            className="w-full h-full border-0 block bg-white"
+            className="w-full h-full border-0 block bg-transparent"
           />
         ) : (
           <LivingBotanicalWallpaper isBuilding={isStreaming} />

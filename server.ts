@@ -96,6 +96,7 @@ import {
   createGeminiClient,
   finalizeRealtimeOutput,
   prepareRealtimePrompt,
+  repairIncompleteBuildHtml,
   streamServerFreeAiRealTime,
   type VisualHintsSpec,
 } from './api/_realtimeEngine.js';
@@ -2769,7 +2770,7 @@ async function startServer() {
       } else {
         clearInterval(keepAlive);
       }
-    }, 3000);
+    }, 2000);
 
     // Keep AI generation running to completion even if the user closes/leaves the app
     const clientAbort = new AbortController();
@@ -2777,6 +2778,8 @@ async function startServer() {
       clearInterval(keepAlive);
       job.subscribers.delete(res);
     });
+
+    let rawAccumulated = '';
 
     try {
       sendEvent({
@@ -2794,12 +2797,12 @@ async function startServer() {
               accessToken: generationCreditContext.accessToken,
             }
           : null;
-      const retrievedMemory = memAuth
-        ? await getProjectMemory(memAuth, projectId).catch(() => ({
+      const projectMemoryPromise = memAuth
+        ? getProjectMemory(memAuth, projectId).catch(() => ({
             brainContext: '',
             memory: null,
           }))
-        : { brainContext: '', memory: null };
+        : Promise.resolve({ brainContext: '', memory: null });
 
       const visualHints = body?.visualHints ?? options.visualHints ?? null;
       const prepared = await prepareRealtimePrompt({
@@ -2823,7 +2826,7 @@ async function startServer() {
         clientTime,
         clientTimeZone,
         visualHints,
-        projectMemoryContext: retrievedMemory.brainContext || '',
+        projectMemoryPromise,
         onStage: (stage) => {
           sendEvent({
             type: 'phase',
@@ -2887,7 +2890,7 @@ async function startServer() {
         return;
       }
 
-      let rawAccumulated = '';
+      rawAccumulated = '';
       let emittedTitle = '';
       let emittedPlanCount = 0;
       let emittedDbKey = '';
@@ -3012,7 +3015,7 @@ async function startServer() {
                 bytesBuilt: htmlSoFar.length,
               });
             }
-            if (htmlSoFar.length >= 600 && htmlSoFar.length - lastPreviewBytesSent >= 2400) {
+            if (htmlSoFar.length >= 450 && htmlSoFar.length - lastPreviewBytesSent >= 1400) {
               lastPreviewBytesSent = htmlSoFar.length;
               const liveHtml = finalizePartialPreviewHtml(cleanSoFar);
               if (liveHtml) {
@@ -3050,6 +3053,32 @@ async function startServer() {
         provider: activeProvider,
         startedAt: job.startedAt,
       });
+
+      if (
+        finalized.kind === 'build' &&
+        !finalized.valid &&
+        finalized.previewHtml &&
+        Date.now() - job.startedAt < 45000
+      ) {
+        sendEvent({
+          type: 'phase',
+          phase: 'building',
+          kind: 'build',
+          action: 'Checking',
+          label: 'Verifying scripts & polishing live UI...',
+        });
+        const repairedHtml = await repairIncompleteBuildHtml({
+          brokenHtml: finalized.previewHtml,
+          validationReason: finalized.validationReason || 'Incomplete app output',
+          userMessage: message,
+          mode,
+        });
+        if (repairedHtml) {
+          finalized.previewHtml = repairedHtml;
+          finalized.bytesBuilt = repairedHtml.length;
+          finalized.valid = true;
+        }
+      }
 
       if (finalized.kind === 'chat') {
         if (memAuth) {
@@ -3191,6 +3220,16 @@ async function startServer() {
       });
     } catch (err) {
       clearInterval(keepAlive);
+      const savedPartial = rawAccumulated
+        ? finalizePartialPreviewHtml(stripReasoningTags(rawAccumulated))
+        : '';
+      if (savedPartial && savedPartial.length >= 450) {
+        sendEvent({
+          type: 'partialHtml',
+          previewHtml: savedPartial,
+          bytesBuilt: savedPartial.length,
+        });
+      }
       const errorMessage =
         err instanceof Error ? err.message : 'Unable to reach free AI engine right now.';
       if (projectId && generationCreditContext?.user?.id) {
@@ -3209,6 +3248,7 @@ async function startServer() {
             pausedReason: 'STREAM_ERROR',
             pausedMessage: errorMessage,
             unfinishedTaskTitle: message.slice(0, 120),
+            partialHtml: savedPartial || undefined,
           }
         ).catch(() => {});
       }

@@ -23,6 +23,7 @@ import {
 import {
   finalizeRealtimeOutput,
   prepareRealtimePrompt,
+  repairIncompleteBuildHtml,
   streamServerFreeAiRealTime,
   type VisualHintsSpec,
 } from '../_realtimeEngine.js';
@@ -183,7 +184,7 @@ export async function POST(request: Request): Promise<Response> {
 
       const keepAlive = setInterval(() => {
         enqueueRaw(': ping\n\n');
-      }, 3000);
+      }, 2000);
 
       const closeStream = () => {
         clearInterval(keepAlive);
@@ -192,6 +193,8 @@ export async function POST(request: Request): Promise<Response> {
           controller.close();
         }
       };
+
+      let rawAccumulated = '';
 
       try {
         const startedAt = Date.now();
@@ -210,12 +213,12 @@ export async function POST(request: Request): Promise<Response> {
                 accessToken: creditCheck.context.accessToken,
               }
             : null;
-        const retrievedMemory = memAuth
-          ? await getProjectMemory(memAuth, projectId).catch(() => ({
+        const projectMemoryPromise = memAuth
+          ? getProjectMemory(memAuth, projectId).catch(() => ({
               brainContext: '',
               memory: null,
             }))
-          : { brainContext: '', memory: null };
+          : Promise.resolve({ brainContext: '', memory: null });
 
         const prepared = await prepareRealtimePrompt({
           message,
@@ -238,7 +241,7 @@ export async function POST(request: Request): Promise<Response> {
           clientTime,
           clientTimeZone,
           visualHints,
-          projectMemoryContext: retrievedMemory.brainContext || '',
+          projectMemoryPromise,
           onStage: (stage) => {
             sendEvent({
               type: 'phase',
@@ -303,7 +306,7 @@ export async function POST(request: Request): Promise<Response> {
         }
 
         // True Real-Time Streaming LLM Generation (Zero Hardcoded Templates!)
-        let rawAccumulated = '';
+        rawAccumulated = '';
         let emittedTitle = '';
         let emittedPlanCount = 0;
         let emittedDbKey = '';
@@ -430,7 +433,7 @@ export async function POST(request: Request): Promise<Response> {
                   bytesBuilt: htmlSoFar.length,
                 });
               }
-              if (htmlSoFar.length >= 600 && htmlSoFar.length - lastPreviewBytesSent >= 2400) {
+              if (htmlSoFar.length >= 450 && htmlSoFar.length - lastPreviewBytesSent >= 1400) {
                 lastPreviewBytesSent = htmlSoFar.length;
                 const liveHtml = finalizePartialPreviewHtml(cleanSoFar);
                 if (liveHtml) {
@@ -468,6 +471,32 @@ export async function POST(request: Request): Promise<Response> {
           provider: activeProvider,
           startedAt,
         });
+
+        if (
+          finalized.kind === 'build' &&
+          !finalized.valid &&
+          finalized.previewHtml &&
+          Date.now() - startedAt < 42000
+        ) {
+          sendEvent({
+            type: 'phase',
+            phase: 'building',
+            kind: 'build',
+            action: 'Checking',
+            label: 'Verifying scripts & polishing live UI...',
+          });
+          const repairedHtml = await repairIncompleteBuildHtml({
+            brokenHtml: finalized.previewHtml,
+            validationReason: finalized.validationReason || 'Incomplete app output',
+            userMessage: message,
+            mode,
+          });
+          if (repairedHtml) {
+            finalized.previewHtml = repairedHtml;
+            finalized.bytesBuilt = repairedHtml.length;
+            finalized.valid = true;
+          }
+        }
 
         if (finalized.kind === 'chat') {
           if (memAuth) {
@@ -607,6 +636,16 @@ export async function POST(request: Request): Promise<Response> {
         });
         closeStream();
       } catch (err) {
+        const savedPartial = rawAccumulated
+          ? finalizePartialPreviewHtml(stripReasoningTags(rawAccumulated))
+          : '';
+        if (savedPartial && savedPartial.length >= 450) {
+          sendEvent({
+            type: 'partialHtml',
+            previewHtml: savedPartial,
+            bytesBuilt: savedPartial.length,
+          });
+        }
         const errorMessage =
           err instanceof Error
             ? err.message
@@ -627,6 +666,7 @@ export async function POST(request: Request): Promise<Response> {
               pausedReason: 'STREAM_ERROR',
               pausedMessage: errorMessage,
               unfinishedTaskTitle: message.slice(0, 120),
+              partialHtml: savedPartial || undefined,
             }
           ).catch(() => {});
         }
