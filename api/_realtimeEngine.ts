@@ -28,15 +28,23 @@ import {
   type SearchResultItem,
   type SearchVideoItem,
 } from './_builderCore.js';
-import { GoogleGenAI, type GenerateContentResponse } from '@google/genai';
 import {
-  BACKEND_DESIGNER_MODEL_ID,
+  GoogleGenAI,
+  ThinkingLevel,
+  type GenerateContentConfig,
+  type GenerateContentResponse,
+} from '@google/genai';
+import {
   GEMINI_BUILDER_MODELS,
   buildGatewayExecutionPlan,
-  getOrderedBackendGeminiFailoverModels,
-  getServerGeminiApiKey,
+  getServerGeminiApiKeys,
+  hasServerFreeAiKey,
+  invalidateDiscoveredGeminiModelsCache,
+  markApiKeyInvalidCooldown,
   markGatewayCandidateCooldown,
   parseGatewayModelIdentifier,
+  resolveDynamicGeminiExecutionMatrix,
+  type DynamicGeminiCandidate,
 } from './_aiGateways.js';
 import {
   recordGeminiApiError,
@@ -94,22 +102,44 @@ function extractReadableErrorMessage(err: unknown): string {
   return msg.trim();
 }
 
-function isKeyFatalError(rawLower: string): boolean {
+function isInvalidApiKeyError(rawLower: string): boolean {
   return (
     rawLower.includes('api_key_invalid') ||
     rawLower.includes('api key not valid') ||
     rawLower.includes('api key expired') ||
-    rawLower.includes('permission_denied') ||
-    rawLower.includes('403')
+    rawLower.includes('reported as leaked') ||
+    rawLower.includes('consumer_suspended') ||
+    rawLower.includes('project has been suspended')
   );
 }
 
-function isModelNotFoundError(rawLower: string): boolean {
+function isModelRetiredOrUnavailableError(rawLower: string): boolean {
   return (
     rawLower.includes('not_found') ||
     rawLower.includes('404') ||
     rawLower.includes('not found') ||
-    rawLower.includes('is not supported for')
+    rawLower.includes('no longer available') ||
+    rawLower.includes('is deprecated') ||
+    rawLower.includes('deprecated') ||
+    rawLower.includes('retired') ||
+    rawLower.includes('shut down') ||
+    rawLower.includes('shutdown') ||
+    rawLower.includes('update your code') ||
+    rawLower.includes('is not supported for') ||
+    rawLower.includes('permission_denied') ||
+    rawLower.includes('403') ||
+    rawLower.includes('paid tier') ||
+    rawLower.includes('billing')
+  );
+}
+
+function isThinkingConfigRejectedError(rawLower: string): boolean {
+  return (
+    rawLower.includes('thinking') ||
+    rawLower.includes('thinkinglevel') ||
+    rawLower.includes('thinkingbudget') ||
+    rawLower.includes('includethoughts') ||
+    (rawLower.includes('invalid_argument') && rawLower.includes('config'))
   );
 }
 
@@ -117,24 +147,25 @@ function formatGeminiApiError(err: unknown, modelName: string): string {
   const rawMsg = extractReadableErrorMessage(err);
   const lower = rawMsg.toLowerCase();
 
-  if (isKeyFatalError(lower)) {
-    return 'Your GEMINI_API_KEY was rejected or expired. Please check GEMINI_API_KEY in Vercel Environment Variables.';
+  if (isInvalidApiKeyError(lower)) {
+    return 'The configured GEMINI_API_KEY was rejected or expired. Add a valid GEMINI_API_KEY in Vercel Environment Variables and redeploy.';
   }
   if (lower.includes('resource_exhausted') || lower.includes('429') || lower.includes('quota')) {
-    return `${modelName} reached its current API quota limit across all backup models. Please wait a moment or recharge/upgrade GEMINI_API_KEY.`;
+    return `${modelName} reached its current API quota across all active backup models. Please wait a moment or recharge/add a backup GEMINI_API_KEY.`;
   }
   if (
     lower.includes('503') ||
     lower.includes('unavailable') ||
     lower.includes('high demand') ||
-    lower.includes('overloaded')
+    lower.includes('overloaded') ||
+    lower.includes('timed out')
   ) {
-    return `${modelName} and backup engines are temporarily busy on Google servers. Tap Continue / Retry in a few seconds.`;
+    return `${modelName} and all live backup engines are experiencing temporary high demand on Google servers. Tap Continue / Retry in a few seconds.`;
   }
-  if (isModelNotFoundError(lower)) {
-    return `${modelName} could not reach an enabled model on this GEMINI_API_KEY.`;
+  if (isModelRetiredOrUnavailableError(lower)) {
+    return `${modelName} could not reach an active Gemini model on this GEMINI_API_KEY yet. Check API key permissions or try again shortly.`;
   }
-  return rawMsg.slice(0, 260);
+  return rawMsg.slice(0, 220);
 }
 
 export interface VisualHintsSpec {
@@ -217,10 +248,8 @@ async function runBackendDesignArchitect(params: {
   visualHints?: VisualHintsSpec | null;
   searchQuery?: string;
 }): Promise<string> {
-  const geminiKey = getServerGeminiApiKey();
-  if (!geminiKey) return '';
+  if (!hasServerFreeAiKey()) return '';
 
-  const ai = createGeminiClient(geminiKey);
   const designerParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
 
   if (params.attachmentDataUrl && params.attachmentDataUrl.startsWith('data:image/')) {
@@ -262,11 +291,21 @@ async function runBackendDesignArchitect(params: {
   });
 
   const generatePromise = (async () => {
-    const designerModels = [BACKEND_DESIGNER_MODEL_ID, 'gemini-2.5-flash-lite', 'gemini-2.0-flash'];
-    for (const designerModel of designerModels) {
+    const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'design' });
+    const clientMap = new Map<string, GoogleGenAI>();
+    const badKeys = new Set<string>();
+
+    for (const candidate of candidates.slice(0, 6)) {
+      if (badKeys.has(candidate.keyFingerprint)) continue;
+      let ai = clientMap.get(candidate.apiKey);
+      if (!ai) {
+        ai = createGeminiClient(candidate.apiKey);
+        clientMap.set(candidate.apiKey, ai);
+      }
+
       try {
         const response = await ai.models.generateContent({
-          model: designerModel,
+          model: candidate.upstreamModelId,
           contents: [{ role: 'user', parts: designerParts }],
           config: {
             systemInstruction:
@@ -276,7 +315,7 @@ async function runBackendDesignArchitect(params: {
         const textOut = (response.text || '').trim().slice(0, 1400);
         const usage = response.usageMetadata;
         void recordGeminiApiUsage({
-          modelId: designerModel,
+          modelId: candidate.upstreamModelId,
           promptTokens: usage?.promptTokenCount,
           candidatesTokens: usage?.candidatesTokenCount,
           totalTokens: usage?.totalTokenCount ?? Math.max(120, Math.ceil(textOut.length / 4)),
@@ -285,15 +324,14 @@ async function runBackendDesignArchitect(params: {
         if (textOut) return textOut;
       } catch (err) {
         const lower = extractReadableErrorMessage(err).toLowerCase();
-        if (isKeyFatalError(lower)) {
-          void recordGeminiApiError({
-            modelId: designerModel,
-            error: err,
-            source: 'design-architect',
-          });
-          return '';
+        if (isInvalidApiKeyError(lower)) {
+          markApiKeyInvalidCooldown(candidate.apiKey);
+          badKeys.add(candidate.keyFingerprint);
+        } else if (isModelRetiredOrUnavailableError(lower)) {
+          markGatewayCandidateCooldown(candidate.cooldownKey, 6 * 60 * 60_000, true);
+        } else {
+          markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
         }
-        // Silently advance to fallback designer model on 503/404/429
       }
     }
     return '';
@@ -338,7 +376,7 @@ export async function prepareRealtimePrompt(
   const shouldRunDesignEngine =
     !input.forceChat &&
     !naturalMediaIntent &&
-    Boolean(getServerGeminiApiKey()) &&
+    hasServerFreeAiKey() &&
     (initialRoute === 'build' || (initialRoute === 'auto' && message.length >= 10));
 
   if (wantsSearch || shouldRunDesignEngine) {
@@ -679,8 +717,44 @@ export function finalizeRealtimeOutput(
   };
 }
 
+function buildStreamGenerateConfig(
+  candidate: DynamicGeminiCandidate,
+  systemPrompt: string,
+  route: 'chat' | 'build' | 'auto',
+  enableThinking: boolean
+): GenerateContentConfig {
+  const config: GenerateContentConfig = {
+    systemInstruction: systemPrompt,
+  };
+  if (enableThinking && candidate.thinkingMode === 'level') {
+    config.thinkingConfig = {
+      includeThoughts: true,
+      thinkingLevel: route === 'chat' ? ThinkingLevel.MEDIUM : ThinkingLevel.HIGH,
+    };
+  } else if (enableThinking && candidate.thinkingMode === 'budget') {
+    config.thinkingConfig = {
+      includeThoughts: true,
+      thinkingBudget: route === 'chat' ? 1024 : 4096,
+    };
+  }
+  return config;
+}
+
+function extractThoughtsFromChunk(chunk: GenerateContentResponse): string {
+  const parts = chunk?.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return '';
+  let thoughts = '';
+  for (const part of parts) {
+    if (part && part.thought === true && typeof part.text === 'string') {
+      thoughts += part.text;
+    }
+  }
+  return thoughts;
+}
+
 export async function streamServerFreeAiRealTime(params: {
   requestedModel?: string;
+  initialRoute?: 'chat' | 'build' | 'auto';
   systemPrompt: string;
   historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
   userPrompt: string;
@@ -690,8 +764,8 @@ export async function streamServerFreeAiRealTime(params: {
   onReasoningChunk?: (reasoningText: string) => void;
   onContentChunk: (chunkText: string) => void;
 }): Promise<{ rawOutput: string; modelUsed: string; modelName: string; provider: string }> {
-  const geminiKey = getServerGeminiApiKey();
-  if (!geminiKey) {
+  const allKeys = getServerGeminiApiKeys();
+  if (allKeys.length === 0) {
     throw new Error(
       'GEMINI_API_KEY is not configured on the server yet. Add GEMINI_API_KEY in Vercel Environment Variables (or Settings > Secrets) and redeploy.'
     );
@@ -699,17 +773,14 @@ export async function streamServerFreeAiRealTime(params: {
 
   const parsedModel = parseGatewayModelIdentifier(params.requestedModel);
   const flagshipModel = GEMINI_BUILDER_MODELS[0];
-  const failoverCandidates = getOrderedBackendGeminiFailoverModels(
-    parsedModel.upstreamModelId
-  );
+  const route = params.initialRoute || 'build';
+  const taskKind = route === 'chat' ? 'chat' : 'build';
 
   params.onModelMeta?.({
     modelId: flagshipModel.id,
     modelName: flagshipModel.name,
     provider: 'aicraft',
   });
-
-  const ai = createGeminiClient(geminiKey);
 
   const contents: Array<{
     role: 'user' | 'model';
@@ -736,110 +807,234 @@ export async function streamServerFreeAiRealTime(params: {
   userParts.push({ text: params.userPrompt });
   contents.push({ role: 'user', parts: userParts });
 
-  let lastError: unknown = null;
-  let lastAttemptedUpstreamId = failoverCandidates[0]?.upstreamModelId || 'gemini-4-hydrogen';
-
-  for (const candidate of failoverCandidates) {
-    if (params.signal?.aborted) {
-      throw new Error('Request cancelled.');
+  const clientMap = new Map<string, GoogleGenAI>();
+  const getClient = (apiKey: string) => {
+    let client = clientMap.get(apiKey);
+    if (!client) {
+      client = createGeminiClient(apiKey);
+      clientMap.set(apiKey, client);
     }
+    return client;
+  };
 
-    lastAttemptedUpstreamId = candidate.upstreamModelId;
-    let fullContent = '';
-    let emittedAnyChunk = false;
-    let lastPromptTokens = 0;
-    let lastCandidatesTokens = 0;
-    let lastTotalTokens = 0;
+  const invalidatedKeysThisRun = new Set<string>();
+  const attemptedKeyModels = new Set<string>();
+  let lastError: unknown = null;
+  let lastMeaningfulError: unknown = null;
+  let lastAttemptedUpstreamId = parsedModel.upstreamModelId || 'gemini-4-hydrogen';
 
-    try {
-      const streamConnectTimeoutMs = 15000;
-      const streamResponse = await Promise.race([
-        ai.models.generateContentStream({
-          model: candidate.upstreamModelId,
-          contents,
-          config: {
-            systemInstruction: params.systemPrompt,
-          },
-        }),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`${candidate.label} stream timed out waiting for first byte.`)), streamConnectTimeoutMs)
-        ),
-      ]);
+  const runCandidateList = async (candidates: DynamicGeminiCandidate[]) => {
+    for (const candidate of candidates) {
+      if (params.signal?.aborted) {
+        throw new Error('Request cancelled.');
+      }
+      const dedupKey = `${candidate.keyFingerprint}::${candidate.upstreamModelId}`;
+      if (attemptedKeyModels.has(dedupKey)) continue;
+      if (invalidatedKeysThisRun.has(candidate.keyFingerprint)) continue;
+      attemptedKeyModels.add(dedupKey);
 
-      for await (const chunk of streamResponse) {
-        if (params.signal?.aborted) break;
-        const c = chunk as GenerateContentResponse;
-        if (c.usageMetadata) {
-          lastPromptTokens = c.usageMetadata.promptTokenCount ?? lastPromptTokens;
-          lastCandidatesTokens = c.usageMetadata.candidatesTokenCount ?? lastCandidatesTokens;
-          lastTotalTokens = c.usageMetadata.totalTokenCount ?? lastTotalTokens;
+      lastAttemptedUpstreamId = candidate.upstreamModelId;
+      const ai = getClient(candidate.apiKey);
+
+      // Try with thinkingConfig enabled first; if rejected solely for thinking parameter, retry cleanly without thinkingConfig
+      const thinkingAttempts =
+        candidate.thinkingMode !== 'none' ? [true, false] : [false];
+
+      for (const enableThinking of thinkingAttempts) {
+        let fullContent = '';
+        let emittedAnyChunk = false;
+        let lastPromptTokens = 0;
+        let lastCandidatesTokens = 0;
+        let lastTotalTokens = 0;
+
+        try {
+          const streamConnectTimeoutMs = 15000;
+          const config = buildStreamGenerateConfig(
+            candidate,
+            params.systemPrompt,
+            route,
+            enableThinking
+          );
+          const streamResponse = await Promise.race([
+            ai.models.generateContentStream({
+              model: candidate.upstreamModelId,
+              contents,
+              config,
+            }),
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () =>
+                  reject(
+                    new Error(`${candidate.label} stream timed out waiting for first byte.`)
+                  ),
+                streamConnectTimeoutMs
+              )
+            ),
+          ]);
+
+          for await (const chunk of streamResponse) {
+            if (params.signal?.aborted) break;
+            const c = chunk as GenerateContentResponse;
+            if (c.usageMetadata) {
+              lastPromptTokens = c.usageMetadata.promptTokenCount ?? lastPromptTokens;
+              lastCandidatesTokens =
+                c.usageMetadata.candidatesTokenCount ?? lastCandidatesTokens;
+              lastTotalTokens = c.usageMetadata.totalTokenCount ?? lastTotalTokens;
+            }
+            const thoughtChunk = extractThoughtsFromChunk(c);
+            if (thoughtChunk) {
+              params.onReasoningChunk?.(thoughtChunk);
+            }
+            const text = typeof c.text === 'string' ? c.text : '';
+            if (text) {
+              fullContent += text;
+              emittedAnyChunk = true;
+              params.onContentChunk(text);
+            }
+          }
+
+          if (!fullContent.trim()) {
+            throw new Error(`${candidate.label} returned an empty response.`);
+          }
+
+          const fallbackEstimate = Math.max(
+            1,
+            Math.ceil(
+              (params.userPrompt.length + params.systemPrompt.length + fullContent.length) / 4
+            )
+          );
+          await recordGeminiApiUsage({
+            modelId: candidate.upstreamModelId,
+            promptTokens:
+              lastPromptTokens ||
+              Math.ceil((params.userPrompt.length + params.systemPrompt.length) / 4),
+            candidatesTokens: lastCandidatesTokens || Math.ceil(fullContent.length / 4),
+            totalTokens: lastTotalTokens || fallbackEstimate,
+            source: 'craft-stream',
+          }).catch(() => undefined);
+
+          return {
+            rawOutput: fullContent,
+            modelUsed: flagshipModel.id,
+            modelName: flagshipModel.name,
+            provider: 'aicraft',
+          };
+        } catch (err) {
+          lastError = err;
+          const lower = extractReadableErrorMessage(err).toLowerCase();
+
+          // If streaming partially wrote output already, propagate clean formatted error
+          if (emittedAnyChunk) {
+            throw new Error(formatGeminiApiError(err, flagshipModel.name));
+          }
+
+          // If thinking parameter wasn't accepted by this model variant, retry immediately without thinkingConfig
+          if (enableThinking && isThinkingConfigRejectedError(lower)) {
+            continue;
+          }
+
+          if (isInvalidApiKeyError(lower)) {
+            markApiKeyInvalidCooldown(candidate.apiKey);
+            invalidatedKeysThisRun.add(candidate.keyFingerprint);
+            if (!lastMeaningfulError) lastMeaningfulError = err;
+            break;
+          }
+
+          if (isModelRetiredOrUnavailableError(lower)) {
+            // Hard-block retired / 404 / single-model-403 for 6 hours and keep switching!
+            markGatewayCandidateCooldown(candidate.cooldownKey, 6 * 60 * 60_000, true);
+            break;
+          }
+
+          // Transient 503 / 429 / timeout / empty response: preserve as meaningful error & cool down 45s
+          lastMeaningfulError = err;
+          markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
+          break;
         }
-        const text = typeof c.text === 'string' ? c.text : '';
-        if (text) {
-          fullContent += text;
-          emittedAnyChunk = true;
-          params.onContentChunk(text);
+      }
+    }
+    return null;
+  };
+
+  // Pass 1: Dynamic execution matrix across all configured keys & live-discovered models
+  const initialMatrix = await resolveDynamicGeminiExecutionMatrix({
+    preferredUpstreamId: parsedModel.upstreamModelId,
+    taskKind,
+  });
+  const pass1Result = await runCandidateList(initialMatrix);
+  if (pass1Result) return pass1Result;
+
+  // Pass 2: Force-refresh Google's live /v1beta/models catalog in case a newly deployed or updated key unlocks newer models
+  if (!params.signal?.aborted) {
+    invalidateDiscoveredGeminiModelsCache();
+    const refreshedMatrix = await resolveDynamicGeminiExecutionMatrix({
+      preferredUpstreamId: parsedModel.upstreamModelId,
+      forceRefresh: true,
+      taskKind,
+    });
+    const pass2Result = await runCandidateList(refreshedMatrix);
+    if (pass2Result) return pass2Result;
+
+    // Pass 3: Non-streaming safety net on top live active candidates in case streaming edge dropped
+    const nonStreamPool = refreshedMatrix
+      .filter((c) => !invalidatedKeysThisRun.has(c.keyFingerprint))
+      .slice(0, 3);
+    for (const candidate of nonStreamPool) {
+      if (params.signal?.aborted) break;
+      try {
+        const ai = getClient(candidate.apiKey);
+        const res = await Promise.race([
+          ai.models.generateContent({
+            model: candidate.upstreamModelId,
+            contents,
+            config: {
+              systemInstruction: params.systemPrompt,
+            },
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Non-stream fallback timed out.')), 28000)
+          ),
+        ]);
+        const textOut = typeof res.text === 'string' ? res.text : '';
+        if (textOut.trim()) {
+          params.onReasoningChunk?.('Assembling verified architecture...');
+          params.onContentChunk(textOut);
+          const usage = res.usageMetadata;
+          await recordGeminiApiUsage({
+            modelId: candidate.upstreamModelId,
+            promptTokens: usage?.promptTokenCount,
+            candidatesTokens: usage?.candidatesTokenCount,
+            totalTokens:
+              usage?.totalTokenCount ??
+              Math.max(1, Math.ceil((params.userPrompt.length + textOut.length) / 4)),
+            source: 'craft-fallback',
+          }).catch(() => undefined);
+          return {
+            rawOutput: textOut,
+            modelUsed: flagshipModel.id,
+            modelName: flagshipModel.name,
+            provider: 'aicraft',
+          };
+        }
+      } catch (err) {
+        lastError = err;
+        const lower = extractReadableErrorMessage(err).toLowerCase();
+        if (!isModelRetiredOrUnavailableError(lower)) {
+          lastMeaningfulError = err;
         }
       }
-
-      if (!fullContent.trim()) {
-        throw new Error(`${candidate.label} returned an empty response.`);
-      }
-
-      const fallbackEstimate = Math.max(
-        1,
-        Math.ceil((params.userPrompt.length + params.systemPrompt.length + fullContent.length) / 4)
-      );
-      await recordGeminiApiUsage({
-        modelId: candidate.upstreamModelId,
-        promptTokens:
-          lastPromptTokens || Math.ceil((params.userPrompt.length + params.systemPrompt.length) / 4),
-        candidatesTokens: lastCandidatesTokens || Math.ceil(fullContent.length / 4),
-        totalTokens: lastTotalTokens || fallbackEstimate,
-        source: 'craft-stream',
-      }).catch(() => undefined);
-
-      return {
-        rawOutput: fullContent,
-        modelUsed: flagshipModel.id,
-        modelName: flagshipModel.name,
-        provider: 'aicraft',
-      };
-    } catch (err) {
-      lastError = err;
-      const lower = extractReadableErrorMessage(err).toLowerCase();
-
-      if (isKeyFatalError(lower)) {
-        await recordGeminiApiError({
-          modelId: candidate.upstreamModelId,
-          error: err,
-          source: 'craft-stream',
-        }).catch(() => undefined);
-        throw new Error(formatGeminiApiError(err, flagshipModel.name));
-      }
-
-      // If this model hasn't streamed partial text to the client yet, silently advance
-      // to the next healthy Gemini model in the backend failover chain.
-      if (!emittedAnyChunk) {
-        const cooldownMs = isModelNotFoundError(lower) ? 15 * 60_000 : 45_000;
-        markGatewayCandidateCooldown(candidate.cooldownKey, cooldownMs);
-        continue;
-      }
-
-      // Partial output already streamed; surface clean formatted message
-      throw new Error(formatGeminiApiError(err, flagshipModel.name));
     }
   }
 
-  // Only record global exhaustion if ALL models in the backend chain failed
-  if (lastError) {
+  const errorToReport = lastMeaningfulError || lastError;
+  if (errorToReport) {
     await recordGeminiApiError({
       modelId: lastAttemptedUpstreamId,
-      error: lastError,
+      error: errorToReport,
       source: 'craft-stream',
     }).catch(() => undefined);
   }
-  throw new Error(formatGeminiApiError(lastError, flagshipModel.name));
+  throw new Error(formatGeminiApiError(errorToReport, flagshipModel.name));
 }
 
 /**
@@ -851,10 +1046,8 @@ export async function repairIncompleteBuildHtml(params: {
   userMessage: string;
   mode: 'mobile' | 'web';
 }): Promise<string> {
-  const geminiKey = getServerGeminiApiKey();
-  if (!geminiKey || !params.brokenHtml.trim()) return '';
+  if (!hasServerFreeAiKey() || !params.brokenHtml.trim()) return '';
 
-  const ai = createGeminiClient(geminiKey);
   const repairPrompt = [
     `The built ${params.mode} app HTML for "${params.userMessage.slice(0, 200)}" failed validation: ${params.validationReason}`,
     'Fix ONLY the broken/truncated HTML, CSS, or <script> syntax and ensure the main screen content renders immediately with working buttons and zero empty blank viewports.',
@@ -865,10 +1058,17 @@ export async function repairIncompleteBuildHtml(params: {
   ].join('\n');
 
   const repairPromise = (async () => {
-    for (const modelId of ['gemini-2.5-flash', 'gemini-2.5-flash-lite']) {
+    const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'repair' });
+    const clientMap = new Map<string, GoogleGenAI>();
+    for (const candidate of candidates.slice(0, 5)) {
+      let ai = clientMap.get(candidate.apiKey);
+      if (!ai) {
+        ai = createGeminiClient(candidate.apiKey);
+        clientMap.set(candidate.apiKey, ai);
+      }
       try {
         const res = await ai.models.generateContent({
-          model: modelId,
+          model: candidate.upstreamModelId,
           contents: [{ role: 'user', parts: [{ text: repairPrompt }] }],
         });
         const raw = (res.text || '').trim();
@@ -880,7 +1080,7 @@ export async function repairIncompleteBuildHtml(params: {
           }
         }
       } catch {
-        // try next fast repair model
+        // try next fast repair candidate
       }
     }
     return '';

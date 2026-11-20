@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import {
-  getServerGeminiApiKey,
+  hasServerFreeAiKey,
   parseGatewayModelIdentifier,
+  resolveDynamicGeminiExecutionMatrix,
 } from './_aiGateways.js';
 import { createGeminiClient } from './_realtimeEngine.js';
 import { runLiveBrowserSearch } from './_builderCore.js';
@@ -564,14 +565,13 @@ async function composeArrangementWithAi(
     }
   };
 
-  const geminiKey = getServerGeminiApiKey();
-  if (geminiKey) {
-    const ai = createGeminiClient(geminiKey);
-    const plannerModels = ['gemini-4-hydrogen', 'gemini-2.5-flash', 'gemini-2.0-flash'];
-    for (const modelId of plannerModels) {
+  if (hasServerFreeAiKey()) {
+    const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'media' });
+    for (const candidate of candidates.slice(0, 5)) {
       try {
+        const ai = createGeminiClient(candidate.apiKey);
         const response = await ai.models.generateContent({
-          model: modelId,
+          model: candidate.upstreamModelId,
           contents: prompt,
           config: {
             systemInstruction: systemPrompt,
@@ -581,7 +581,7 @@ async function composeArrangementWithAi(
         const outText = response.text || '';
         const usage = response.usageMetadata;
         void recordGeminiApiUsage({
-          modelId,
+          modelId: candidate.upstreamModelId,
           promptTokens: usage?.promptTokenCount,
           candidatesTokens: usage?.candidatesTokenCount,
           totalTokens: usage?.totalTokenCount ?? Math.max(80, Math.ceil((prompt.length + outText.length) / 4)),
@@ -590,7 +590,7 @@ async function composeArrangementWithAi(
         const plan = parseAiPlan(outText);
         if (plan) return plan;
       } catch {
-        // silently try next backend planner model
+        // silently try next live backend candidate
       }
     }
   }

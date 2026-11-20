@@ -1,4 +1,7 @@
-import { getServerGeminiApiKey } from './_aiGateways.js';
+import {
+  hasServerFreeAiKey,
+  resolveDynamicGeminiExecutionMatrix,
+} from './_aiGateways.js';
 import { createGeminiClient } from './_realtimeEngine.js';
 import {
   recordGeminiApiError,
@@ -23,8 +26,7 @@ export async function POST(request: Request): Promise<Response> {
       return Response.json({ error: 'Audio data is required.' }, { status: 400 });
     }
 
-    const geminiKey = getServerGeminiApiKey();
-    if (!geminiKey) {
+    if (!hasServerFreeAiKey()) {
       return Response.json(
         {
           error:
@@ -34,13 +36,13 @@ export async function POST(request: Request): Promise<Response> {
       );
     }
 
-    const ai = createGeminiClient(geminiKey);
-    const transcribeModels = ['gemini-2.5-flash', 'gemini-4-hydrogen', 'gemini-2.0-flash'];
+    const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'transcribe' });
     let lastTranscribeErr: unknown = null;
-    for (const modelId of transcribeModels) {
+    for (const candidate of candidates.slice(0, 6)) {
       try {
+        const ai = createGeminiClient(candidate.apiKey);
         const response = await ai.models.generateContent({
-          model: modelId,
+          model: candidate.upstreamModelId,
           contents: {
             parts: [
               {
@@ -61,7 +63,7 @@ export async function POST(request: Request): Promise<Response> {
         const text = (response.text || '').trim();
         const usage = response.usageMetadata;
         void recordGeminiApiUsage({
-          modelId,
+          modelId: candidate.upstreamModelId,
           promptTokens: usage?.promptTokenCount,
           candidatesTokens: usage?.candidatesTokenCount,
           totalTokens: usage?.totalTokenCount ?? Math.max(50, Math.ceil(text.length / 4)),
@@ -85,7 +87,7 @@ export async function POST(request: Request): Promise<Response> {
       : new Error('Unable to transcribe audio input.');
   } catch (err) {
     void recordGeminiApiError({
-      modelId: 'gemini-2.5-flash',
+      modelId: 'gemini-3.8-flash',
       error: err,
       source: 'transcribe',
     });

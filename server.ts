@@ -65,6 +65,7 @@ import {
   fetchAllGatewayModels,
   getServerGeminiApiKey,
   hasServerFreeAiKey,
+  resolveDynamicGeminiExecutionMatrix,
 } from './api/_aiGateways.js';
 import {
   generateMediaAsset,
@@ -1987,8 +1988,7 @@ async function startServer() {
         return;
       }
 
-      const geminiKey = getServerGeminiApiKey();
-      if (!geminiKey) {
+      if (!hasServerFreeAiKey()) {
         res.status(422).json({
           error:
             'GEMINI_API_KEY is required for server-side voice transcription, or allow microphone permission in Chrome, Edge, or Safari.',
@@ -1996,13 +1996,13 @@ async function startServer() {
         return;
       }
 
-      const ai = createGeminiClient(geminiKey);
-      const transcribeModels = ['gemini-2.5-flash', 'gemini-4-hydrogen', 'gemini-2.0-flash'];
+      const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'transcribe' });
       let lastTranscribeErr: unknown = null;
-      for (const modelId of transcribeModels) {
+      for (const candidate of candidates.slice(0, 6)) {
         try {
+          const ai = createGeminiClient(candidate.apiKey);
           const response = await ai.models.generateContent({
-            model: modelId,
+            model: candidate.upstreamModelId,
             contents: {
               parts: [
                 {
@@ -2023,7 +2023,7 @@ async function startServer() {
           const text = (response.text || '').trim();
           const usage = response.usageMetadata;
           void recordGeminiApiUsage({
-            modelId,
+            modelId: candidate.upstreamModelId,
             promptTokens: usage?.promptTokenCount,
             candidatesTokens: usage?.candidatesTokenCount,
             totalTokens: usage?.totalTokenCount ?? Math.max(50, Math.ceil(text.length / 4)),
@@ -2046,7 +2046,7 @@ async function startServer() {
         : new Error('Unable to process audio input.');
     } catch (err) {
       void recordGeminiApiError({
-        modelId: 'gemini-2.5-flash',
+        modelId: 'gemini-3.8-flash',
         error: err,
         source: 'transcribe',
       });
@@ -2905,8 +2905,12 @@ async function startServer() {
       let activeModelName = prepared.requestedModelLabel || 'AI Craft Pro (4 Hydrogen)';
       let activeProvider = 'aicraft';
 
+      let lastReasoningUpdateAt = 0;
+      let reasoningBuffer = '';
+
       await streamServerFreeAiRealTime({
         requestedModel,
+        initialRoute: prepared.initialRoute,
         systemPrompt: prepared.systemPrompt,
         historyMessages: prepared.historyMessages,
         userPrompt: prepared.userPrompt,
@@ -2926,14 +2930,23 @@ async function startServer() {
             isFallback: false,
           });
         },
-        onReasoningChunk: () => {
-          if (!enteredCodePhase && !emittedReasoningPhase) {
+        onReasoningChunk: (reasoningChunk) => {
+          if (enteredCodePhase) return;
+          reasoningBuffer = `${reasoningBuffer}${reasoningChunk}`.slice(-600);
+          const now = Date.now();
+          if (!emittedReasoningPhase || now - lastReasoningUpdateAt >= 1600) {
             emittedReasoningPhase = true;
+            lastReasoningUpdateAt = now;
+            const headingMatches = Array.from(reasoningBuffer.matchAll(/\*\*([^*\n]{4,72})\*\*/g));
+            const latestHeading =
+              headingMatches[headingMatches.length - 1]?.[1]?.trim() ||
+              'Planning screens, data & layout step by step...';
             sendEvent({
               type: 'phase',
               phase: 'understanding',
-              kind: 'chat',
-              label: 'Planning architecture step by step...',
+              kind: prepared.initialRoute === 'build' ? 'build' : 'chat',
+              action: 'Thinking',
+              label: latestHeading,
             });
           }
         },

@@ -321,8 +321,12 @@ export async function POST(request: Request): Promise<Response> {
         let activeModelName = prepared.requestedModelLabel || 'AI Craft Pro (4 Hydrogen)';
         let activeProvider = 'aicraft';
 
+        let lastReasoningUpdateAt = 0;
+        let reasoningBuffer = '';
+
         await streamServerFreeAiRealTime({
           requestedModel,
+          initialRoute: prepared.initialRoute,
           systemPrompt: prepared.systemPrompt,
           historyMessages: prepared.historyMessages,
           userPrompt: prepared.userPrompt,
@@ -341,14 +345,23 @@ export async function POST(request: Request): Promise<Response> {
               isFallback: false,
             });
           },
-          onReasoningChunk: () => {
-            if (!enteredCodePhase && !emittedReasoningPhase) {
+          onReasoningChunk: (reasoningChunk) => {
+            if (enteredCodePhase) return;
+            reasoningBuffer = `${reasoningBuffer}${reasoningChunk}`.slice(-600);
+            const now = Date.now();
+            if (!emittedReasoningPhase || now - lastReasoningUpdateAt >= 1600) {
               emittedReasoningPhase = true;
+              lastReasoningUpdateAt = now;
+              const headingMatches = Array.from(reasoningBuffer.matchAll(/\*\*([^*\n]{4,72})\*\*/g));
+              const latestHeading =
+                headingMatches[headingMatches.length - 1]?.[1]?.trim() ||
+                'Planning screens, data & layout step by step...';
               sendEvent({
                 type: 'phase',
                 phase: 'understanding',
-                kind: 'chat',
-                label: 'Planning architecture step by step...',
+                kind: prepared.initialRoute === 'build' ? 'build' : 'chat',
+                action: 'Thinking',
+                label: latestHeading,
               });
             }
           },
