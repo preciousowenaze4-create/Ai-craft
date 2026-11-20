@@ -3693,10 +3693,10 @@ export default function App() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -6 }}
               transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-              className="flex-1 min-h-0 w-full max-w-[460px] md:max-w-[680px] lg:max-w-[840px] 2xl:max-w-[1000px] mx-auto px-5 py-4 flex flex-col overflow-hidden"
+              className="flex-1 min-h-0 w-full max-w-[460px] md:max-w-[680px] lg:max-w-[840px] 2xl:max-w-[1000px] mx-auto px-5 pt-4 pb-0 flex flex-col overflow-hidden"
             >
-              <div className="flex-1 min-h-0 flex flex-col gap-4 overflow-hidden">
-                <div className="flex items-center justify-between gap-3">
+              <div className="flex-1 min-h-0 flex flex-col gap-3.5 overflow-hidden">
+                <div className="shrink-0 flex items-center justify-between gap-3">
                   <div className="flex items-center gap-3 min-w-0">
                     <img
                       src="/logo-mark.png"
@@ -3723,7 +3723,7 @@ export default function App() {
                 </div>
 
                 {projects.length === 0 ? (
-                  <div className="rounded-[24px] border border-black/[0.08] bg-white p-6 text-center shadow-[0_6px_24px_rgba(15,15,30,0.04)]">
+                  <div className="max-w-[324px] sm:max-w-[400px] mx-auto w-full rounded-[28px] border border-black/[0.08] bg-white p-6 text-center shadow-[0_6px_24px_rgba(15,15,30,0.04)]">
                     <p className="font-display font-semibold text-base text-[#0B0B0F]">
                       No builds started yet
                     </p>
@@ -3740,7 +3740,10 @@ export default function App() {
                     </button>
                   </div>
                 ) : (
-                  <ul className="flex flex-col gap-3">
+                  <ul
+                    aria-label="Built projects"
+                    className="flex-1 min-h-0 w-full overflow-y-auto overscroll-y-contain touch-pan-y flex flex-col items-center gap-2.5 pt-0.5 pb-6 [-webkit-overflow-scrolling:touch]"
+                  >
                     {projects.map((item) => (
                       <SwipeableProjectRow
                         key={item.id}
