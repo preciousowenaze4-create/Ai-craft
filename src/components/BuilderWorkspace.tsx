@@ -2632,7 +2632,7 @@ export function BuilderWorkspace({
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-1.5 pt-0.5">
+            <div className="flex items-center justify-between gap-2 pt-0.5">
               {/* Left: Attachment + Web Search */}
               <div className="flex items-center gap-1.5 shrink-0">
                 <input
@@ -2669,55 +2669,6 @@ export function BuilderWorkspace({
                 </button>
               </div>
 
-              {/* Center: Deploy, Database, Secrets evenly spaced */}
-              <div className="flex-1 min-w-0 grid grid-cols-3 items-center gap-0.5 px-0.5">
-                <button
-                  type="button"
-                  onClick={() => setActiveDrawer('deploy')}
-                  aria-label="Open project deployment panel"
-                  className={`w-full min-h-[38px] px-1 rounded-xl flex flex-col items-center justify-center gap-[3px] hover:bg-black/[0.04] active:scale-95 transition-all ${
-                    isPublished ? 'text-[#6D4AFF]' : 'text-[#52525B] hover:text-[#0B0B0F]'
-                  }`}
-                >
-                  <Rocket className="w-[14px] h-[14px] stroke-[1.9] shrink-0" />
-                  <span className="text-[10px] leading-none font-medium tracking-[-0.01em] whitespace-nowrap">
-                    Deploy
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setActiveDrawer('database')}
-                  aria-label="Open project database and schema"
-                  className={`w-full min-h-[38px] px-1 rounded-xl flex flex-col items-center justify-center gap-[3px] hover:bg-black/[0.04] active:scale-95 transition-all ${
-                    databaseConfig.tables.length > 0
-                      ? 'text-[#6D4AFF]'
-                      : 'text-[#52525B] hover:text-[#0B0B0F]'
-                  }`}
-                >
-                  <Database className="w-[14px] h-[14px] stroke-[1.9] shrink-0" />
-                  <span className="text-[10px] leading-none font-medium tracking-[-0.01em] whitespace-nowrap">
-                    Database
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setActiveDrawer('secrets')}
-                  aria-label="Open project secrets and environment variables"
-                  className={`w-full min-h-[38px] px-1 rounded-xl flex flex-col items-center justify-center gap-[3px] hover:bg-black/[0.04] active:scale-95 transition-all ${
-                    secrets.length > 0
-                      ? 'text-[#6D4AFF]'
-                      : 'text-[#52525B] hover:text-[#0B0B0F]'
-                  }`}
-                >
-                  <KeyRound className="w-[14px] h-[14px] stroke-[1.9] shrink-0" />
-                  <span className="text-[10px] leading-none font-medium tracking-[-0.01em] whitespace-nowrap">
-                    Secrets
-                  </span>
-                </button>
-              </div>
-
               {/* Right: Send OR Stop Button */}
               {isStreaming && onStopGeneration ? (
                 <button
@@ -2749,6 +2700,55 @@ export function BuilderWorkspace({
                 </button>
               )}
             </div>
+          </div>
+
+          {/* Scrollable Quick Action Strip Below Chat Box: Deploy, Database, Secrets */}
+          <div
+            role="toolbar"
+            aria-label="Project tools"
+            className="mt-2 w-full flex items-center gap-2 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden touch-pan-x px-0.5 py-0.5 [-webkit-overflow-scrolling:touch]"
+          >
+            <button
+              type="button"
+              onClick={() => setActiveDrawer('deploy')}
+              aria-label="Open project deployment panel"
+              className={`shrink-0 inline-flex items-center gap-1.5 h-8 px-3 rounded-full border text-[11.5px] font-medium whitespace-nowrap transition-all active:scale-95 ${
+                isPublished
+                  ? 'border-[#7A68F6]/35 bg-[#F5F3FF] text-[#6D4AFF]'
+                  : 'border-black/[0.08] bg-[#FAFAFC] text-[#3F3F46] hover:bg-black/[0.04] hover:text-[#0B0B0F]'
+              }`}
+            >
+              <Rocket className="w-3.5 h-3.5 stroke-[1.9] shrink-0" />
+              <span>Deploy</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveDrawer('database')}
+              aria-label="Open project database and schema"
+              className={`shrink-0 inline-flex items-center gap-1.5 h-8 px-3 rounded-full border text-[11.5px] font-medium whitespace-nowrap transition-all active:scale-95 ${
+                databaseConfig.tables.length > 0
+                  ? 'border-[#7A68F6]/35 bg-[#F5F3FF] text-[#6D4AFF]'
+                  : 'border-black/[0.08] bg-[#FAFAFC] text-[#3F3F46] hover:bg-black/[0.04] hover:text-[#0B0B0F]'
+              }`}
+            >
+              <Database className="w-3.5 h-3.5 stroke-[1.9] shrink-0" />
+              <span>Database</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveDrawer('secrets')}
+              aria-label="Open project secrets and environment variables"
+              className={`shrink-0 inline-flex items-center gap-1.5 h-8 px-3 rounded-full border text-[11.5px] font-medium whitespace-nowrap transition-all active:scale-95 ${
+                secrets.length > 0
+                  ? 'border-[#7A68F6]/35 bg-[#F5F3FF] text-[#6D4AFF]'
+                  : 'border-black/[0.08] bg-[#FAFAFC] text-[#3F3F46] hover:bg-black/[0.04] hover:text-[#0B0B0F]'
+              }`}
+            >
+              <KeyRound className="w-3.5 h-3.5 stroke-[1.9] shrink-0" />
+              <span>Secrets</span>
+            </button>
           </div>
         </div>
       </div>

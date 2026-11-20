@@ -377,7 +377,7 @@ export async function prepareRealtimePrompt(
     !input.forceChat &&
     !naturalMediaIntent &&
     hasServerFreeAiKey() &&
-    (initialRoute === 'build' || (initialRoute === 'auto' && message.length >= 10));
+    initialRoute === 'build';
 
   if (wantsSearch || shouldRunDesignEngine) {
     input.onStage?.({
@@ -421,9 +421,11 @@ export async function prepareRealtimePrompt(
     kind: initialRoute === 'build' ? 'build' : 'chat',
     action: 'Thinking',
     label:
-      initialRoute === 'chat'
-        ? 'Thinking through your question...'
-        : 'Planning screens & database architecture...',
+      initialRoute === 'build'
+        ? 'Planning screens & database architecture...'
+        : initialRoute === 'chat'
+          ? 'Thinking through your message...'
+          : 'Understanding your request...',
   });
 
   const timeContext = [
@@ -728,13 +730,18 @@ function buildStreamGenerateConfig(
   };
   if (enableThinking && candidate.thinkingMode === 'level') {
     config.thinkingConfig = {
-      includeThoughts: true,
-      thinkingLevel: route === 'chat' ? ThinkingLevel.MEDIUM : ThinkingLevel.HIGH,
+      includeThoughts: route === 'build',
+      thinkingLevel:
+        route === 'build'
+          ? ThinkingLevel.HIGH
+          : route === 'auto'
+            ? ThinkingLevel.MEDIUM
+            : ThinkingLevel.LOW,
     };
   } else if (enableThinking && candidate.thinkingMode === 'budget') {
     config.thinkingConfig = {
-      includeThoughts: true,
-      thinkingBudget: route === 'chat' ? 1024 : 4096,
+      includeThoughts: route === 'build',
+      thinkingBudget: route === 'build' ? 4096 : route === 'auto' ? 1024 : 256,
     };
   }
   return config;

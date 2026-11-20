@@ -480,9 +480,23 @@ export function formatWebSearchContext(searchData: {
 
 export function shouldRunChatSearch(message: string, hasPreviousHtml = false): boolean {
   const clean = message.trim();
+  const wordCount = clean.split(/\s+/).filter(Boolean).length;
   if (clean.length < 4) return false;
   if (
-    /^(hi|hello|hey|yo|sup|thanks|thank you|thx|ok|okay|cool|nice|great|awesome|lol|haha|good morning|good afternoon|good evening|good night|bye)[!.\s]*$/i.test(
+    /^(hi|hello|hey|yo|sup|don|test|testing|yes|no|yeah|nope|sure|ok|okay|cool|nice|great|awesome|lol|haha|good morning|good afternoon|good evening|good night|bye|good|bro|boss|thanks|thank you|thx)[!.\s]*$/i.test(
+      clean
+    )
+  ) {
+    return false;
+  }
+  if (
+    wordCount <= 2 &&
+    !/\b(weather|news|price|bitcoin|btc|usd|ngn|score|stock|time)\b/i.test(clean)
+  ) {
+    return false;
+  }
+  if (
+    /^(who are you|what are you|how are you|what can you do|how do you work|can we chat|just asking)\b/i.test(
       clean
     )
   ) {
@@ -490,7 +504,7 @@ export function shouldRunChatSearch(message: string, hasPreviousHtml = false): b
   }
   if (
     hasPreviousHtml &&
-    /\b(this app|the app|my app|this screen|the screen|the preview|you built|you made|you added|what does (it|this)|how does (it|this)|why is (it|this|there))\b/i.test(
+    /\b(this app|the app|my app|this screen|the screen|the preview|you built|you made|you added|what does (it|this)|how does (it|this)|why is (it|this|there)|did you (add|build|put|make))\b/i.test(
       clean
     ) &&
     !/\b(search|google|look up|online|internet|weather|news|price|live data|stock)\b/i.test(
@@ -511,29 +525,65 @@ export function classifyInitialRoute(
   const text = message.trim();
   if (!text) return 'chat';
 
+  const wordCount = text.split(/\s+/).filter(Boolean).length;
+
   const isPoliteBuildCommand =
-    /^(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:build|create|make|design|code|craft|develop|fix|change|edit|update|add|remove|cut|delete|replace|redesign|upgrade|do)\b/i.test(
+    /^(?:can|could|would|will|please)\s+(?:you\s+)?(?:please\s+)?(?:build|create|make|design|code|craft|develop|fix|change|edit|update|add|remove|cut|delete|replace|redesign|upgrade|monetize|implement|connect|integrate|wire|turn|switch|put)\b/i.test(
+      text
+    );
+
+  const hasExplicitAppArtifact =
+    /\b(app|mobile\s*app|ios\s*app|android\s*app|website|web\s*app|webpage|landing\s*page|site|storefront|dashboard|ecommerce|e-commerce|online\s*store|store|shop|portfolio|calculator|tracker|clone|prototype|ui|ux|screen|html|preview|widget|interface|todo|to-do|game|player|quiz|planner|calendar|timer|clock|notes|chat\s*app|social|feed|blog|portal|tool|system|manager|finder|generator|converter|form|login|signup|paywall|checkout|subscription|monetization|tiktok|instagram|youtube|spotify|netflix|twitter|whatsapp|uber|airbnb|amazon)\b/i.test(
+      text
+    );
+
+  const hasImperativeBuildVerb =
+    /\b(build|create|make|design|develop|generate|craft|code|scaffold|implement|redesign|upgrade|convert|monetize|integrate|connect|wire)\b/i.test(
+      text
+    );
+
+  const hasEditVerb =
+    /\b(change|update|modify|edit|fix|add|remove|cut|delete|take\s*out|replace|make\s+it|switch|turn|redesign|upgrade|rebuild|restructure|monetize|put)\b/i.test(
       text
     );
 
   if (attachmentName || hasAttachmentData) {
     const asksPureQuestion =
       (/\?$/.test(text) ||
-        /^(what|why|how|who|where|when|which|is|are|does|do|explain|tell me)\b/i.test(
+        /^(what|why|how|who|where|when|which|is|are|does|do|did|explain|tell me)\b/i.test(
           text
         )) &&
       !isPoliteBuildCommand &&
-      !/\b(fix|change|edit|cut|remove|delete|build|make|create|update|add|keep|stay|replace|redesign|take out)\b/i.test(
-        text
-      );
-    return asksPureQuestion ? 'auto' : 'build';
+      !hasEditVerb &&
+      !hasImperativeBuildVerb;
+    return asksPureQuestion ? 'chat' : 'build';
+  }
+
+  // Short casual greetings, names, reactions, or conversational single words with no build/app keywords -> immediate CHAT
+  if (wordCount <= 3 && !hasExplicitAppArtifact && !hasImperativeBuildVerb && !(previousHtml.trim().length > 0 && hasEditVerb)) {
+    return 'chat';
   }
 
   if (
     /^(hi|hello|hey|yo|sup|good morning|good afternoon|good evening|good night|thanks|thank you|ok|okay|cool|nice|great|awesome|how are you|who are you|what time|what day|what date)\b/i.test(
       text
     ) &&
-    !/\b(build|create|make|app|website|web\s*app|change|fix|update|remove|add|cut)\b/i.test(
+    !hasImperativeBuildVerb &&
+    !hasEditVerb
+  ) {
+    return 'chat';
+  }
+
+  // Pure questions / explanations / advice requests (including "how do I monetize an app?" or "did you build X?") -> CHAT unless explicitly commanding a build
+  const startsAsQuestion =
+    /^(what|why|how|who|where|when|which|is|are|was|were|does|do|did|have you|did you|are you|explain|tell me|can you explain|can you tell me|should i|what's)\b/i.test(
+      text
+    );
+
+  if (
+    (startsAsQuestion || /\?\s*$/.test(text)) &&
+    !isPoliteBuildCommand &&
+    !/\b(build me|create me|make me|do my app|add .+ to (my|the) app|put .+ in (my|the) app)\b/i.test(
       text
     )
   ) {
@@ -541,7 +591,7 @@ export function classifyInitialRoute(
   }
 
   if (
-    /\b(tell me a joke|make me laugh|make sense|make sure|write a (poem|story|essay|email|song|letter)|what time|what day|what date|who are you|what model|how are you|explain\b|define\b|what is\b|what are\b|what does\b|why is\b|why are\b|why did\b|why does\b|how does\b|how do i\b|how did\b|how many\b)\b/i.test(
+    /\b(tell me a joke|make me laugh|make sense|make sure|write a (poem|story|essay|email|song|letter)|what time|what day|what date|who are you|what model|how are you|explain\b|define\b)\b/i.test(
       text
     ) &&
     !isPoliteBuildCommand &&
@@ -550,26 +600,12 @@ export function classifyInitialRoute(
     return 'chat';
   }
 
-  if (/\?\s*$/.test(text) && !isPoliteBuildCommand) {
-    return 'auto';
-  }
-
-  const hasExplicitAppArtifact =
-    /\b(app|mobile\s*app|ios\s*app|android\s*app|website|web\s*app|webpage|landing\s*page|site|storefront|dashboard|ecommerce|e-commerce|online\s*store|store|shop|portfolio|calculator|tracker|clone|prototype|ui|ux|screen|html|preview|widget|interface|todo|to-do|game|player|quiz|planner|calendar|timer|clock|notes|chat\s*app|social|feed|blog|portal|tool|system|manager|finder|generator|converter|form|login|signup|tiktok|instagram|youtube|spotify|netflix|twitter|whatsapp|uber|airbnb|amazon)\b/i.test(
-      text
-    );
-
-  const hasBuildVerb =
-    /\b(build|create|make|design|develop|generate|craft|code|scaffold|implement|redesign|upgrade|convert|do|want|need|give)\b/i.test(
-      text
-    );
-
-  if (hasExplicitAppArtifact && (hasBuildVerb || /\b(for me|like)\b/i.test(text))) {
+  if (hasExplicitAppArtifact && (hasImperativeBuildVerb || /\b(for me|like|with)\b/i.test(text))) {
     return 'build';
   }
 
   if (
-    /^(?:please\s+)?(?:build|create|make|design|scaffold|craft)\s+(?:me\s+)?(?:an?|the|my)\s+/i.test(
+    /^(?:please\s+)?(?:build|create|make|design|scaffold|craft|monetize)\s+(?:me\s+)?(?:an?|the|my)\s+/i.test(
       text
     ) &&
     !/\b(summary|poem|story|joke|essay|recipe|explanation|sentence|paragraph|list|plan)\b/i.test(
@@ -581,12 +617,8 @@ export function classifyInitialRoute(
 
   if (
     previousHtml.trim().length > 0 &&
-    !/^(what|why|how|who|where|when|which|is|are|does|do|did|should|would|could)\b/i.test(
-      text
-    ) &&
-    /\b(change|update|modify|edit|fix|add|remove|cut|delete|take\s*out|replace|make\s+it|switch|turn|redesign|upgrade|rebuild|restructure)\b/i.test(
-      text
-    )
+    !startsAsQuestion &&
+    hasEditVerb
   ) {
     return 'build';
   }
@@ -1730,20 +1762,21 @@ export function buildCraftSystemPrompt(params: {
       : '';
 
     return [
-      'You are AI Craft, a calm, helpful, real-time AI assistant with live browser search access.',
+      'You are AI Craft, a sharp, warm, human-like AI product partner & engineer with live web search access.',
       `Real-time clock context: ${timeContext}.`,
       projectInfraContext,
       projectMemoryContext ? `\n${projectMemoryContext}` : '',
       webSearchContext ? `\n${webSearchContext}` : '',
       previewSummary
-        ? `\nContext about the user's current Preview app (for answering questions accurately without rebuilding):\n${previewSummary}`
-        : '',
+        ? `\nContext about what actually exists in the user's current Preview app right now (ONLY reference items that genuinely exist here):\n${previewSummary}`
+        : '\nNo app has been built in Preview yet in this session.',
       titleRuleForChat,
-      'Respond directly and conversationally in real time to the user message.',
-      'The user is chatting or asking a question right now — reply naturally without rebuilding the app or outputting HTML code.',
-      'NEVER claim you added or built features into Preview unless you actually built them.',
-      'NEVER tell the user to copy and paste code.',
-      'Keep formatting clean and readable.',
+      'HOW TO RESPOND RIGHT NOW (CHAT MODE — STRICT):',
+      '- Talk naturally like a real human engineer — concise, helpful, clear, and honest.',
+      '- Answer normal questions directly without outputting HTML, code blocks, fake build plans, or rebuilding Preview.',
+      '- STRICT HONESTY: NEVER claim you built, added, fixed, changed, or connected anything in Preview unless it genuinely already exists in the context above. If you did not build an app on this turn, never say you did.',
+      '- If the user asks how to monetize an app or build something (subscriptions, paywalls, Paystack/Stripe checkout, marketplace fees, ads, credits), give practical real-world guidance AND offer to build it right into their app whenever they ask you to.',
+      '- NEVER tell the user to copy and paste code manually.',
     ]
       .filter(Boolean)
       .join('\n');
@@ -1762,7 +1795,11 @@ export function buildCraftSystemPrompt(params: {
     '  * NEVER rebuild or overwrite the whole app from scratch when the user asks to add, edit, fix, restyle, or remove a specific feature/screen unless they explicitly ask for a brand-new redesign.',
     '  * For targeted edits or feature additions on an existing complete app, PREFER outputting fast surgical patch blocks inside `<<<AICRAFT_PATCH>>>...<<<END_PATCH>>>` (with exact `<<<SEARCH>>>...<<<REPLACE>>>...`, `<<<APPEND_CSS>>>`, `<<<APPEND_SCREEN>>>`, or `<<<APPEND_SCRIPT>>>`) so untouched screens, styles, buttons, and `window.AICraft.db` tables remain 100% intact!',
     '  * When resuming from a stopped/paused incomplete build (`[[CONTINUE_BUILD]]`) OR when restructuring the full shell, preserve ALL existing screens, styles, DB tables, and working handlers cleanly inside `<<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>`.',
-    '- STRICT HONESTY & NO LINKS / UNSOLICITED LAUNCHERS: NEVER claim in your explanation that you built a feature unless that exact screen, button, handler, and DB-backed DOM logic is genuinely working inside PART 2. NEVER print app URLs/links inside your chat explanation, and never add an unsolicited "Open" banner inside the app.',
+    '- MONETIZATION & REVENUE ARCHITECTURE (WHEN USER REQUESTS MONETIZATION / PAYMENTS / SUBSCRIPTIONS):',
+    '  * Whenever the user asks to monetize their app (subscriptions, Pro/VIP plans, paywalls, Stripe/Paystack checkout, in-app wallet/credits, marketplace commissions, digital store checkout, or sponsored listings/ads), build a REAL interactive monetization system backed by `window.AICraft.db` (`plans`, `subscriptions`, `transactions`, `entitlements`, `orders`).',
+    '  * Wire configured payment keys automatically via `window.AICraft.findSecret("paystack|stripe|flutterwave")` with real Paystack/Stripe client SDK checkout when a public key is present in `Secrets`, PLUS clean test-mode/sandbox verification, active Pro entitlement gating on premium features, and a live billing/receipts history view.',
+    '  * Always be 100% honest in PART 1 about whether live payment keys from `Secrets` were connected or whether checkout currently runs in local Preview sandbox mode until they add their key in `Secrets`.',
+    '- STRICT HONESTY & NO LINKS / UNSOLICITED LAUNCHERS: NEVER claim in your explanation that you built a feature unless that exact screen, button, handler, and DB-backed DOM logic is genuinely working inside PART 2. NEVER lie about capabilities or unbuilt actions. NEVER print app URLs/links inside your chat explanation, and never add an unsolicited "Open" banner inside the app.',
     '- REAL-WORLD GROUNDING (ZERO GENERIC PLACEHOLDERS): Use real verified facts, services, names, departments, and real HTTPS photos from `Live Browser & Web Search Results` when available (with clean `onerror` CSS gradient fallbacks). Never output dummy placeholders like "Item 1", "Feature A", or "Lorem ipsum".',
     titleRuleForBuild,
     'STEP 0 (Calm 5-Step Architecture & Database Thinking): Output 5 thoughtful, concrete engineering steps using exact format `[[PLAN: <step>]]` showing what you are designing BEFORE writing code:',
@@ -1823,19 +1860,19 @@ export function buildCraftSystemPrompt(params: {
   }
 
   return [
-    'You are AI Craft, a calm, intelligent real-time AI assistant AND methodical Replit-grade product builder connected to a live Preview workspace.',
+    'You are AI Craft, a sharp, human-like AI partner AND Lovable-grade full-stack app builder connected to a live Preview workspace.',
     `Real-time clock context: ${timeContext}.`,
     projectInfraContext,
     projectMemoryContext ? `\n${projectMemoryContext}` : '',
     designBlock,
     webSearchContext ? `\n${webSearchContext}` : '',
     previewSummary ? `\nLIVE PREVIEW ENVIRONMENT AWARENESS:\n${previewSummary}` : '',
-    'THINK FIRST BEFORE RESPONDING:',
-    'First decide carefully whether the user message is:',
-    '(A) CHAT / QUESTION: A question, greeting, explanation request, feedback discussion, or normal conversation (even if an app was already built in Preview).',
-    `    -> Start your output on the VERY FIRST LINE with exactly \`[[INTENT:CHAT]]\` followed by a newline${shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline' : ''}, then write a natural, helpful conversational reply. Do NOT output HTML, code blocks, or rebuild the app.`,
-    '(B) BUILD / EDIT APP: A request to create/build a new app or website, OR ANY request to change, style, restyle, cut, remove, fix, add features, update the Home Screen logo/icon/color, customize browser toolbar theme-color, or build monetization.',
-    '    -> Start your output on the VERY FIRST LINE with exactly `[[INTENT:BUILD]]` followed by a newline, then output TWO strictly separated parts:',
+    'THINK FIRST LIKE A HUMAN BEFORE CHOOSING MODE:',
+    'Examine the user message carefully and decide truthfully whether they want (A) a normal conversation/question answer OR (B) an app built/edited/monetized right now:',
+    '(A) CHAT / NORMAL QUESTION: Any greeting, name, short remark, normal question, advice/monetization question ("how do I...", "what is...", "did you..."), feedback, or casual discussion — even when an app already exists in Preview.',
+    `    -> Start on the VERY FIRST LINE with exactly \`[[INTENT:CHAT]]\` followed by a newline${shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline' : ''}, then reply naturally, warmly, and honestly like a human. Do NOT output HTML, code blocks, fake build plans, or claim you built/changed anything.`,
+    '(B) BUILD / EDIT / MONETIZE APP: Only when the user asks you to build, create, modify, fix, restyle, add a feature, connect a secret/database, or implement monetization in their app.',
+    '    -> Start on the VERY FIRST LINE with exactly `[[INTENT:BUILD]]` followed by a newline, then output TWO strictly separated parts:',
     buildRulesBlock,
     activeFlags.length > 0 ? `Enabled capabilities: ${activeFlags.join(', ')}.` : '',
   ]
