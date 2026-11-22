@@ -98,6 +98,30 @@ async function fetchImageBytesAsDataUrl(
   }
 }
 
+/**
+ * Keyless AI image generation via Pollinations. Returns null on any failure
+ * so callers can fall through to web search / SVG studio fallbacks.
+ */
+async function fetchPollinationsAiImage(
+  prompt: string
+): Promise<{ dataUrl: string; mimeType: string } | null> {
+  const baseUrl = (
+    process.env.POLLINATIONS_IMAGE_BASE_URL || 'https://image.pollinations.ai'
+  ).trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(baseUrl)) return null;
+  try {
+    const seed = Math.floor(Math.random() * 1_000_000);
+    const url =
+      `${baseUrl}/prompt/${encodeURIComponent(prompt.slice(0, 800))}` +
+      `?width=1024&height=1024&nologo=true&seed=${seed}&model=flux`;
+    const downloaded = await fetchImageBytesAsDataUrl(url, 25000);
+    if (!downloaded) return null;
+    return downloaded;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchVerifiedWebImageFallback(
   prompt: string
 ): Promise<GeneratedMediaResult | null> {
@@ -1090,6 +1114,24 @@ export async function generateMediaAsset(params: {
 
   if (params.kind === 'music') {
     return generateKeylessAiMusic(cleanPrompt);
+  }
+
+  // Keyless AI image generation via Pollinations (opt-out: POLLINATIONS_IMAGE_ENABLED=false)
+  if (
+    params.kind === 'image' &&
+    (process.env.POLLINATIONS_IMAGE_ENABLED || '').trim().toLowerCase() !== 'false'
+  ) {
+    const aiImg = await fetchPollinationsAiImage(cleanPrompt);
+    if (aiImg) {
+      return {
+        kind: params.kind,
+        prompt: cleanPrompt,
+        dataUrl: aiImg.dataUrl,
+        mimeType: aiImg.mimeType,
+        modelId: 'pollinations::flux',
+        gateway: 'browser',
+      };
+    }
   }
 
   // Real Google / Bing / Wikimedia web image search

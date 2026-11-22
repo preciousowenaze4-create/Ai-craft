@@ -71,6 +71,7 @@ import {
   generateMediaAsset,
   type GeneratedMediaResult,
 } from './api/_mediaService.js';
+import { getFreeAiMeshStatus } from './api/_freeAiMesh.js';
 import { cleanEnvKey } from './api/_openrouterModels.js';
 import {
   ModerationActionType,
@@ -534,10 +535,18 @@ async function startServer() {
 
   app.get('/api/health', (_req, res) => {
     const sbConfig = getSupabaseConfig();
+    const mesh = getFreeAiMeshStatus();
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       ok: true,
       geminiConfigured: Boolean(getServerGeminiApiKey()),
+      serverFreeAiReady: Boolean(getServerGeminiApiKey()) || mesh.hasAny,
+      freeAiMesh: {
+        hasAny: mesh.hasAny,
+        hasKeyless: mesh.hasKeyless,
+        pollinationsEnabled: mesh.pollinationsEnabled,
+        providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
+      },
       supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
       paymentsConfigured: Boolean(getPaymentSecretKey()),
     });
@@ -2095,6 +2104,7 @@ async function startServer() {
   app.get('/api/models', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     const referer = getAppBaseUrl(req);
+    const mesh = getFreeAiMeshStatus();
     try {
       const forceRefresh = req.query.refresh === '1';
       const result = await fetchAllGatewayModels(referer, forceRefresh);
@@ -2103,20 +2113,30 @@ async function startServer() {
         models: result.models,
         gateways: result.gateways,
         geminiConfigured: result.geminiConfigured,
-        serverFreeAiReady: result.serverFreeAiReady,
-        pollinationsConfigured: false,
+        serverFreeAiReady: result.geminiConfigured || mesh.hasAny,
+        pollinationsConfigured: mesh.pollinationsConfigured,
         puterConfigured: false,
-        keyless: false,
+        keyless: mesh.hasKeyless,
+        freeAiMesh: {
+          hasAny: mesh.hasAny,
+          hasKeyless: mesh.hasKeyless,
+          providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
+        },
         freeOnly: true,
       });
     } catch {
       res.status(200).json({
         models: GEMINI_BUILDER_MODELS,
         geminiConfigured: hasServerFreeAiKey(),
-        serverFreeAiReady: hasServerFreeAiKey(),
-        pollinationsConfigured: false,
+        serverFreeAiReady: hasServerFreeAiKey() || mesh.hasAny,
+        pollinationsConfigured: mesh.pollinationsConfigured,
         puterConfigured: false,
-        keyless: false,
+        keyless: mesh.hasKeyless,
+        freeAiMesh: {
+          hasAny: mesh.hasAny,
+          hasKeyless: mesh.hasKeyless,
+          providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
+        },
         freeOnly: true,
       });
     }

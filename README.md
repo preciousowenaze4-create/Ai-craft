@@ -76,7 +76,7 @@ Copy `.env.example` to `.env` and fill in values. All secrets stay server-side.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | ✅ | Server-side Gemini key for the build/stream pipeline |
+| `GEMINI_API_KEY` | optional | Server-side Gemini key for the build/stream pipeline (highest priority when set) |
 | `SUPABASE_URL` | ✅* | Supabase project URL (*needed for auth, cloud save, memory) |
 | `SUPABASE_ANON_KEY` | ✅* | Supabase anon (public) key |
 | `SUPABASE_SERVICE_ROLE_KEY` | ✅* | Supabase service-role key (server-only) |
@@ -84,13 +84,34 @@ Copy `.env.example` to `.env` and fill in values. All secrets stay server-side.
 | `PAYSTACK_USD_TO_NGN_RATE` | optional | Manual USD→NGN override (defaults to live FX) |
 | `APP_URL` | recommended | Public base URL for OAuth callbacks & published apps |
 | `PORT` | optional | Server port (default `3000`) |
-| `SELF_HOSTED_LLM_URL/MODEL/PROTOCOL/API_KEY` | Stage 2 | Self-hosted GPU endpoint (inactive in Stage 1) |
+| `SELF_HOSTED_LLM_URL/MODEL/PROTOCOL/API_KEY` | optional | Self-hosted GPU endpoint — first lane of the free AI mesh |
+| `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`, `HF_TOKEN`, `GITHUB_TOKEN`, `TOGETHER_API_KEY`, `DEEPINFRA_API_KEY` | optional | Any subset of free-tier provider keys — each adds failover lanes |
+| `OPENAI_COMPATIBLE_BASE_URL/KEY/MODEL` | optional | Generic OpenAI-compatible endpoint lane |
+| `POLLINATIONS_ENABLED` | optional | Keyless text fallback (default `true`) |
+
+### Free AI mesh (automatic failover)
+
+Chat and build requests run through one ordered multi-provider mesh — no Gemini
+key required:
+
+1. **Gemini** (when `GEMINI_API_KEY` is set — existing 3-pass failover)
+2. **Self-hosted** GPU (`SELF_HOSTED_LLM_*`)
+3. **OpenAI-compatible** endpoint (`OPENAI_COMPATIBLE_*`)
+4. Free-tier keys: **Groq → Cerebras → OpenRouter (`:free` models) → Mistral →
+   HuggingFace → GitHub Models → Together → DeepInfra**
+5. **Pollinations** — keyless, always last (opt out with `POLLINATIONS_ENABLED=false`)
+
+Providers that rate-limit or error are cooled down (429/quota → 90s, auth →
+10min, retired model → 6h, 5xx/network → 30-45s) in a shared registry, so the
+next request skips them instantly with zero added latency. Repair and the design
+architect pre-pass use the same mesh. Media generation additionally falls back to
+keyless Pollinations image AI before web search (`POLLINATIONS_IMAGE_ENABLED`).
 
 Without Supabase/payments the server still boots and reports status:
 
 ```bash
 curl http://localhost:3000/api/health
-# {"ok":true,"geminiConfigured":…,"supabaseConfigured":…,"paymentsConfigured":…}
+# {"ok":true,"geminiConfigured":…,"serverFreeAiReady":true,"freeAiMesh":{…},"supabaseConfigured":…,"paymentsConfigured":…}
 ```
 
 ## Database (Supabase)
@@ -128,8 +149,9 @@ Stage 1 (this repo) is provider-agnostic: `api/_aiBrain.ts` defines a
 `AiBrainProviderAdapter` contract and a ready scaffold
 (`createSelfHostedBrainAdapter`) for pointing builds at a self-hosted
 open-source coder model (Qwen2.5-Coder / DeepSeek-Coder / Llama via vLLM, TGI,
-or Ollama). Set the `SELF_HOSTED_LLM_*` variables to activate it — no UI, memory,
-auth, or billing changes required.
+or Ollama). The free AI mesh (`api/_freeAiMesh.ts`) already routes live chat
+and build traffic through `SELF_HOSTED_LLM_*` when set — no UI, memory, auth,
+or billing changes required.
 
 ## License
 
