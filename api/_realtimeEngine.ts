@@ -373,11 +373,16 @@ export async function prepareRealtimePrompt(
     (initialRoute !== 'chat' || shouldRunChatSearch(message, hasPreviousHtml));
 
   const previewSummary = extractPreviewStructureSummary(previousHtml);
+  const wantsFullRedesign =
+    /\b(redesign|restyle\s*(?:all|everything|the\s*whole|entire)|rebuild\s*from\s*scratch|start\s*over|completely\s*new)\b/i.test(
+      message
+    );
   const shouldRunDesignEngine =
     !input.forceChat &&
     !naturalMediaIntent &&
     hasServerFreeAiKey() &&
-    initialRoute === 'build';
+    initialRoute === 'build' &&
+    (!hasPreviousHtml || wantsFullRedesign);
 
   if (wantsSearch || shouldRunDesignEngine) {
     input.onStage?.({
@@ -494,13 +499,22 @@ export async function prepareRealtimePrompt(
 
   if (hasPreviousHtml && initialRoute !== 'chat') {
     const isContinueResume = /\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(message);
+    const cleanedPreviousForPrompt = previousHtml
+      .replace(/<style\b[^>]*data-aicraft-safety[^>]*>[\s\S]*?<\/style>\s*/gi, '')
+      .replace(/<script\b[^>]*data-aicraft-safety-js[^>]*>[\s\S]*?<\/script>\s*/gi, '');
     const trimmedExisting =
-      previousHtml.length > 120000
-        ? `${previousHtml.slice(0, 62000)}\n<!-- ... middle truncated (${previousHtml.length} total chars) ... -->\n${previousHtml.slice(-55000)}`
-        : previousHtml;
+      cleanedPreviousForPrompt.length > 120000
+        ? `${cleanedPreviousForPrompt.slice(0, 62000)}\n<!-- ... middle truncated (${cleanedPreviousForPrompt.length} total chars) ... -->\n${cleanedPreviousForPrompt.slice(-55000)}`
+        : cleanedPreviousForPrompt;
     const continuationDirective = isContinueResume
       ? `RESUMING STOPPED/PAUSED BUILD WITH ${executionPlan.requestedModelLabel}: Continue building cleanly from the saved progress below! Preserve EVERY existing screen, style, handler, and database table already written, finish any unfinished screens/scripts, and output the complete finished app inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>.`
-      : `EXISTING APP CODEBASE (Active Builder: ${executionPlan.requestedModelLabel} — You are continuing THIS EXACT app seamlessly! Perform SURGICAL additions/edits ONLY using <<<AICRAFT_PATCH>>> (preferred for adding features, buttons, themes, or 1-2 new screens cleanly without touching other screens) OR output full updated <<<AICRAFT_APP_HTML>>> preserving ALL untouched screens, navigation, database tables, and CSS variables):`;
+      : wantsFullRedesign
+        ? `EXISTING APP CODEBASE (Active Builder: ${executionPlan.requestedModelLabel} — User explicitly requested a redesign/overhaul. Preserve existing domain features and \`window.AICraft.db\` data tables while applying the requested redesign cleanly inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>):`
+        : `EXISTING APP CODEBASE — VISUAL LOCK & SURGICAL EDIT MODE (Active Builder: ${executionPlan.requestedModelLabel}):
+CRITICAL PRESERVATION RULES:
+- DO NOT change existing \`:root\` CSS variables, colors, fonts, body layout, header bar, bottom nav bar, or untouched screens!
+- DO NOT rewrite the entire HTML unless restructuring everything is strictly unavoidable.
+- USE \`<<<AICRAFT_PATCH>>>...<<<END_PATCH>>>\` with exact \`<<<SEARCH>>>...<<<REPLACE>>>...\` anchors (copied character-for-character from the code below), \`<<<APPEND_CSS>>>\`, \`<<<APPEND_SCREEN>>>\`, and/or \`<<<APPEND_SCRIPT>>>\` so the existing app keeps 100% of its exact visual look & working features:`;
 
     userBlocks.push(
       `${continuationDirective}\n\`\`\`html\n${trimmedExisting}\n\`\`\``
@@ -639,9 +653,12 @@ export function finalizeRealtimeOutput(
   }
 
   const previousHtml = typeof input.previousHtml === 'string' ? input.previousHtml : '';
+  const hasPatchDirective =
+    previousHtml.trim().length > 0 && /<<<\s*AICRAFT_PATCH\s*>>>/i.test(cleanedRaw);
   let extractedHtml = '';
+  let patchFailedCompletely = false;
 
-  if (previousHtml.trim() && /<<<\s*AICRAFT_PATCH\s*>>>/i.test(cleanedRaw)) {
+  if (hasPatchDirective) {
     const patched = applySurgicalPatchesToHtml(previousHtml, cleanedRaw);
     if (patched.html && patched.appliedCount > 0) {
       extractedHtml = patched.html;
@@ -650,9 +667,15 @@ export function finalizeRealtimeOutput(
 
   if (!extractedHtml) {
     extractedHtml = extractPreviewHtmlFromRaw(cleanedRaw);
-    if (!extractedHtml && /<!doctype|<html|<body|<section|<main/i.test(cleanedRaw)) {
+    if (!extractedHtml && /<!doctype|<html|<body|<section|<main/i.test(cleanedRaw) && !hasPatchDirective) {
       extractedHtml = finalizePartialPreviewHtml(cleanedRaw);
     }
+  }
+
+  if (!extractedHtml && hasPatchDirective) {
+    // Never fall back to kind:'chat' or wipe out previousHtml when a patch fails to match anchors
+    extractedHtml = previousHtml;
+    patchFailedCompletely = true;
   }
 
   const explicitlyChat = /\[\[\s*INTENT\s*:\s*CHAT\s*\]\]/i.test(cleanedRaw) && !extractedHtml;
@@ -679,7 +702,12 @@ export function finalizeRealtimeOutput(
   }
 
   const hardenedHtml = sanitizeAndHardenPreviewHtml(extractedHtml);
-  const validation = validateBuiltAppHtml(hardenedHtml);
+  const validation = patchFailedCompletely
+    ? {
+        valid: false,
+        reason: `Surgical patch anchors did not match existing HTML while updating "${input.message.slice(0, 120)}". Preserve existing styles/screens and apply the requested addition cleanly.`,
+      }
+    : validateBuiltAppHtml(hardenedHtml);
   const files = extractLiveBuildArtifacts(hardenedHtml).map((a) => a.path);
   const dbTables = mergeParsedDbTables(
     extractDbSchemaFromRaw(cleanedRaw),

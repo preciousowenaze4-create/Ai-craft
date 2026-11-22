@@ -339,6 +339,41 @@ ${viewportHintStyle}
   return out;
 }
 
+function stripClientPatchFences(snippet: string): string {
+  return snippet
+    .replace(/\r\n/g, '\n')
+    .trim()
+    .replace(/^```(?:html|htm|css|javascript|js)?\s*\n?/i, '')
+    .replace(/\n?```\s*$/i, '')
+    .trim();
+}
+
+function findClientLastScreenEndIndex(html: string): number {
+  const openRe =
+    /<(section|div|main|article)\b[^>]*\b(?:data-screen|data-view|data-page|data-tab)=["'][^"']+["'][^>]*>/gi;
+  let lastEnd = -1;
+  let m: RegExpExecArray | null;
+  while ((m = openRe.exec(html)) !== null) {
+    const tag = m[1].toLowerCase();
+    const tagPairRe = new RegExp(`<${tag}\\b[^>]*>|</${tag}>`, 'gi');
+    tagPairRe.lastIndex = m.index;
+    let depth = 0;
+    let tm: RegExpExecArray | null;
+    while ((tm = tagPairRe.exec(html)) !== null) {
+      if (tm[0].startsWith('</')) {
+        depth -= 1;
+        if (depth <= 0) {
+          lastEnd = tm.index + tm[0].length;
+          break;
+        }
+      } else {
+        depth += 1;
+      }
+    }
+  }
+  return lastEnd;
+}
+
 export function applySurgicalPatchesToHtmlClient(
   existingHtml: string,
   rawOutput: string
@@ -356,42 +391,68 @@ export function applySurgicalPatchesToHtmlClient(
       /<<<\s*SEARCH\s*>>>\s*\n?([\s\S]*?)\n?<<<\s*REPLACE\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT)\s*>>>|$)/gi;
     let m: RegExpExecArray | null;
     while ((m = srRegex.exec(block)) !== null) {
-      const s = m[1].replace(/\r\n/g, '\n');
-      const r = m[2].replace(/\r\n/g, '\n');
-      if (s.trim() && updated.includes(s)) {
-        updated = updated.replace(s, r);
+      const rawS = m[1].trim();
+      const rawR = m[2].trim();
+      const s = stripClientPatchFences(m[1]);
+      const r = stripClientPatchFences(m[2]);
+      if (s && updated.includes(s)) {
+        updated = updated.replace(s, () => r);
         applied += 1;
-      } else if (s.trim() && updated.includes(s.trim())) {
-        updated = updated.replace(s.trim(), r.trim());
-        applied += 1;
-      }
-    }
-
-    const cssMatch = /<<<\s*APPEND_CSS\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT)\s*>>>|$)/i.exec(block);
-    if (cssMatch?.[1]?.trim() && /<\/style>/i.test(updated)) {
-      const idx = updated.toLowerCase().lastIndexOf('</style>');
-      updated = `${updated.slice(0, idx)}\n${cssMatch[1].trim()}\n${updated.slice(idx)}`;
-      applied += 1;
-    }
-
-    const screenMatch = /<<<\s*APPEND_SCREEN\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT)\s*>>>|$)/i.exec(block);
-    if (screenMatch?.[1]?.trim() && /<\/body>/i.test(updated)) {
-      const anchorIdx = /<nav\b/i.test(updated)
-        ? updated.toLowerCase().lastIndexOf('<nav')
-        : /<script\b/i.test(updated)
-          ? updated.toLowerCase().indexOf('<script')
-          : updated.toLowerCase().lastIndexOf('</body>');
-      if (anchorIdx !== -1) {
-        updated = `${updated.slice(0, anchorIdx)}${screenMatch[1].trim()}\n${updated.slice(anchorIdx)}`;
+      } else if (rawS && updated.includes(rawS)) {
+        updated = updated.replace(rawS, () => rawR);
         applied += 1;
       }
     }
 
-    const jsMatch = /<<<\s*APPEND_SCRIPT\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT)\s*>>>|$)/i.exec(block);
-    if (jsMatch?.[1]?.trim() && /<\/script>/i.test(updated)) {
-      const idx = updated.toLowerCase().lastIndexOf('</script>');
-      updated = `${updated.slice(0, idx)}\n${jsMatch[1].trim()}\n${updated.slice(idx)}`;
-      applied += 1;
+    const cssRegex = /<<<\s*APPEND_CSS\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT)\s*>>>|$)/gi;
+    for (const cssMatch of block.matchAll(cssRegex)) {
+      const snippet = stripClientPatchFences(cssMatch[1] || '');
+      if (!snippet) continue;
+      const safetyIdx = updated.indexOf('data-aicraft-safety');
+      const idx =
+        safetyIdx !== -1
+          ? updated.toLowerCase().lastIndexOf('</style>', safetyIdx)
+          : updated.toLowerCase().lastIndexOf('</style>');
+      if (idx !== -1) {
+        updated = `${updated.slice(0, idx)}\n${snippet}\n${updated.slice(idx)}`;
+        applied += 1;
+      }
+    }
+
+    const screenRegex = /<<<\s*APPEND_SCREEN\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT)\s*>>>|$)/gi;
+    for (const screenMatch of block.matchAll(screenRegex)) {
+      const snippet = stripClientPatchFences(screenMatch[1] || '');
+      if (!snippet) continue;
+      const siblingEnd = findClientLastScreenEndIndex(updated);
+      if (siblingEnd !== -1) {
+        updated = `${updated.slice(0, siblingEnd)}\n${snippet}${updated.slice(siblingEnd)}`;
+        applied += 1;
+      } else {
+        const anchorIdx = /<\/main>/i.test(updated)
+          ? updated.toLowerCase().lastIndexOf('</main>')
+          : /<nav\b[^>]*class=["'][^"']*bottom/i.test(updated)
+            ? updated.search(/<nav\b[^>]*class=["'][^"']*bottom/i)
+            : updated.toLowerCase().lastIndexOf('</body>');
+        if (anchorIdx !== -1) {
+          updated = `${updated.slice(0, anchorIdx)}${snippet}\n${updated.slice(anchorIdx)}`;
+          applied += 1;
+        }
+      }
+    }
+
+    const jsRegex = /<<<\s*APPEND_SCRIPT\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT)\s*>>>|$)/gi;
+    for (const jsMatch of block.matchAll(jsRegex)) {
+      const snippet = stripClientPatchFences(jsMatch[1] || '');
+      if (!snippet) continue;
+      const beforeSafety = updated.indexOf('data-aicraft-safety-js');
+      const idx =
+        beforeSafety !== -1
+          ? updated.toLowerCase().lastIndexOf('</script>', beforeSafety)
+          : updated.toLowerCase().lastIndexOf('</script>');
+      if (idx !== -1) {
+        updated = `${updated.slice(0, idx)}\n${snippet}\n${updated.slice(idx)}`;
+        applied += 1;
+      }
     }
   }
 

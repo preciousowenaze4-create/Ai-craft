@@ -639,8 +639,22 @@ export function stripReasoningTags(raw: string): string {
 
 export function findCodeStart(
   raw: string
-): { markerIdx: number; htmlOffset: number } | null {
+): { markerIdx: number; htmlOffset: number; isPatch?: boolean } | null {
+  const patchMarkerMatch = /<<<\s*AICRAFT_PATCH\s*>>>/i.exec(raw);
   const markerMatch = /<<<\s*AICRAFT_APP_HTML\s*>>>/i.exec(raw);
+
+  if (
+    patchMarkerMatch &&
+    patchMarkerMatch.index !== undefined &&
+    (!markerMatch || patchMarkerMatch.index < markerMatch.index)
+  ) {
+    return {
+      markerIdx: patchMarkerMatch.index,
+      htmlOffset: patchMarkerMatch.index + patchMarkerMatch[0].length,
+      isPatch: true,
+    };
+  }
+
   if (markerMatch && markerMatch.index !== undefined) {
     return {
       markerIdx: markerMatch.index,
@@ -731,6 +745,9 @@ ${jsBlocks.length > 0 ? `<script>\n${jsBlocks.join('\n\n')}\n</script>` : ''}
 export function extractPreviewHtmlFromRaw(raw: string): string {
   const cleanRaw = stripReasoningTags(raw);
   const codeStart = findCodeStart(cleanRaw);
+  if (codeStart?.isPatch) {
+    return '';
+  }
   if (codeStart) {
     let rawHtml = cleanRaw.slice(codeStart.htmlOffset);
     const endMarkerMatch = /<<<\s*END_AICRAFT_APP_HTML\s*>>>/i.exec(rawHtml);
@@ -763,6 +780,48 @@ ${rawHtml}
   return assembleHtmlFromScatteredBlocks(cleanRaw);
 }
 
+function stripPatchMarkdownFences(snippet: string): string {
+  return snippet
+    .replace(/\r\n/g, '\n')
+    .trim()
+    .replace(/^```(?:html|htm|css|javascript|js)?\s*\n?/i, '')
+    .replace(/\n?```\s*$/i, '')
+    .trim();
+}
+
+/**
+ * Finds the character index immediately AFTER the closing tag of the LAST
+ * [data-screen] / [data-view] / [data-tab] / [data-page] sibling element so
+ * appended screens stay cleanly inside the exact same parent (<main>, .screens, etc.).
+ */
+function findLastScreenElementEndIndex(html: string): number {
+  const openRe =
+    /<(section|div|main|article)\b[^>]*\b(?:data-screen|data-view|data-page|data-tab)=["'][^"']+["'][^>]*>/gi;
+  let lastEnd = -1;
+  let m: RegExpExecArray | null;
+
+  while ((m = openRe.exec(html)) !== null) {
+    const tag = m[1].toLowerCase();
+    const startIdx = m.index;
+    const tagPairRe = new RegExp(`<${tag}\\b[^>]*>|</${tag}>`, 'gi');
+    tagPairRe.lastIndex = startIdx;
+    let depth = 0;
+    let tm: RegExpExecArray | null;
+    while ((tm = tagPairRe.exec(html)) !== null) {
+      if (tm[0].startsWith('</')) {
+        depth -= 1;
+        if (depth <= 0) {
+          lastEnd = tm.index + tm[0].length;
+          break;
+        }
+      } else {
+        depth += 1;
+      }
+    }
+  }
+  return lastEnd;
+}
+
 /**
  * Applies targeted <<<AICRAFT_PATCH>>> operations onto existing HTML cleanly
  * without rebuilding or respoiling untouched screens, styles, handlers, or DB wiring.
@@ -792,41 +851,37 @@ export function applySurgicalPatchesToHtml(
       /<<<\s*SEARCH\s*>>>\s*\n?([\s\S]*?)\n?<<<\s*REPLACE\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>|$)/gi;
     let srMatch: RegExpExecArray | null;
     while ((srMatch = srRegex.exec(block)) !== null) {
-      const searchStr = srMatch[1].replace(/\r\n/g, '\n');
-      const replaceStr = srMatch[2].replace(/\r\n/g, '\n');
-      if (!searchStr.trim()) continue;
+      const searchStr = stripPatchMarkdownFences(srMatch[1]);
+      const replaceStr = stripPatchMarkdownFences(srMatch[2]);
+      if (!searchStr) continue;
 
       if (updated.includes(searchStr)) {
-        updated = updated.replace(searchStr, replaceStr);
+        updated = updated.replace(searchStr, () => replaceStr);
         appliedCount += 1;
         continue;
       }
 
-      // Tolerant line-trimmed match when whitespace/indentation shifted slightly
-      const trimmedNeedle = searchStr.trim();
-      const idx = updated.indexOf(trimmedNeedle);
-      if (idx !== -1) {
-        updated =
-          updated.slice(0, idx) +
-          replaceStr.trim() +
-          updated.slice(idx + trimmedNeedle.length);
+      const rawSearch = srMatch[1].replace(/\r\n/g, '\n');
+      const rawReplace = srMatch[2].replace(/\r\n/g, '\n');
+      if (rawSearch.trim() && updated.includes(rawSearch)) {
+        updated = updated.replace(rawSearch, () => rawReplace);
         appliedCount += 1;
         continue;
       }
 
       // Regex whitespace-normalized fallback match for short-to-medium anchors
-      const searchLines = trimmedNeedle
+      const searchLines = searchStr
         .split('\n')
         .map((l) => l.trim())
         .filter(Boolean);
-      if (searchLines.length > 0 && searchLines.length <= 24) {
+      if (searchLines.length > 0 && searchLines.length <= 28) {
         const escapedPattern = searchLines
           .map((l) => l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
           .join('\\s+');
         try {
           const flexRe = new RegExp(escapedPattern);
           if (flexRe.test(updated)) {
-            updated = updated.replace(flexRe, replaceStr.trim());
+            updated = updated.replace(flexRe, () => replaceStr);
             appliedCount += 1;
             continue;
           }
@@ -838,62 +893,81 @@ export function applySurgicalPatchesToHtml(
       failedCount += 1;
     }
 
-    // 2. APPEND_CSS block
-    const cssMatch =
-      /<<<\s*APPEND_CSS\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>|$)/i.exec(
-        block
-      );
-    if (cssMatch?.[1]?.trim()) {
-      const cssSnippet = cssMatch[1].trim();
-      if (/<\/style>/i.test(updated)) {
-        const lastIdx = updated.toLowerCase().lastIndexOf('</style>');
-        updated = `${updated.slice(0, lastIdx)}\n${cssSnippet}\n${updated.slice(lastIdx)}`;
+    // 2. APPEND_CSS blocks (all occurrences, inserted before data-aicraft-safety style if present)
+    const cssRegex =
+      /<<<\s*APPEND_CSS\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>|$)/gi;
+    for (const cssMatch of block.matchAll(cssRegex)) {
+      const cssSnippet = stripPatchMarkdownFences(cssMatch[1] || '');
+      if (!cssSnippet) continue;
+      const safetyStyleIdx = updated.indexOf('data-aicraft-safety');
+      const targetStyleClose =
+        safetyStyleIdx !== -1
+          ? updated.toLowerCase().lastIndexOf('</style>', safetyStyleIdx)
+          : updated.toLowerCase().lastIndexOf('</style>');
+      if (targetStyleClose !== -1) {
+        updated = `${updated.slice(0, targetStyleClose)}\n${cssSnippet}\n${updated.slice(targetStyleClose)}`;
+        appliedCount += 1;
       } else if (/<\/head>/i.test(updated)) {
-        updated = updated.replace(/<\/head>/i, `<style>\n${cssSnippet}\n</style>\n</head>`);
+        const headClose = updated.toLowerCase().indexOf('</head>');
+        updated = `${updated.slice(0, headClose)}<style>\n${cssSnippet}\n</style>\n${updated.slice(headClose)}`;
+        appliedCount += 1;
       }
-      appliedCount += 1;
     }
 
-    // 3. APPEND_SCREEN block
-    const screenMatch =
-      /<<<\s*APPEND_SCREEN\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>|$)/i.exec(
-        block
-      );
-    if (screenMatch?.[1]?.trim()) {
-      const screenSnippet = screenMatch[1].trim();
-      if (/<nav\b/i.test(updated)) {
-        const navIdx = updated.toLowerCase().lastIndexOf('<nav');
+    // 3. APPEND_SCREEN blocks (insert inside existing screen sibling container, never outside <main> or above top <nav>)
+    const screenRegex =
+      /<<<\s*APPEND_SCREEN\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>|$)/gi;
+    for (const screenMatch of block.matchAll(screenRegex)) {
+      const screenSnippet = stripPatchMarkdownFences(screenMatch[1] || '');
+      if (!screenSnippet) continue;
+      const siblingEndIdx = findLastScreenElementEndIndex(updated);
+      if (siblingEndIdx !== -1) {
+        updated = `${updated.slice(0, siblingEndIdx)}\n${screenSnippet}${updated.slice(siblingEndIdx)}`;
+        appliedCount += 1;
+      } else if (/<\/main>/i.test(updated)) {
+        const mainClose = updated.toLowerCase().lastIndexOf('</main>');
+        updated = `${updated.slice(0, mainClose)}${screenSnippet}\n${updated.slice(mainClose)}`;
+        appliedCount += 1;
+      } else if (/<nav\b[^>]*class=["'][^"']*bottom/i.test(updated)) {
+        const navIdx = updated.search(/<nav\b[^>]*class=["'][^"']*bottom/i);
         updated = `${updated.slice(0, navIdx)}${screenSnippet}\n${updated.slice(navIdx)}`;
+        appliedCount += 1;
       } else if (/<script\b/i.test(updated)) {
         const scriptIdx = updated.toLowerCase().indexOf('<script');
         updated = `${updated.slice(0, scriptIdx)}${screenSnippet}\n${updated.slice(scriptIdx)}`;
+        appliedCount += 1;
       } else if (/<\/body>/i.test(updated)) {
-        updated = updated.replace(/<\/body>/i, `${screenSnippet}\n</body>`);
+        const bodyClose = updated.toLowerCase().lastIndexOf('</body>');
+        updated = `${updated.slice(0, bodyClose)}${screenSnippet}\n${updated.slice(bodyClose)}`;
+        appliedCount += 1;
       }
-      appliedCount += 1;
     }
 
-    // 4. APPEND_SCRIPT block
-    const jsMatch =
-      /<<<\s*APPEND_SCRIPT\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>|$)/i.exec(
-        block
-      );
-    if (jsMatch?.[1]?.trim()) {
-      const jsSnippet = jsMatch[1].trim();
-      if (/<\/script>/i.test(updated)) {
-        const lastIdx = updated.toLowerCase().lastIndexOf('</script>');
-        // Avoid injecting into aicraft safety script if present
-        const beforeSafety = updated.indexOf('data-aicraft-safety-js');
-        const targetCloseIdx =
-          beforeSafety !== -1
-            ? updated.toLowerCase().lastIndexOf('</script>', beforeSafety)
-            : lastIdx;
-        const idx = targetCloseIdx !== -1 ? targetCloseIdx : lastIdx;
-        updated = `${updated.slice(0, idx)}\n${jsSnippet}\n${updated.slice(idx)}`;
+    // 4. APPEND_SCRIPT blocks (all occurrences, inserted BEFORE data-aicraft-safety-js)
+    const jsRegex =
+      /<<<\s*APPEND_SCRIPT\s*>>>\s*\n?([\s\S]*?)(?=<<<\s*(?:SEARCH|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>|$)/gi;
+    for (const jsMatch of block.matchAll(jsRegex)) {
+      const jsSnippet = stripPatchMarkdownFences(jsMatch[1] || '');
+      if (!jsSnippet) continue;
+      const beforeSafety = updated.indexOf('data-aicraft-safety-js');
+      const targetCloseIdx =
+        beforeSafety !== -1
+          ? updated.toLowerCase().lastIndexOf('</script>', beforeSafety)
+          : updated.toLowerCase().lastIndexOf('</script>');
+      if (targetCloseIdx !== -1) {
+        updated = `${updated.slice(0, targetCloseIdx)}\n${jsSnippet}\n${updated.slice(targetCloseIdx)}`;
+        appliedCount += 1;
+      } else if (beforeSafety !== -1) {
+        const safetyScriptOpen = updated.toLowerCase().lastIndexOf('<script', beforeSafety);
+        if (safetyScriptOpen !== -1) {
+          updated = `${updated.slice(0, safetyScriptOpen)}<script>\n${jsSnippet}\n</script>\n${updated.slice(safetyScriptOpen)}`;
+          appliedCount += 1;
+        }
       } else if (/<\/body>/i.test(updated)) {
-        updated = updated.replace(/<\/body>/i, `<script>\n${jsSnippet}\n</script>\n</body>`);
+        const bodyClose = updated.toLowerCase().lastIndexOf('</body>');
+        updated = `${updated.slice(0, bodyClose)}<script>\n${jsSnippet}\n</script>\n${updated.slice(bodyClose)}`;
+        appliedCount += 1;
       }
-      appliedCount += 1;
     }
   }
 
@@ -1069,10 +1143,10 @@ export function sanitizeAndHardenPreviewHtml(html: string): string {
   const hasSafetyMarker = out.includes('data-aicraft-safety');
   if (!hasSafetyMarker) {
     const safetyStyle = `<style data-aicraft-safety="1">
-html { width: 100%; height: 100%; min-height: 100%; margin: 0; padding: 0; max-width: 100%; overflow-x: hidden; -webkit-tap-highlight-color: transparent; }
-body { width: 100%; min-height: 100%; margin: 0; padding: 0; max-width: 100%; overflow-x: hidden; }
-*, *::before, *::after { box-sizing: border-box; }
-nav[class*="bottom"], .bottom-nav, footer.app-nav, #bottom-nav { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+:where(html) { width: 100%; height: 100%; min-height: 100%; margin: 0; padding: 0; max-width: 100%; overflow-x: hidden; -webkit-tap-highlight-color: transparent; }
+:where(body) { width: 100%; min-height: 100%; margin: 0; padding: 0; max-width: 100%; overflow-x: hidden; }
+:where(*, *::before, *::after) { box-sizing: border-box; }
+:where(nav[class*="bottom"], .bottom-nav, footer.app-nav, #bottom-nav) { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
 </style>`;
     out = /<\/head>/i.test(out)
       ? out.replace(/<\/head>/i, `${safetyStyle}\n</head>`)
@@ -1263,9 +1337,11 @@ export function extractPreviewStructureSummary(previousHtml: string): string {
     .slice(0, 18)
     .map((m) => `<${m[1].toLowerCase()} id="${m[2]}">`);
 
-  const cssVars = Array.from(previousHtml.matchAll(/--([a-zA-Z0-9_-]{2,28})\s*:/g))
+  const cssVars = Array.from(
+    previousHtml.matchAll(/--([a-zA-Z0-9_-]{2,28})\s*:\s*([^;}\n]{1,42})/g)
+  )
     .slice(0, 14)
-    .map((m) => `--${m[1]}`);
+    .map((m) => `--${m[1]}: ${m[2].trim()}`);
 
   const dbTables = extractDbSchemaFromHtml(previousHtml).map(
     (t) => `${t.name}(${t.columns.map((c) => c.name).join(', ')})`
@@ -1292,7 +1368,7 @@ export function extractPreviewStructureSummary(previousHtml: string): string {
     themeMatch ? `Current browser theme-color: ${themeMatch[1].trim()}.` : '',
     logoMatch ? `Current app logo meta: ${logoMatch[0]}.` : '',
     screenMatches.length > 0 ? `Existing screens: ${screenMatches.join(', ')}.` : '',
-    cssVars.length > 0 ? `Existing CSS variables: ${Array.from(new Set(cssVars)).join(', ')}.` : '',
+    cssVars.length > 0 ? `Locked CSS design tokens (DO NOT change unless requested): ${Array.from(new Set(cssVars)).join('; ')}.` : '',
     dbTables.length > 0 ? `Existing window.AICraft.db tables: ${dbTables.join('; ')}.` : '',
     fnMatches.length > 0 ? `Existing JS functions: ${Array.from(new Set(fnMatches)).join(', ')}.` : '',
     items.length > 0 ? `Existing artifacts: ${items.join(', ')}.` : '',

@@ -421,13 +421,15 @@ export async function POST(request: Request): Promise<Response> {
                   type: 'phase',
                   phase: 'building',
                   kind: 'build',
-                  label: 'Writing real-time code...',
+                  label: codeStart.isPatch
+                    ? 'Applying surgical code updates...'
+                    : 'Writing real-time code...',
                 });
               }
 
               const htmlSoFar = cleanSoFar
                 .slice(codeStart.htmlOffset)
-                .replace(/<<<\s*END_AICRAFT_APP_HTML\s*>>>[\s\S]*/i, '');
+                .replace(/<<<\s*(?:END_AICRAFT_APP_HTML|END_PATCH|END_AICRAFT_PATCH)\s*>>>[\s\S]*/i, '');
               const artifacts = extractLiveBuildArtifacts(htmlSoFar);
               const paths = artifacts.map((a) => a.path);
               const filesKey = paths.join('|');
@@ -440,13 +442,17 @@ export async function POST(request: Request): Promise<Response> {
                 const active = artifacts[artifacts.length - 1];
                 sendEvent({
                   type: 'file',
-                  action: active?.action || 'Coding',
+                  action: codeStart.isPatch ? 'Updating' : active?.action || 'Coding',
                   path: active?.path || 'index.html',
                   allFiles: paths,
                   bytesBuilt: htmlSoFar.length,
                 });
               }
-              if (htmlSoFar.length >= 450 && htmlSoFar.length - lastPreviewBytesSent >= 1400) {
+              if (
+                !codeStart.isPatch &&
+                htmlSoFar.length >= 450 &&
+                htmlSoFar.length - lastPreviewBytesSent >= 1400
+              ) {
                 lastPreviewBytesSent = htmlSoFar.length;
                 const liveHtml = finalizePartialPreviewHtml(cleanSoFar);
                 if (liveHtml) {
