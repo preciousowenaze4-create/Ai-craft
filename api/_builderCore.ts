@@ -516,6 +516,31 @@ export function shouldRunChatSearch(message: string, hasPreviousHtml = false): b
   return true;
 }
 
+export function isGameBuildPrompt(message: string): boolean {
+  return /\b(games?|gmae|arcade|snake|tetris|pong|chess|ludo|checkers|sudoku|puzzle|shooter|racing|runner|flappy|platformer|blackjack|solitaire|memory\s*match|tic[\s-]*tac[\s-]*toe|wordle|brick\s*breaker|minesweeper|tower\s*defense|rpg|trivia\s*game)\b/i.test(
+    message
+  );
+}
+
+export function shouldSkipSlowWebSearchForBuild(
+  message: string,
+  hasAttachmentData = false
+): boolean {
+  if (hasAttachmentData) return false;
+  const text = message.trim();
+  const explicitlyWantsWebData =
+    /\b(search|google|look\s*up|online|internet|real\s*photos?|real\s*images?|real\s*videos?|youtube|tiktok|instagram|news|weather|stocks?|crypto|bitcoin|prices?|store|shop|ecommerce|marketplace|restaurant|hotel|clinic|hospital|flight)\b/i.test(
+      text
+    );
+  if (explicitlyWantsWebData) return false;
+
+  if (isGameBuildPrompt(text)) return true;
+
+  return /\b(calculator|timer|stopwatch|countdown|pomodoro|clock|alarm|converter|todo|to-do|checklist|notes?|drawing|sketchpad|paint|piano|drum\s*pad|dice|scoreboard|counter|flashcards?)\b/i.test(
+    text
+  );
+}
+
 export function classifyInitialRoute(
   message: string,
   previousHtml: string,
@@ -528,17 +553,17 @@ export function classifyInitialRoute(
   const wordCount = text.split(/\s+/).filter(Boolean).length;
 
   const isPoliteBuildCommand =
-    /^(?:can|could|would|will|please)\s+(?:you\s+)?(?:please\s+)?(?:build|create|make|design|code|craft|develop|fix|change|edit|update|add|remove|cut|delete|replace|redesign|upgrade|monetize|implement|connect|integrate|wire|turn|switch|put)\b/i.test(
+    /^(?:can|could|would|will|please)\s+(?:you\s+)?(?:please\s+)?(?:build|bulid|biuld|buil|create|creat|cretae|make|mak|design|desgin|code|craft|develop|devlop|fix|change|edit|update|add|remove|cut|delete|replace|redesign|upgrade|monetize|implement|connect|integrate|wire|turn|switch|put)\b/i.test(
       text
     );
 
   const hasExplicitAppArtifact =
-    /\b(app|mobile\s*app|ios\s*app|android\s*app|website|web\s*app|webpage|landing\s*page|site|storefront|dashboard|ecommerce|e-commerce|online\s*store|store|shop|portfolio|calculator|tracker|clone|prototype|ui|ux|screen|html|preview|widget|interface|todo|to-do|game|player|quiz|planner|calendar|timer|clock|notes|chat\s*app|social|feed|blog|portal|tool|system|manager|finder|generator|converter|form|login|signup|paywall|checkout|subscription|monetization|tiktok|instagram|youtube|spotify|netflix|twitter|whatsapp|uber|airbnb|amazon)\b/i.test(
+    /\b(app|mobile\s*app|ios\s*app|android\s*app|website|web\s*app|webpage|landing\s*page|site|storefront|dashboard|ecommerce|e-commerce|online\s*store|store|shop|portfolio|calculator|tracker|clone|prototype|ui|ux|screen|html|preview|widget|interface|todo|to-do|games?|gmae|arcade|snake|tetris|pong|chess|ludo|sudoku|puzzle|shooter|racing|flappy|player|quiz|planner|calendar|timer|clock|notes|chat\s*app|social|feed|blog|portal|tool|system|manager|finder|generator|converter|form|login|signup|paywall|checkout|subscription|monetization|tiktok|instagram|youtube|spotify|netflix|twitter|whatsapp|uber|airbnb|amazon)\b/i.test(
       text
     );
 
   const hasImperativeBuildVerb =
-    /\b(build|create|make|design|develop|generate|craft|code|scaffold|implement|redesign|upgrade|convert|monetize|integrate|connect|wire)\b/i.test(
+    /\b(build|bulid|biuld|buil|create|creat|cretae|make|mak|design|desgin|develop|devlop|generate|craft|code|scaffold|implement|redesign|upgrade|convert|monetize|integrate|connect|wire)\b/i.test(
       text
     );
 
@@ -560,7 +585,12 @@ export function classifyInitialRoute(
   }
 
   // Short casual greetings, names, reactions, or conversational single words with no build/app keywords -> immediate CHAT
-  if (wordCount <= 3 && !hasExplicitAppArtifact && !hasImperativeBuildVerb && !(previousHtml.trim().length > 0 && hasEditVerb)) {
+  if (
+    wordCount <= 3 &&
+    !hasExplicitAppArtifact &&
+    !hasImperativeBuildVerb &&
+    !(previousHtml.trim().length > 0 && hasEditVerb)
+  ) {
     return 'chat';
   }
 
@@ -583,7 +613,7 @@ export function classifyInitialRoute(
   if (
     (startsAsQuestion || /\?\s*$/.test(text)) &&
     !isPoliteBuildCommand &&
-    !/\b(build me|create me|make me|do my app|add .+ to (my|the) app|put .+ in (my|the) app)\b/i.test(
+    !/\b(build me|bulid me|create me|make me|do my app|add .+ to (my|the) app|put .+ in (my|the) app)\b/i.test(
       text
     )
   ) {
@@ -595,17 +625,20 @@ export function classifyInitialRoute(
       text
     ) &&
     !isPoliteBuildCommand &&
-    !/\b(do my app|build me|create me|make me)\b/i.test(text)
+    !/\b(do my app|build me|bulid me|create me|make me)\b/i.test(text)
   ) {
     return 'chat';
   }
 
-  if (hasExplicitAppArtifact && (hasImperativeBuildVerb || /\b(for me|like|with)\b/i.test(text))) {
+  if (
+    hasExplicitAppArtifact &&
+    (hasImperativeBuildVerb || /\b(for me|like|with)\b/i.test(text) || !startsAsQuestion)
+  ) {
     return 'build';
   }
 
   if (
-    /^(?:please\s+)?(?:build|create|make|design|scaffold|craft|monetize)\s+(?:me\s+)?(?:an?|the|my)\s+/i.test(
+    /^(?:please\s+)?(?:build|bulid|biuld|create|creat|make|mak|design|scaffold|craft|monetize)\s+(?:me\s+)?(?:an?|the|my)\s+/i.test(
       text
     ) &&
     !/\b(summary|poem|story|joke|essay|recipe|explanation|sentence|paragraph|list|plan)\b/i.test(
@@ -1783,6 +1816,7 @@ export function buildCraftSystemPrompt(params: {
   previewSummary: string;
   mode: 'mobile' | 'web';
   activeFlags: string[];
+  isGameBuild?: boolean;
 }): string {
   const {
     mediaKind,
@@ -1798,6 +1832,7 @@ export function buildCraftSystemPrompt(params: {
     previewSummary,
     mode,
     activeFlags,
+    isGameBuild = false,
   } = params;
 
   const targetLabel =
@@ -1894,7 +1929,9 @@ export function buildCraftSystemPrompt(params: {
     '  - (A) Full app build: `<<<AICRAFT_APP_HTML>>>` ...complete `<!DOCTYPE html>`... `<<<END_AICRAFT_APP_HTML>>>`',
     '  - (B) Surgical addition/edit on an existing app: `<<<AICRAFT_PATCH>>>` with exact `<<<SEARCH>>>...<<<REPLACE>>>...`, `<<<APPEND_CSS>>>`, `<<<APPEND_SCREEN>>>`, and/or `<<<APPEND_SCRIPT>>>` ending with `<<<END_PATCH>>>`',
     'MANDATORY REAL-APP COMPLETENESS & DYNAMIC ENGINEERING RULES FOR PART 2:',
-    `1. TARGET EXPERIENCE: Engineer a complete, genuinely functional ${targetLabel}. NEVER stop after building one screen or static non-working cards! Build 4 to 6 distinct, fully interactive screens using semantic containers: \`<section data-screen="<id>" data-screen-title="<Screen Name>">...</section>\`. Every screen must render real state dynamically via JS functions and respond to user clicks, inputs, filters, edits, and deletions.`,
+    isGameBuild
+      ? `1. PLAYABLE GAME ENGINE MODE (TARGET: ${targetLabel}): Build a genuinely FUN, immediately playable, tactile game — NEVER force 4–6 business CRUD screens onto a game! Include: (a) a crisp Title / Difficulty start screen or instant play arena with \`requestAnimationFrame\` 60fps delta-time loop on a HiDPI \`<canvas>\` (or responsive interactive game board for board/card/word games), (b) FULL mobile touch controls (drag/swipe + large >=48px on-screen D-pad/action buttons) AND desktop keyboard controls (Arrow keys/WASD/Space/P), (c) top HUD showing Score, Best Score, Lives/Wave/Timer, Pause, and Sound FX Mute toggle using synthesized Web Audio API beeps/chimes, (d) Game Over / Victory overlay with instant \`Play Again\` state reset (cancelling any stale intervals/RAF loops cleanly), and (e) real persistent High Score leaderboard stored in \`window.AICraft.db\` (\`scores\` table, seeded with 3 starter scores). If the user asked generally for "game" or "app like game", craft an addictive, polished Neon Arcade Striker / Brick & Orb Runner game that feels awesome on the very first tap.`
+      : `1. TARGET EXPERIENCE: Engineer a complete, genuinely functional ${targetLabel}. NEVER stop after building one screen or static non-working cards! Build 4 to 6 distinct, fully interactive screens using semantic containers: \`<section data-screen="<id>" data-screen-title="<Screen Name>">...</section>\`. Every screen must render real state dynamically via JS functions and respond to user clicks, inputs, filters, edits, and deletions.`,
     '2. ZERO FRAGILE EXTERNAL CDNs FOR STYLING OR ICONS: Write ALL layout, spacing, typography, cards, feeds, modals, and animations cleanly inside `<style>...</style>`. DO NOT depend on `cdn.tailwindcss.com`, `unpkg.com/lucide`, React/Babel `<script type="text/babel">`, or icon font CDNs — use PURE INLINE `<svg>` paths (`width="20" height="20" viewBox="0 0 24 24"`) on EVERY icon button so icons never disappear!',
     '3. ZERO BLANK SCREEN / ZERO EMPTY BLACK FEED & FULL-BLEED VIEWPORT MATH: Use `html, body { margin: 0; padding: 0; width: 100%; height: 100%; min-height: 100dvh; overflow: hidden; background: <matching app surface color>; }` for fixed-nav shells (NO mismatched outer board or bottom white strip!). Every middle scrollable area or feed between top bar & bottom nav MUST have `flex: 1; min-height: 0; overflow-y: auto;` so it NEVER collapses to 0px height! ALWAYS show the default primary screen visible immediately in CSS (`[data-screen].active, [data-screen]:first-of-type { display: flex; }`) BEFORE JavaScript runs, so the screen is NEVER empty!',
     '4. PLAYABLE VIDEO & RICH MEDIA APPS (NO EMPTY BLACK VIDEO BOXES): Whenever building any video feed, reels, short-video, streaming, or discovery app, use real playable HTTPS video URLs from `Verified Video Search Results` AND live `await window.AICraft.search(topic)` (`{ videos, images, results }`). Always set `poster`, `playsinline`, `muted`, `loop`, interactive tap-to-play/pause + mute/unmute controls, swipe/snap scrolling (`scroll-snap-type: y mandatory`), real author overlays, working likes/comments/bookmarks in `window.AICraft.db`, and graceful `poster` + animated canvas/artwork fallback if any clip is still buffering — NEVER leave an empty black center!',

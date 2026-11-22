@@ -2,11 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDown,
   ArrowUp,
-  ArrowUpRight,
   BadgeCheck,
   Check,
   CheckCircle2,
-  ChevronDown,
   ChevronLeft,
   Code2,
   Copy,
@@ -15,18 +13,17 @@ import {
   Eye,
   Film,
   Globe,
-  HelpCircle,
   Image as ImageIcon,
   KeyRound,
-  Lightbulb,
   Loader2,
   MoreVertical,
   Music,
   Paperclip,
+  Pencil,
   Rocket,
-  Search,
+  RotateCcw,
+  Save,
   ShieldAlert,
-  Sparkles,
   Square,
   Volume2,
   X,
@@ -48,6 +45,10 @@ import {
   WorkspaceView,
 } from '../types/craft';
 import { ProcessedAttachment, readAttachmentFile } from '../utils/attachment';
+import {
+  applyFileEditToHtml,
+  extractEditableCodeFiles,
+} from '../utils/codeFileEditor';
 import { buildProjectSecretHints } from '../utils/secretHints';
 import { FloatingLogoMenu } from './FloatingLogoMenu';
 import { LivingBotanicalWallpaper } from './LivingBotanicalWallpaper';
@@ -58,7 +59,6 @@ import {
   ProjectSecretsModal,
 } from './ProjectConfigDrawers';
 import { ProviderLogo } from './ProviderLogo';
-import { ScreenStudioStrip } from './ScreenStudioStrip';
 import { VoiceInputButton } from './VoiceInputButton';
 
 function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
@@ -128,7 +128,8 @@ interface BuilderWorkspaceProps {
   onPublish: () => void;
   onUpdateSecrets: (next: ProjectSecret[]) => Promise<SecretSaveResult> | SecretSaveResult | void;
   onUpdateDatabase: (next: ProjectDatabaseConfig) => void;
-  onDeployProject: (slug: string) => void;
+  onUpdatePreviewHtml?: (nextHtml: string) => Promise<void> | void;
+  onDeployProject: (slug: string) => Promise<boolean> | void;
   onBack: () => void;
   onSendFollowUp: (message: string, options: ComposerOptions) => void;
   onContinueTurn: (turn: BuilderTurn) => void;
@@ -169,6 +170,7 @@ export function BuilderWorkspace({
   onPublish,
   onUpdateSecrets,
   onUpdateDatabase,
+  onUpdatePreviewHtml,
   onDeployProject,
   onBack,
   onSendFollowUp,
@@ -192,11 +194,15 @@ export function BuilderWorkspace({
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);
   const [activeDrawer, setActiveDrawer] = useState<'secrets' | 'database' | 'deploy' | null>(null);
   const [showHeaderActions, setShowHeaderActions] = useState(false);
-  const [autoAllow, setAutoAllow] = useState(true);
+  const [expandedPlanTurns, setExpandedPlanTurns] = useState<Record<string, boolean>>({});
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const [previewKey, setPreviewKey] = useState(0);
   const [copiedCode, setCopiedCode] = useState(false);
-  const [activeCodeTab, setActiveCodeTab] = useState<'index.html' | 'styles.css' | 'app.js'>('index.html');
+  const [activeCodeTab, setActiveCodeTab] = useState<string>('index.html');
+  const [isEditingCode, setIsEditingCode] = useState(false);
+  const [codeDraft, setCodeDraft] = useState('');
+  const [codeEditError, setCodeEditError] = useState<string | null>(null);
+  const [codeSaveNotice, setCodeSaveNotice] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [previewSurfaceBg, setPreviewSurfaceBg] = useState<string>('#ffffff');
 
@@ -264,6 +270,9 @@ export function BuilderWorkspace({
     setShowHeaderActions(false);
     setShowScrollBottom(false);
     setActiveCodeTab('index.html');
+    setIsEditingCode(false);
+    setCodeEditError(null);
+    setCodeSaveNotice(null);
   }, [projectId, stopVoice]);
 
   const {
@@ -318,38 +327,38 @@ export function BuilderWorkspace({
   }, [activeView, hasBuiltApp, previewSurfaceBg]);
 
   const codeParts = useMemo(() => {
-    if (!latestPreviewHtml) {
-      return [{ id: 'index.html' as const, label: 'index.html', content: '' }];
-    }
-    const parts: Array<{ id: 'index.html' | 'styles.css' | 'app.js'; label: string; content: string }> = [
-      { id: 'index.html', label: 'index.html', content: latestPreviewHtml },
-    ];
-    const styleMatches = Array.from(
-      latestPreviewHtml.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)
-    )
-      .map((m) => m[1]?.trim() ?? '')
-      .filter(Boolean);
-    if (styleMatches.length > 0) {
-      parts.push({
-        id: 'styles.css',
-        label: 'styles.css',
-        content: styleMatches.join('\n\n'),
+    const editableFiles = extractEditableCodeFiles(latestPreviewHtml);
+    if (databaseConfig.tables.length > 0 && latestPreviewHtml.trim()) {
+      const schemaSql = databaseConfig.tables
+        .map((t) => {
+          const cols = t.columns.map((c) => {
+            const sqlType =
+              c.type === 'number'
+                ? 'NUMERIC'
+                : c.type === 'boolean'
+                  ? 'BOOLEAN DEFAULT false'
+                  : c.type === 'timestamp'
+                    ? 'TIMESTAMPTZ DEFAULT now()'
+                    : c.type === 'json'
+                      ? "JSONB DEFAULT '{}'::jsonb"
+                      : c.name === 'id'
+                        ? 'TEXT PRIMARY KEY'
+                        : 'TEXT';
+            return `  ${c.name} ${sqlType}`;
+          });
+          return `CREATE TABLE IF NOT EXISTS ${t.name} (\n${cols.join(',\n')}\n);`;
+        })
+        .join('\n\n');
+      editableFiles.push({
+        id: 'database/schema.sql',
+        label: 'database/schema.sql',
+        content: schemaSql,
+        kind: 'sql',
+        editable: false,
       });
     }
-    const scriptMatches = Array.from(
-      latestPreviewHtml.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)
-    )
-      .map((m) => m[1]?.trim() ?? '')
-      .filter(Boolean);
-    if (scriptMatches.length > 0) {
-      parts.push({
-        id: 'app.js',
-        label: 'app.js',
-        content: scriptMatches.join('\n\n'),
-      });
-    }
-    return parts;
-  }, [latestPreviewHtml]);
+    return editableFiles;
+  }, [latestPreviewHtml, databaseConfig.tables]);
 
   const databaseConfigRef = useRef(databaseConfig);
   databaseConfigRef.current = databaseConfig;
@@ -1707,10 +1716,11 @@ export function BuilderWorkspace({
     return 'Ready to share';
   };
 
-  const handleCopyCode = async () => {
-    if (!latestPreviewHtml) return;
+  const handleCopyCode = async (textOverride?: string) => {
+    const content = textOverride ?? latestPreviewHtml;
+    if (!content) return;
     try {
-      await navigator.clipboard.writeText(latestPreviewHtml);
+      await navigator.clipboard.writeText(content);
       setCopiedCode(true);
       window.setTimeout(() => setCopiedCode(false), 2000);
     } catch {
@@ -1754,51 +1764,131 @@ export function BuilderWorkspace({
     );
   }
 
-  // Code Viewer Mode (accessed from clicking the floating round logo -> View App Code)
+  // Built-In Code Viewer & Live File Editor
   if (activeView === 'code') {
     const selectedCodePart =
       codeParts.find((p) => p.id === activeCodeTab) ?? codeParts[0];
+    const displayedContent = isEditingCode
+      ? codeDraft
+      : selectedCodePart?.content || '';
+    const lineCount = displayedContent ? displayedContent.split('\n').length : 0;
+    const kbLabel = `${(displayedContent.length / 1024).toFixed(1)} KB`;
+
+    const handleBeginCodeEdit = () => {
+      if (!selectedCodePart || !selectedCodePart.editable || isStreaming) return;
+      setCodeEditError(null);
+      setCodeSaveNotice(null);
+      setCodeDraft(selectedCodePart.content);
+      setIsEditingCode(true);
+    };
+
+    const handleApplyCodeEdit = async () => {
+      if (!selectedCodePart || !latestPreviewHtml || !onUpdatePreviewHtml) return;
+      const result = applyFileEditToHtml(
+        latestPreviewHtml,
+        selectedCodePart.id,
+        codeDraft
+      );
+      if (!result.ok) {
+        setCodeEditError(result.error);
+        return;
+      }
+      setCodeEditError(null);
+      await onUpdatePreviewHtml(result.html);
+      setIsEditingCode(false);
+      setPreviewKey((k) => k + 1);
+      setCodeSaveNotice(`Saved ${selectedCodePart.label} & refreshed Preview`);
+      window.setTimeout(() => setCodeSaveNotice(null), 2600);
+    };
 
     return (
       <div className="relative h-dvh w-full flex flex-col bg-white overflow-hidden">
         <header className="shrink-0 w-full bg-white border-b border-black/[0.06] pt-safe">
-          <div className="w-full max-w-[680px] lg:max-w-[880px] 2xl:max-w-[1060px] mx-auto px-3 py-2 flex items-center justify-between gap-2">
+          <div className="w-full max-w-[680px] lg:max-w-[960px] 2xl:max-w-[1160px] mx-auto px-3 py-2 flex items-center justify-between gap-2">
             <div className="flex items-center gap-1.5 min-w-0">
               <button
                 type="button"
-                onClick={() => onSetView('preview')}
+                onClick={() => {
+                  setIsEditingCode(false);
+                  setCodeEditError(null);
+                  onSetView('preview');
+                }}
                 aria-label="Back to Preview"
                 className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#0B0B0F] hover:bg-black/[0.04] active:scale-95 transition-all shrink-0"
               >
                 <ChevronLeft className="w-6 h-6 stroke-[2]" />
               </button>
-              <h1 className="font-display font-bold text-[16px] tracking-[-0.02em] text-[#0B0B0F] truncate">
-                {projectTitle} · Code
-              </h1>
+              <div className="min-w-0">
+                <h1 className="font-display font-bold text-[15.5px] tracking-[-0.02em] text-[#0B0B0F] truncate">
+                  {projectTitle} · Code
+                </h1>
+                <p className="text-[11px] text-[#71717A] font-mono tabular-nums truncate">
+                  {selectedCodePart?.label} · {lineCount} lines · {kbLabel}
+                </p>
+              </div>
             </div>
 
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex items-center gap-1.5 shrink-0">
+              {selectedCodePart?.editable && hasBuiltApp && onUpdatePreviewHtml && !isStreaming && (
+                isEditingCode ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsEditingCode(false);
+                        setCodeEditError(null);
+                      }}
+                      className="h-9 px-2.5 rounded-xl border border-black/15 bg-white text-xs font-medium text-[#52525B] hover:bg-black/[0.03] inline-flex items-center gap-1"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span className="hidden sm:inline">Cancel</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleApplyCodeEdit()}
+                      className="h-9 px-3 rounded-xl bg-[#6D4AFF] hover:bg-[#5B35F5] text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      <Save className="w-3.5 h-3.5" />
+                      <span>Save & Preview</span>
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleBeginCodeEdit}
+                    className="h-9 px-3 rounded-xl border border-black/15 bg-white text-xs font-medium text-[#0B0B0F] hover:bg-black/[0.03] inline-flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                    <span>Edit</span>
+                  </button>
+                )
+              )}
+
               <button
                 type="button"
-                onClick={() => void handleCopyCode()}
-                className="h-9 px-3 rounded-xl border border-black/15 bg-white text-xs font-medium text-[#0B0B0F] hover:bg-black/[0.03] flex items-center gap-1.5 whitespace-nowrap"
+                onClick={() => void handleCopyCode(displayedContent)}
+                className="h-9 px-2.5 sm:px-3 rounded-xl border border-black/15 bg-white text-xs font-medium text-[#0B0B0F] hover:bg-black/[0.03] inline-flex items-center gap-1.5 whitespace-nowrap"
               >
                 {copiedCode ? (
                   <>
                     <Check className="w-3.5 h-3.5 text-[#0D6BFF]" />
-                    <span>Copied</span>
+                    <span className="hidden sm:inline">Copied</span>
                   </>
                 ) : (
                   <>
                     <Copy className="w-3.5 h-3.5" />
-                    <span>Copy Code</span>
+                    <span className="hidden sm:inline">Copy</span>
                   </>
                 )}
               </button>
 
               <button
                 type="button"
-                onClick={() => onSetView('chat')}
+                onClick={() => {
+                  setIsEditingCode(false);
+                  setCodeEditError(null);
+                  onSetView('chat');
+                }}
                 className="h-9 px-3 rounded-xl bg-[#0B0B0F] text-white text-xs font-medium whitespace-nowrap"
               >
                 Chat
@@ -1806,15 +1896,19 @@ export function BuilderWorkspace({
             </div>
           </div>
 
-          {codeParts.length > 1 && (
-            <div className="w-full max-w-[680px] lg:max-w-[880px] 2xl:max-w-[1060px] mx-auto px-3 pb-2 flex items-center gap-1.5 overflow-x-auto">
+          {codeParts.length > 0 && (
+            <div className="w-full max-w-[680px] lg:max-w-[960px] 2xl:max-w-[1160px] mx-auto px-3 pb-2 flex items-center gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               {codeParts.map((part) => {
-                const isSelected = selectedCodePart.id === part.id;
+                const isSelected = selectedCodePart?.id === part.id;
                 return (
                   <button
                     key={part.id}
                     type="button"
-                    onClick={() => setActiveCodeTab(part.id)}
+                    onClick={() => {
+                      setActiveCodeTab(part.id);
+                      setIsEditingCode(false);
+                      setCodeEditError(null);
+                    }}
                     className={`px-3 py-1 rounded-lg text-xs font-mono transition-colors shrink-0 ${
                       isSelected
                         ? 'bg-[#0B0B0F] text-white'
@@ -1829,10 +1923,38 @@ export function BuilderWorkspace({
           )}
         </header>
 
-        <div className="flex-1 min-h-0 overflow-auto bg-[#0F1117] text-[#E4E4E7] p-4">
-          <pre className="w-full max-w-[680px] lg:max-w-[880px] 2xl:max-w-[1060px] mx-auto text-[12.5px] leading-relaxed font-mono whitespace-pre-wrap break-words">
-            <code>{selectedCodePart?.content || 'No generated code yet.'}</code>
-          </pre>
+        {(codeEditError || codeSaveNotice) && (
+          <div className="shrink-0 bg-[#181822] border-b border-white/10 px-4 py-2">
+            <div className="w-full max-w-[680px] lg:max-w-[960px] 2xl:max-w-[1160px] mx-auto">
+              {codeEditError ? (
+                <p role="alert" className="text-xs font-medium text-red-400">
+                  {codeEditError}
+                </p>
+              ) : (
+                <p role="status" className="text-xs font-medium text-emerald-400">
+                  {codeSaveNotice}
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="flex-1 min-h-0 flex flex-col bg-[#0F1117] text-[#E4E4E7]">
+          {isEditingCode ? (
+            <textarea
+              value={codeDraft}
+              onChange={(e) => setCodeDraft(e.target.value)}
+              spellCheck={false}
+              aria-label={`Edit ${selectedCodePart?.label || 'file'}`}
+              className="flex-1 min-h-0 w-full max-w-[680px] lg:max-w-[960px] 2xl:max-w-[1160px] mx-auto p-4 bg-[#0F1117] text-[#E4E4E7] text-[12.5px] leading-relaxed font-mono resize-none focus:outline-none"
+            />
+          ) : (
+            <div className="flex-1 min-h-0 overflow-auto p-4">
+              <pre className="w-full max-w-[680px] lg:max-w-[960px] 2xl:max-w-[1160px] mx-auto text-[12.5px] leading-relaxed font-mono whitespace-pre-wrap break-words">
+                <code>{selectedCodePart?.content || 'No generated code yet.'}</code>
+              </pre>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1896,17 +2018,39 @@ export function BuilderWorkspace({
         {/* Inline non-overlapping action strip when menu toggled */}
         {showHeaderActions && (
           <div className="w-full max-w-[540px] md:max-w-[720px] lg:max-w-[880px] 2xl:max-w-[1060px] mx-auto px-4 pb-2.5 flex items-center justify-between gap-2 border-t border-black/[0.04] pt-2 text-xs">
-            <span className="text-[#52525B] font-medium">
-              Target: {theme.label}
+            <span className="text-[#52525B] font-medium truncate">
+              {theme.label}
             </span>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowHeaderActions(false);
+                  onOpenSettings();
+                }}
+                className="px-3 py-1.5 rounded-lg bg-[#F4F4F6] text-[#0B0B0F] font-medium hover:bg-[#E4E4E7] whitespace-nowrap"
+              >
+                Settings
+              </button>
+              {!isOwner && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowHeaderActions(false);
+                    onOpenUpgrade();
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-[#F5F3FF] text-[#6D4AFF] font-medium hover:bg-[#EDE9FE] whitespace-nowrap"
+                >
+                  Upgrade
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
                   setShowHeaderActions(false);
                   onOpenApps();
                 }}
-                className="px-3 py-1.5 rounded-full bg-[#F4F4F6] text-[#0B0B0F] font-medium hover:bg-[#E4E4E7]"
+                className="px-3 py-1.5 rounded-lg bg-[#F4F4F6] text-[#0B0B0F] font-medium hover:bg-[#E4E4E7] whitespace-nowrap"
               >
                 Apps
               </button>
@@ -1916,7 +2060,7 @@ export function BuilderWorkspace({
                   setShowHeaderActions(false);
                   onBack();
                 }}
-                className="px-3 py-1.5 rounded-full bg-[#0B0B0F] text-white font-medium"
+                className="px-3 py-1.5 rounded-lg bg-[#0B0B0F] text-white font-medium whitespace-nowrap"
               >
                 New Build
               </button>
@@ -1939,47 +2083,51 @@ export function BuilderWorkspace({
               const isTurnWorking =
                 turn.phase === 'understanding' || turn.phase === 'building';
               const displayAiText = sanitizeDisplayProse(turn.aiText, isBuildTurn);
-
               const isPausedTurn = turn.phase === 'paused';
-              const stepBuildingDone = turn.phase === 'complete';
+
+              const elapsedSec = isTurnWorking
+                ? turn.startedAt
+                  ? Math.max(1, Math.floor((nowMs - turn.startedAt) / 1000))
+                  : Math.max(1, turn.thoughtSeconds)
+                : Math.max(1, turn.thoughtSeconds);
+
+              const activeStageIndex: 0 | 1 | 2 = (() => {
+                if (!isTurnWorking) return 2;
+                const actionLower = (turn.activeAction || '').toLowerCase();
+                if (actionLower.includes('check') || actionLower.includes('verify')) return 2;
+                if (
+                  turn.phase === 'building' ||
+                  actionLower.includes('cod') ||
+                  Boolean(turn.activeFile) ||
+                  (turn.bytesBuilt ?? 0) > 0
+                ) {
+                  return 1;
+                }
+                return 0;
+              })();
+
+              const isPlanOpen = Boolean(expandedPlanTurns[turn.id]);
+              const togglePlan = () =>
+                setExpandedPlanTurns((prev) => ({ ...prev, [turn.id]: !prev[turn.id] }));
 
               const turnModelName =
-                turn.modelName ||
-                models.find((m) => m.id === turn.modelId)?.name ||
-                activeModel?.name ||
-                'AI Craft Pro (4 Hydrogen)';
+                models.length > 1
+                  ? turn.modelName ||
+                    models.find((m) => m.id === turn.modelId)?.name ||
+                    activeModel?.name ||
+                    'AI Craft'
+                  : 'AI Craft';
 
-              const liveActionText = (() => {
-                if (!isTurnWorking) return '';
-                const act = (turn.activeAction || '').trim();
-                if (act) return act;
-                if (turn.phase === 'building') {
-                  return isMediaTurn ? 'Creating' : 'Building';
-                }
-                return displayAiText.length > 0 ? 'Responding' : 'Thinking';
-              })();
-
-              const LiveActionIcon = (() => {
-                const lowerAct = liveActionText.toLowerCase();
-                if (lowerAct.includes('search')) return Search;
-                if (lowerAct.includes('design')) return Sparkles;
-                if (
-                  lowerAct.includes('cod') ||
-                  lowerAct.includes('writ') ||
-                  lowerAct.includes('styl') ||
-                  lowerAct.includes('script') ||
-                  lowerAct.includes('build')
-                ) {
-                  return Code2;
-                }
-                return Lightbulb;
-              })();
+              const stageSteps = ['Building', 'Coding', 'Checking'] as const;
+              const showLivePipelineCard =
+                isTurnWorking && (isBuildTurn || turn.phase === 'building' || Boolean(turn.activeFile));
+              const previewBytes = turn.bytesBuilt || turn.previewHtml?.length || 0;
 
               return (
-                <article key={turn.id} className="flex flex-col gap-3.5">
+                <article key={turn.id} className="flex flex-col gap-3">
                   {/* User Message Bubble */}
                   <div className="flex justify-end">
-                    <div className="max-w-[88%] rounded-2xl rounded-br-sm bg-[#F4F4F6] px-3.5 py-2.5 text-[14.5px] leading-snug text-[#111118]">
+                    <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-[#F4F4F6] px-3.5 py-2.5 text-[14.5px] leading-snug text-[#111118]">
                       {turn.attachmentDataUrl && (
                         <img
                           src={turn.attachmentDataUrl}
@@ -1996,130 +2144,109 @@ export function BuilderWorkspace({
                     </div>
                   </div>
 
-                  {/* Active AI Model Brand Row with Real-Time Activity Tracking */}
-                  <div className="flex items-center justify-between pt-0.5 gap-2">
-                    <div className="flex items-center gap-2.5 min-w-0">
+                  {/* Clean AI Attribution Row */}
+                  <div className="flex items-center justify-between gap-2 pt-0.5">
+                    <div className="flex items-center gap-2 min-w-0">
                       <ProviderLogo
                         provider={turn.modelProvider || activeModel?.provider}
                         modelId={turn.modelId || selectedModel}
-                        size={22}
+                        size={20}
                         isTracking={isTurnWorking}
                         trackingColor={theme.accentColor}
                       />
-                      <div className="min-w-0 flex items-center gap-2">
-                        <span className="font-display font-bold text-[14.5px] tracking-[-0.01em] text-[#0B0B0F] truncate">
-                          {turnModelName}
-                        </span>
-                        {isTurnWorking && (
-                          <span
-                            className="inline-flex items-center gap-1 text-[11.5px] font-semibold shrink-0"
-                            style={{ color: theme.accentColor }}
-                          >
-                            <span>{liveActionText}</span>
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Live Activity & Thought Timer Row */}
-                  <div className="flex items-center justify-between gap-2 text-[13.5px] text-[#71717A]">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <LiveActionIcon
-                        className={`w-[16px] h-[16px] shrink-0 stroke-[1.8] ${
-                          isTurnWorking ? 'animate-pulse' : ''
-                        }`}
-                        style={isTurnWorking ? { color: theme.accentColor } : undefined}
-                      />
-                      <span className="tabular-nums truncate">
+                      <span className="font-display font-semibold text-[14px] tracking-[-0.01em] text-[#0B0B0F] truncate">
+                        {turnModelName}
+                      </span>
+                      <span aria-hidden="true" className="text-[#A1A1AA] text-xs">
+                        ·
+                      </span>
+                      <span className="text-[12.5px] text-[#71717A] tabular-nums truncate">
                         {isTurnWorking
-                          ? `${turn.phaseLabel || liveActionText}${
-                              turn.activeFile && turn.phase === 'building'
-                                ? ` · ${turn.activeFile}`
-                                : ''
-                            } (${
-                              turn.startedAt
-                                ? Math.max(1, Math.floor((nowMs - turn.startedAt) / 1000))
-                                : Math.max(1, turn.thoughtSeconds)
-                            }s)`
+                          ? `${stageSteps[activeStageIndex]} · ${elapsedSec}s`
                           : isPausedTurn
-                            ? `Paused at ${Math.max(1, turn.thoughtSeconds)}s`
-                            : `Thought for ${Math.max(1, turn.thoughtSeconds)}s`}
+                            ? `Paused · ${elapsedSec}s`
+                            : `${elapsedSec}s`}
                       </span>
                     </div>
+
                     {isTurnWorking && (turn.bytesBuilt ?? 0) > 0 && (
-                      <span className="text-[11.5px] font-mono text-[#52525B] shrink-0 tabular-nums">
+                      <span className="text-[11.5px] font-mono text-[#71717A] shrink-0 tabular-nums">
                         {((turn.bytesBuilt ?? 0) / 1024).toFixed(1)} KB
                       </span>
                     )}
                   </div>
 
-                  {/* Calm Replit-Style Step-by-Step Thinking & Blue-Checkmark Plan */}
-                  {turn.planSteps && turn.planSteps.length > 0 && (
-                    <div className="rounded-2xl border border-black/[0.08] bg-[#F7F7FA] px-4 py-3 flex flex-col gap-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[11.5px] font-semibold uppercase tracking-[0.04em] text-[#52525B]">
-                          Real-Time Build Plan
-                        </span>
-                        <span className="text-[11.5px] font-medium text-[#0D5BFF] tabular-nums">
-                          {turn.phase === 'understanding'
-                            ? `Planning · Step ${turn.planSteps.length}`
-                            : `${turn.planSteps.length} ${turn.planSteps.length === 1 ? 'step' : 'steps'}`}
-                        </span>
-                      </div>
-                      <ul className="space-y-1.5 text-[13px] leading-snug">
-                        {turn.planSteps.map((step, idx) => {
-                          const isActivePlanStep =
-                            turn.phase === 'understanding' &&
-                            idx === turn.planSteps!.length - 1;
+                  {/* Clean Real-Time Building -> Coding -> Checking Tracker (while active) */}
+                  {showLivePipelineCard && (
+                    <div className="rounded-2xl border border-black/[0.08] bg-[#FAFAFC] px-3.5 py-3 flex flex-col gap-2.5">
+                      <div className="flex items-center gap-2 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                        {stageSteps.map((stageLabel, idx) => {
+                          const isDone = idx < activeStageIndex;
+                          const isActive = idx === activeStageIndex;
                           return (
-                            <li
-                              key={`${turn.id}-plan-${idx}`}
-                              className="flex items-start gap-2"
-                            >
-                              {isActivePlanStep ? (
-                                <Loader2 className="w-3.5 h-3.5 mt-0.5 animate-spin text-[#0D5BFF] shrink-0" />
-                              ) : (
-                                <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 text-[#0D5BFF] shrink-0" />
-                              )}
-                              <span
-                                className={
-                                  isActivePlanStep
-                                    ? 'text-[#111118] font-medium'
-                                    : 'text-[#3F3F46]'
-                                }
+                            <div key={stageLabel} className="flex items-center gap-2 shrink-0">
+                              <div
+                                className={`inline-flex items-center gap-1.5 text-[12.5px] font-medium ${
+                                  isActive
+                                    ? 'text-[#0B0B0F]'
+                                    : isDone
+                                      ? 'text-[#3F3F46]'
+                                      : 'text-[#A1A1AA]'
+                                }`}
                               >
-                                {step}
-                              </span>
-                            </li>
+                                {isActive ? (
+                                  <Loader2
+                                    className="w-3.5 h-3.5 animate-spin shrink-0"
+                                    style={{ color: theme.accentColor }}
+                                  />
+                                ) : isDone ? (
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-[#0D5BFF] shrink-0" />
+                                ) : (
+                                  <span className="w-2 h-2 rounded-full bg-black/15 shrink-0" />
+                                )}
+                                <span>{stageLabel}</span>
+                              </div>
+                              {idx < stageSteps.length - 1 && (
+                                <span aria-hidden="true" className="text-[#D4D4D8] text-xs">
+                                  /
+                                </span>
+                              )}
+                            </div>
                           );
                         })}
-                      </ul>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2 text-[12.5px] text-[#52525B]">
+                        <span className="truncate">
+                          {activeStageIndex === 1 && turn.activeFile
+                            ? `Coding ${turn.activeFile}`
+                            : turn.phaseLabel || `${stageSteps[activeStageIndex]}...`}
+                        </span>
+                        {turn.planSteps && turn.planSteps.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={togglePlan}
+                            className="shrink-0 text-[12px] font-medium text-[#0B0B0F] hover:opacity-75 whitespace-nowrap"
+                          >
+                            {isPlanOpen ? 'Hide steps' : `Steps (${turn.planSteps.length})`}
+                          </button>
+                        )}
+                      </div>
+
+                      {isPlanOpen && turn.planSteps && turn.planSteps.length > 0 && (
+                        <ul className="pt-1.5 border-t border-black/[0.06] space-y-1 text-[12.5px] text-[#3F3F46]">
+                          {turn.planSteps.map((step, idx) => (
+                            <li key={`${turn.id}-live-plan-${idx}`} className="flex items-start gap-1.5">
+                              <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 text-[#0D5BFF] shrink-0" />
+                              <span>{step}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                     </div>
                   )}
 
-                  {/* Live Horizontally Scrollable Multi-Screen Studio Canvas (Real-Time Screen Previews) */}
-                  {isBuildTurn &&
-                    (turn.phase === 'building' ||
-                      turn.phase === 'paused' ||
-                      turn.phase === 'complete' ||
-                      Boolean(turn.previewHtml) ||
-                      turn.files.length > 0) && (
-                      <ScreenStudioStrip
-                        html={turn.previewHtml}
-                        mode={mode}
-                        isWorking={isTurnWorking}
-                        phaseLabel={turn.phaseLabel}
-                        plannedTotalCount={
-                          turn.planSteps && turn.planSteps.length >= 4
-                            ? turn.planSteps.length
-                            : 5
-                        }
-                        onOpenPreview={() => onSetView('preview')}
-                      />
-                    )}
-
-                  {/* Live Streaming AI Response Prose (Raw code strictly excluded) */}
+                  {/* AI Response Prose or Error */}
                   {turn.errorMessage ? (
                     <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-[14px] text-red-700 leading-relaxed flex flex-col gap-2.5">
                       <span>{turn.errorMessage}</span>
@@ -2135,61 +2262,120 @@ export function BuilderWorkspace({
                       </div>
                     </div>
                   ) : (
-                    <div className="flex items-start justify-between gap-2.5">
-                      <div className="flex-1 min-w-0 text-[15.5px] leading-[1.58] tracking-[-0.005em] text-[#111118] whitespace-pre-wrap">
-                        {displayAiText || (
-                          <span className="text-[#71717A]">
-                            {isBuildTurn && turn.phase !== 'understanding'
-                              ? isTurnWorking
-                                ? `Building your real-time ${
-                                    mode === 'mobile'
-                                      ? 'iOS & Android'
-                                      : 'full-stack web'
-                                  } app...`
-                                : 'Your real-time app is ready. Tap Preview to open it.'
-                              : turn.phase === 'building'
-                                ? turn.phaseLabel || 'Creating media...'
-                                : turn.phase === 'understanding'
-                                  ? 'Thinking...'
+                    (displayAiText || !showLivePipelineCard) && (
+                      <div className="flex items-start justify-between gap-2.5">
+                        <div className="flex-1 min-w-0 text-[15px] leading-[1.6] tracking-[-0.005em] text-[#111118] whitespace-pre-wrap">
+                          {displayAiText || (
+                            <span className="text-[#71717A]">
+                              {isTurnWorking
+                                ? turn.phaseLabel || 'Thinking...'
+                                : isBuildTurn
+                                  ? 'Your app is ready to preview.'
                                   : 'Waiting for response...'}
-                          </span>
-                        )}
-                        {isTurnWorking && displayAiText && (
-                          <span
-                            aria-hidden="true"
-                            className="inline-block w-1.5 h-4 ml-1 align-middle bg-[#7A68F6]/75 rounded-xs"
-                          />
+                            </span>
+                          )}
+                          {isTurnWorking && displayAiText && (
+                            <span
+                              aria-hidden="true"
+                              className="inline-block w-1.5 h-4 ml-1 align-middle bg-[#7A68F6]/75 rounded-xs"
+                            />
+                          )}
+                        </div>
+
+                        {ttsSupported &&
+                          turn.phase === 'complete' &&
+                          displayAiText.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => speakTurn(turn.id, displayAiText)}
+                              aria-label={
+                                speakingTurnId === turn.id
+                                  ? 'Replay message from beginning'
+                                  : 'Read message aloud'
+                              }
+                              title="Replay audio"
+                              className={`mt-0.5 min-w-[36px] min-h-[36px] rounded-full border flex items-center justify-center shrink-0 transition-all active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6] ${
+                                speakingTurnId === turn.id
+                                  ? 'border-transparent text-white shadow-xs'
+                                  : 'border-black/10 bg-[#F7F7FA] text-[#52525B] hover:bg-[#EFEFF5] hover:text-[#111118]'
+                              }`}
+                              style={
+                                speakingTurnId === turn.id
+                                  ? { backgroundColor: theme.accentColor }
+                                  : undefined
+                              }
+                            >
+                              <Volume2 className="w-4 h-4 stroke-[2]" />
+                            </button>
+                          )}
+                      </div>
+                    )
+                  )}
+
+                  {/* Sleek Completed Build Action Card (Preview + Code + Optional Steps) */}
+                  {turn.phase === 'complete' &&
+                    isBuildTurn &&
+                    !turn.errorMessage &&
+                    Boolean(turn.previewHtml) && (
+                      <div className="rounded-2xl border border-black/[0.08] bg-[#FAFAFC] p-3.5 flex flex-col gap-2.5">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="font-display font-semibold text-[14px] text-[#0B0B0F] truncate">
+                              {projectTitle}
+                            </p>
+                            <p className="text-[12px] text-[#71717A] tabular-nums">
+                              {Math.max(1, turn.files.length)} files
+                              <span aria-hidden="true"> · </span>
+                              {(previewBytes / 1024).toFixed(1)} KB
+                            </p>
+                          </div>
+
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => onSetView('preview')}
+                              className="h-10 px-3.5 rounded-xl bg-[#0B0B0F] hover:bg-black/85 text-white text-[13px] font-semibold inline-flex items-center gap-1.5 whitespace-nowrap active:scale-95 transition-all"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              <span>Open Preview</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => onSetView('code')}
+                              aria-label="Open built code"
+                              className="h-10 px-3 rounded-xl border border-black/12 bg-white hover:bg-black/[0.03] text-[#0B0B0F] text-[13px] font-medium inline-flex items-center gap-1.5 whitespace-nowrap active:scale-95 transition-all"
+                            >
+                              <Code2 className="w-3.5 h-3.5" />
+                              <span>Code</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        {turn.planSteps && turn.planSteps.length > 0 && (
+                          <div>
+                            <button
+                              type="button"
+                              onClick={togglePlan}
+                              className="text-[12px] font-medium text-[#52525B] hover:text-[#0B0B0F]"
+                            >
+                              {isPlanOpen
+                                ? 'Hide build steps'
+                                : `View build steps (${turn.planSteps.length})`}
+                            </button>
+                            {isPlanOpen && (
+                              <ul className="mt-2 pt-2 border-t border-black/[0.06] space-y-1 text-[12.5px] text-[#3F3F46]">
+                                {turn.planSteps.map((step, idx) => (
+                                  <li key={`${turn.id}-done-plan-${idx}`} className="flex items-start gap-1.5">
+                                    <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 text-[#0D5BFF] shrink-0" />
+                                    <span>{step}</span>
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                          </div>
                         )}
                       </div>
-
-                      {ttsSupported &&
-                        turn.phase === 'complete' &&
-                        displayAiText.length > 0 && (
-                          <button
-                            type="button"
-                            onClick={() => speakTurn(turn.id, displayAiText)}
-                            aria-label={
-                              speakingTurnId === turn.id
-                                ? 'Replay message from beginning'
-                                : 'Read message aloud'
-                            }
-                            title="Replay audio"
-                            className={`mt-0.5 min-w-[36px] min-h-[36px] rounded-full border flex items-center justify-center shrink-0 transition-all active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6] ${
-                              speakingTurnId === turn.id
-                                ? 'border-transparent text-white shadow-xs'
-                                : 'border-black/10 bg-[#F7F7FA] text-[#52525B] hover:bg-[#EFEFF5] hover:text-[#111118]'
-                            }`}
-                            style={
-                              speakingTurnId === turn.id
-                                ? { backgroundColor: theme.accentColor }
-                                : undefined
-                            }
-                          >
-                            <Volume2 className="w-4 h-4 stroke-[2]" />
-                          </button>
-                        )}
-                    </div>
-                  )}
+                    )}
 
                   {/* Generated Media Card (Image / Music / Video) — No web browser link */}
                   {turn.media && turn.media.dataUrl && (
@@ -2367,37 +2553,28 @@ export function BuilderWorkspace({
                     );
                   })()}
 
-                  {/* Post-Build One-Tap Follow-Up Suggestions (Auto-Send on Tap) */}
+                  {/* Compact Horizontally Scrollable Follow-Up Suggestions */}
                   {turn.phase === 'complete' &&
                     isBuildTurn &&
                     !turn.errorMessage &&
                     turn.suggestions &&
                     turn.suggestions.length > 0 && (
-                      <div className="flex flex-col gap-2 pt-0.5">
-                        <span className="text-[12px] font-semibold uppercase tracking-[0.04em] text-[#71717A] px-0.5">
-                          Tap to add next
-                        </span>
-                        <div className="flex flex-col gap-1.5">
-                          {turn.suggestions.map((suggestion, idx) => (
-                            <button
-                              key={`${turn.id}-sug-${idx}`}
-                              type="button"
-                              disabled={isStreaming || isRestricted}
-                              onClick={() => {
-                                if (!isRestricted) {
-                                  onSendFollowUp(suggestion, buildFollowUpOptions());
-                                }
-                              }}
-                              className="w-full text-left rounded-xl border border-black/[0.08] bg-white hover:bg-[#F7F7FA] hover:border-black/15 px-3.5 py-2.5 flex items-center justify-between gap-2.5 text-[13.5px] font-medium text-[#111118] transition-all active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                              <span className="leading-snug">{suggestion}</span>
-                              <ArrowUpRight
-                                className="w-4 h-4 shrink-0"
-                                style={{ color: theme.accentColor }}
-                              />
-                            </button>
-                          ))}
-                        </div>
+                      <div className="flex items-center gap-2 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden touch-pan-x pt-0.5 pb-1 [-webkit-overflow-scrolling:touch]">
+                        {turn.suggestions.map((suggestion, idx) => (
+                          <button
+                            key={`${turn.id}-sug-${idx}`}
+                            type="button"
+                            disabled={isStreaming || isRestricted}
+                            onClick={() => {
+                              if (!isRestricted) {
+                                onSendFollowUp(suggestion, buildFollowUpOptions());
+                              }
+                            }}
+                            className="shrink-0 h-9 px-3.5 rounded-xl border border-black/[0.09] bg-white hover:bg-[#F7F7FA] hover:border-black/15 text-[12.5px] font-medium text-[#111118] whitespace-nowrap transition-all active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            {suggestion}
+                          </button>
+                        ))}
                       </div>
                     )}
                 </article>
@@ -2419,79 +2596,29 @@ export function BuilderWorkspace({
         )}
       </div>
 
-      {/* Bottom Follow-Up Chat Composer */}
+      {/* Clean Bottom Follow-Up Chat Composer */}
       <div className="shrink-0 w-full bg-white border-t border-black/[0.05] pb-safe [[data-platform=android]_&]:pb-5">
-        <div className="w-full max-w-[520px] md:max-w-[700px] lg:max-w-[860px] 2xl:max-w-[1020px] mx-auto px-4 pt-2 pb-2.5">
+        <div className="w-full max-w-[520px] md:max-w-[700px] lg:max-w-[860px] 2xl:max-w-[1020px] mx-auto px-4 pt-2.5 pb-2.5">
           {inlineNotice ? (
             <p
               role="status"
-              className="mb-1.5 px-3 py-1.5 rounded-xl bg-red-50 border border-red-200 text-[12px] font-medium text-red-700 text-center"
+              className="mb-2 px-3 py-1.5 rounded-xl bg-red-50 border border-red-200 text-[12px] font-medium text-red-700 text-center"
             >
               {inlineNotice}
             </p>
           ) : null}
-          {/* Micro Status Strip above Composer */}
-          <div className="px-1 pb-2 flex items-center justify-between text-[13.5px]">
-            <div className="flex items-center gap-3">
+
+          {!isOwner && (
+            <div className="px-1 pb-1.5 flex items-center justify-between text-[12px]">
               <button
                 type="button"
                 onClick={onOpenUpgrade}
-                aria-label={
-                  isOwner
-                    ? 'Owner account: Free unlimited app builds'
-                    : `AI Craft credits: ${credits.toLocaleString()}. Tap to upgrade or add credits`
-                }
-                className="flex items-center gap-1.5 rounded-full px-1.5 py-1 -ml-1.5 hover:bg-black/[0.04] active:scale-95 transition-all"
+                className={`font-medium tabular-nums ${
+                  credits <= 0 ? 'text-red-600' : 'text-[#71717A] hover:text-[#0B0B0F]'
+                }`}
               >
-                <span
-                  className="w-[18px] h-[18px] rounded-full flex items-center justify-center shrink-0"
-                  style={{
-                    background:
-                      !isOwner && credits <= 0
-                        ? 'linear-gradient(135deg, #FCA5A5 0%, #EF4444 65%, #B91C1C 100%)'
-                        : mode === 'mobile'
-                          ? 'linear-gradient(135deg, #C4B5FD 0%, #7A68F6 60%, #5B21B6 100%)'
-                          : 'linear-gradient(135deg, #F0ABFC 0%, #8B5CF6 60%, #6D28D9 100%)',
-                  }}
-                  aria-hidden="true"
-                >
-                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none">
-                    <path
-                      d="M14.5 9.5L12 16L9.5 14.5L12 8L14.5 9.5Z"
-                      fill="white"
-                      fillOpacity="0.95"
-                    />
-                  </svg>
-                </span>
-                <span
-                  className={`font-display font-semibold tabular-nums ${
-                    !isOwner && credits <= 0 ? 'text-red-600' : 'text-[#111118]'
-                  }`}
-                >
-                  {isOwner ? 'Owner · Free' : credits.toLocaleString()}
-                </span>
+                {credits.toLocaleString()} credits left
               </button>
-
-              <button
-                type="button"
-                onClick={() => setAutoAllow((v) => !v)}
-                className="flex items-center gap-1 text-[#52525B] hover:text-[#0B0B0F] font-medium"
-              >
-                <span>{autoAllow ? 'Always allow' : 'Ask first'}</span>
-                <ChevronDown className="w-3.5 h-3.5" />
-              </button>
-            </div>
-
-            <div className="flex items-center gap-3">
-              <button
-                type="button"
-                onClick={onOpenSettings}
-                className="flex items-center gap-1 text-[#52525B] hover:text-[#0B0B0F] font-medium"
-              >
-                <HelpCircle className="w-3.5 h-3.5" />
-                <span>AI</span>
-              </button>
-
               <button
                 type="button"
                 onClick={onOpenUpgrade}
@@ -2500,61 +2627,41 @@ export function BuilderWorkspace({
                 Upgrade
               </button>
             </div>
-          </div>
+          )}
 
-          {/* Rounded Input Card */}
+          {/* Sleek Rounded Input Box */}
           <div
-            className={`relative w-full rounded-[22px] bg-white border shadow-[0_4px_20px_rgba(15,15,30,0.04)] px-4 pt-2.5 pb-2.5 flex flex-col gap-1.5 ${
-              isRestricted ? 'border-amber-400/70' : 'border-black/[0.09]'
+            className={`relative w-full rounded-[22px] bg-white border shadow-[0_2px_16px_rgba(15,15,30,0.05)] px-3.5 pt-2.5 pb-2.5 flex flex-col gap-1.5 ${
+              isRestricted ? 'border-amber-400/70' : 'border-black/[0.1]'
             }`}
           >
-            {/* Selected AI Header Bar at the top of the chat box */}
-            <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-black/[0.05]">
-              <div className="flex items-center gap-2 min-w-0">
-                <ProviderLogo
-                  provider={activeModel?.provider}
-                  modelId={activeModel?.id || selectedModel}
-                  size={20}
-                  isTracking={isStreaming}
-                  trackingColor={theme.accentColor}
-                />
-                <span className="text-[12.5px] font-medium text-[#18181B] truncate">
-                  {activeModel?.name ??
-                    (modelsLoading
-                      ? 'Connecting AI Craft Engine...'
-                      : 'AI Craft Pro (4 Hydrogen)')}
-                </span>
-              </div>
-
-              <div className="flex items-center gap-1.5 -mr-1 shrink-0">
-                {isRestricted && (
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 border border-amber-200 text-amber-800 text-[10.5px] font-semibold">
-                    <ShieldAlert className="w-3 h-3" />
-                    <span>Restricted</span>
-                  </span>
-                )}
-                {models.length > 1 ? (
-                  <ModelSelectorPopover
-                    mode={mode}
-                    models={models}
-                    selectedModel={selectedModel}
-                    modelsLoading={modelsLoading}
-                    modelsError={modelsError}
-                    isStreaming={isStreaming}
-                    onSelectModel={onSelectModel}
-                    onRetryModels={onRetryModels}
+            {models.length > 1 && (
+              <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-black/[0.05]">
+                <div className="flex items-center gap-2 min-w-0">
+                  <ProviderLogo
+                    provider={activeModel?.provider}
+                    modelId={activeModel?.id || selectedModel}
+                    size={18}
+                    isTracking={isStreaming}
+                    trackingColor={theme.accentColor}
                   />
-                ) : (
-                  <span
-                    className="inline-flex items-center gap-1.5 pr-1.5 text-[11px] font-medium text-[#71717A]"
-                    title="Automatic backend multi-model failover active"
-                  >
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                    <span>Auto</span>
+                  <span className="text-[12px] font-medium text-[#18181B] truncate">
+                    {activeModel?.name ??
+                      (modelsLoading ? 'Connecting...' : 'AI Craft')}
                   </span>
-                )}
+                </div>
+                <ModelSelectorPopover
+                  mode={mode}
+                  models={models}
+                  selectedModel={selectedModel}
+                  modelsLoading={modelsLoading}
+                  modelsError={modelsError}
+                  isStreaming={isStreaming}
+                  onSelectModel={onSelectModel}
+                  onRetryModels={onRetryModels}
+                />
               </div>
-            </div>
+            )}
 
             {isRestricted && (
               <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-1.5 flex items-center gap-2 text-[12px] font-medium text-amber-900">
@@ -2702,7 +2809,7 @@ export function BuilderWorkspace({
             </div>
           </div>
 
-          {/* Scrollable Quick Action Strip Below Chat Box: Deploy, Database, Secrets */}
+          {/* Scrollable Quick Action Strip Below Chat Box: Deploy, Database, Code, Secrets */}
           <div
             role="toolbar"
             aria-label="Project tools"
@@ -2734,6 +2841,20 @@ export function BuilderWorkspace({
             >
               <Database className="w-3.5 h-3.5 stroke-[1.9] shrink-0" />
               <span>Database</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => onSetView('code')}
+              aria-label="Open built-in code viewer and live file editor"
+              className={`shrink-0 inline-flex items-center gap-1.5 h-8 px-3 rounded-full border text-[11.5px] font-medium whitespace-nowrap transition-all active:scale-95 ${
+                hasBuiltApp
+                  ? 'border-[#7A68F6]/35 bg-[#F5F3FF] text-[#6D4AFF]'
+                  : 'border-black/[0.08] bg-[#FAFAFC] text-[#3F3F46] hover:bg-black/[0.04] hover:text-[#0B0B0F]'
+              }`}
+            >
+              <Code2 className="w-3.5 h-3.5 stroke-[1.9] shrink-0" />
+              <span>Code</span>
             </button>
 
             <button
@@ -2775,6 +2896,7 @@ export function BuilderWorkspace({
         secrets={secrets}
         codeParts={codeParts}
         latestBuildFiles={latestBuiltTurn?.files ?? []}
+        onApplyHtmlEdit={onUpdatePreviewHtml}
         onClose={() => setActiveDrawer(null)}
       />
 

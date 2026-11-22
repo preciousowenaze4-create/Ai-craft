@@ -20,15 +20,23 @@ import {
 import { resolveUserWithModeration } from './_moderation.js';
 import { appendClearAuthCookies } from './_supabaseAuth.js';
 
-function parseAppRequest(request: Request): { rawId: string; asset: string } {
+function parseAppRequest(request: Request): {
+  rawId: string;
+  asset: string;
+  routePrefix: '/p' | '/app';
+} {
   const reqUrl = new URL(request.url);
   const queryId = reqUrl.searchParams.get('id') || '';
   const queryAsset = reqUrl.searchParams.get('asset') || '';
+  const queryPrefix = reqUrl.searchParams.get('prefix') || '';
+  const isAppPath = /^\/app\//i.test(reqUrl.pathname) || queryPrefix.toLowerCase() === 'app';
+  const routePrefix: '/p' | '/app' = isAppPath ? '/app' : '/p';
+
   if (queryId) {
-    return { rawId: queryId, asset: queryAsset.toLowerCase() };
+    return { rawId: queryId, asset: queryAsset.toLowerCase(), routePrefix };
   }
 
-  const trimmedPath = reqUrl.pathname.replace(/^\/(?:api\/apps|app)\/?/i, '');
+  const trimmedPath = reqUrl.pathname.replace(/^\/(?:api\/apps|app|p)\/?/i, '');
   const segments = trimmedPath.split('/').filter(Boolean);
   const rawId = segments[0] || '';
   const sub = (segments[1] || '').toLowerCase();
@@ -43,12 +51,12 @@ function parseAppRequest(request: Request): { rawId: string; asset: string } {
     else if (sub === 'icon-512.png') asset = 'icon-512';
     else if (sub === 'icon-maskable.png') asset = 'icon-maskable';
   }
-  return { rawId, asset };
+  return { rawId, asset, routePrefix };
 }
 
 export async function GET(request: Request): Promise<Response> {
   const reqUrl = new URL(request.url);
-  const { rawId, asset } = parseAppRequest(request);
+  const { rawId, asset, routePrefix } = parseAppRequest(request);
   const cleanId = sanitizeAppId(rawId);
 
   if (!rawId || !cleanId) {
@@ -79,7 +87,7 @@ export async function GET(request: Request): Promise<Response> {
   }
 
   if (asset === 'manifest') {
-    return new Response(JSON.stringify(buildAppManifestJson(record)), {
+    return new Response(JSON.stringify(buildAppManifestJson(record, routePrefix)), {
       status: 200,
       headers: {
         'Content-Type': 'application/manifest+json; charset=utf-8',
@@ -89,11 +97,11 @@ export async function GET(request: Request): Promise<Response> {
   }
 
   if (asset === 'sw') {
-    return new Response(buildAppServiceWorkerJs(record), {
+    return new Response(buildAppServiceWorkerJs(record, routePrefix), {
       status: 200,
       headers: {
         'Content-Type': 'application/javascript; charset=utf-8',
-        'Service-Worker-Allowed': `/app/${record.appId}`,
+        'Service-Worker-Allowed': `${routePrefix}/${record.appId}`,
         'Cache-Control': 'no-store, max-age=0',
       },
     });
@@ -143,11 +151,12 @@ export async function GET(request: Request): Promise<Response> {
         slug: record.slug,
         mode: record.mode,
         version: record.version,
+        path: `${routePrefix}/${record.appId}`,
         ...(hasLogoOrPwa && logo
           ? {
               themeColor: logo.themeColor,
-              logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
-              manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
+              logoUrl: `${routePrefix}/${record.appId}/icon-180.png?v=${record.version}`,
+              manifestUrl: `${routePrefix}/${record.appId}/manifest.webmanifest?v=${record.version}`,
             }
           : {}),
         updatedAt: record.updatedAt,
@@ -156,7 +165,7 @@ export async function GET(request: Request): Promise<Response> {
     );
   }
 
-  const standaloneHtml = buildStandaloneAppHtml(record);
+  const standaloneHtml = buildStandaloneAppHtml(record, routePrefix);
   return new Response(standaloneHtml, {
     status: 200,
     headers: {
@@ -276,11 +285,11 @@ export async function POST(request: Request): Promise<Response> {
       ok: true,
       appId: record.appId,
       slug: record.slug,
-      path: `/app/${record.appId}`,
+      path: `/p/${record.appId}`,
       ...(hasLogoOrPwa && logo
         ? {
-            logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
-            manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
+            logoUrl: `/p/${record.appId}/icon-180.png?v=${record.version}`,
+            manifestUrl: `/p/${record.appId}/manifest.webmanifest?v=${record.version}`,
             themeColor: logo.themeColor,
           }
         : {}),

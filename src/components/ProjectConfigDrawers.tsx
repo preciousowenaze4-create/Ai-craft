@@ -15,9 +15,11 @@ import {
   KeyRound,
   Lightbulb,
   Loader2,
+  Pencil,
   Plus,
   RefreshCw,
   Rocket,
+  RotateCcw,
   Save,
   Share2,
   Trash2,
@@ -33,6 +35,10 @@ import {
   ProjectSecret,
   SecretSaveResult,
 } from '../types/craft';
+import {
+  applyFileEditToHtml,
+  extractEditableCodeFiles,
+} from '../utils/codeFileEditor';
 
 function slugifyProjectTitle(title: string): string {
   return (
@@ -815,6 +821,7 @@ export function ProjectSecretsModal({
 
 interface ProjectDatabaseModalProps {
   open: boolean;
+  initialTab?: 'database' | 'files';
   mode?: BuildMode;
   projectId: string;
   projectTitle: string;
@@ -825,6 +832,7 @@ interface ProjectDatabaseModalProps {
   secrets?: ProjectSecret[];
   codeParts?: Array<{ id: string; label: string; content: string }>;
   latestBuildFiles?: string[];
+  onApplyHtmlEdit?: (nextHtml: string) => void | Promise<void>;
   onClose: () => void;
 }
 
@@ -833,24 +841,14 @@ interface RealTimeBuiltFile {
   label: string;
   content: string;
   kind: 'code' | 'database' | 'screen';
+  editable: boolean;
   lineCount: number;
   bytes: number;
 }
 
-function extractScreenSectionHtml(fullHtml: string, screenId: string): string {
-  if (!fullHtml || !screenId) return '';
-  const escaped = screenId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const sectionRegex = new RegExp(
-    `<(?:section|div|main|article)\\b[^>]*(?:id|data-screen|data-view|data-tab|data-page)=["']${escaped}["'][^>]*>[\\s\\S]*?(?=<\\/(?:section|main|article)>|$)`,
-    'i'
-  );
-  const m = sectionRegex.exec(fullHtml);
-  if (!m) return '';
-  return m[0].trim();
-}
-
 export function ProjectDatabaseModal({
   open,
+  initialTab,
   mode = 'mobile',
   projectId,
   projectTitle,
@@ -860,18 +858,31 @@ export function ProjectDatabaseModal({
   databaseConfig,
   secrets = [],
   codeParts = [],
-  latestBuildFiles = [],
+  onApplyHtmlEdit,
   onClose,
 }: ProjectDatabaseModalProps) {
-  const [activeTab, setActiveTab] = useState<'database' | 'files'>('database');
+  const [activeTab, setActiveTab] = useState<'database' | 'files'>(initialTab || 'database');
   const [copiedSqlId, setCopiedSqlId] = useState<string | null>(null);
   const [copiedFilePath, setCopiedFilePath] = useState<string | null>(null);
   const [selectedFilePath, setSelectedFilePath] = useState<string>('index.html');
+  const [editingFilePath, setEditingFilePath] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<string>('');
+  const [editError, setEditError] = useState<string | null>(null);
   const [collapsedTables, setCollapsedTables] = useState<Record<string, boolean>>({});
   const [addingRowTable, setAddingRowTable] = useState<string | null>(null);
   const [newRowDraft, setNewRowDraft] = useState<Record<string, string>>({});
   const [feedback, setFeedback] = useState<string | null>(null);
   const [dataRefreshTick, setDataRefreshTick] = useState(0);
+
+  useEffect(() => {
+    if (open && initialTab) {
+      setActiveTab(initialTab);
+    }
+    if (!open) {
+      setEditingFilePath(null);
+      setEditError(null);
+    }
+  }, [open, initialTab]);
 
   useEffect(() => {
     if (!open) return;
@@ -1054,7 +1065,12 @@ export function ProjectDatabaseModal({
   const builtFiles = useMemo<RealTimeBuiltFile[]>(() => {
     const list: RealTimeBuiltFile[] = [];
     const seen = new Set<string>();
-    const pushFile = (path: string, content: string, kind: RealTimeBuiltFile['kind']) => {
+    const pushFile = (
+      path: string,
+      content: string,
+      kind: RealTimeBuiltFile['kind'],
+      editable: boolean
+    ) => {
       if (!path || seen.has(path)) return;
       seen.add(path);
       const clean = content || '';
@@ -1063,48 +1079,72 @@ export function ProjectDatabaseModal({
         label: path,
         content: clean,
         kind,
+        editable,
         lineCount: clean ? clean.split('\n').length : 0,
         bytes: clean.length,
       });
     };
 
-    for (const part of codeParts) {
-      if (part.content) {
-        pushFile(part.id, part.content, 'code');
+    if (latestPreviewHtml.trim()) {
+      for (const ef of extractEditableCodeFiles(latestPreviewHtml)) {
+        if (ef.content.trim()) {
+          pushFile(
+            ef.id,
+            ef.content,
+            ef.kind === 'screen' ? 'screen' : 'code',
+            ef.editable
+          );
+        }
+      }
+    } else {
+      for (const part of codeParts) {
+        if (part.content) {
+          pushFile(part.id, part.content, 'code', true);
+        }
       }
     }
 
     if (structuredTables.length > 0) {
       const fullSql = structuredTables.map((t) => buildCreateSql(t)).join('\n\n');
-      pushFile('database/schema.sql', fullSql, 'database');
+      pushFile('database/schema.sql', fullSql, 'database', false);
 
       const snapshotObj: Record<string, Record<string, unknown>[]> = {};
       for (const tbl of structuredTables) {
         snapshotObj[tbl.name] = liveStoredMap.get(tbl.name)?.rows ?? [];
       }
-      pushFile('database/records.json', JSON.stringify(snapshotObj, null, 2), 'database');
-    }
-
-    if (latestPreviewHtml) {
-      for (const rawPath of latestBuildFiles) {
-        if (!rawPath || seen.has(rawPath)) continue;
-        if (rawPath.startsWith('screens/')) {
-          const screenName = rawPath.replace(/^screens\//, '').replace(/\.html$/i, '');
-          const sectionCode = extractScreenSectionHtml(latestPreviewHtml, screenName);
-          if (sectionCode) {
-            pushFile(rawPath, sectionCode, 'screen');
-          }
-        }
-      }
+      pushFile('database/records.json', JSON.stringify(snapshotObj, null, 2), 'database', false);
     }
 
     return list;
-  }, [codeParts, structuredTables, liveStoredMap, latestPreviewHtml, latestBuildFiles]);
+  }, [codeParts, structuredTables, liveStoredMap, latestPreviewHtml]);
 
   const activeFile = useMemo(
     () => builtFiles.find((f) => f.path === selectedFilePath) || builtFiles[0] || null,
     [builtFiles, selectedFilePath]
   );
+
+  const isEditingActiveFile =
+    Boolean(activeFile && editingFilePath === activeFile.path && activeFile.editable);
+
+  const handleStartEditFile = (file: RealTimeBuiltFile) => {
+    if (!file.editable || isStreaming) return;
+    setEditError(null);
+    setEditDraft(file.content);
+    setEditingFilePath(file.path);
+  };
+
+  const handleApplyFileEdit = async () => {
+    if (!activeFile || !latestPreviewHtml || !onApplyHtmlEdit) return;
+    const result = applyFileEditToHtml(latestPreviewHtml, activeFile.path, editDraft);
+    if (!result.ok) {
+      setEditError(result.error);
+      return;
+    }
+    setEditError(null);
+    await onApplyHtmlEdit(result.html);
+    setEditingFilePath(null);
+    setFeedback(`Saved ${activeFile.label} and updated live Preview.`);
+  };
 
   const handleCopySql = async (table: ProjectDatabaseTable) => {
     try {
@@ -1548,7 +1588,7 @@ export function ProjectDatabaseModal({
         ) : (
           <div className="flex flex-col gap-3">
             {/* Live File Status Bar */}
-            <div className="flex items-center justify-between gap-2 px-3.5 py-2 rounded-2xl bg-[#FAFAFC] border border-black/[0.06]">
+            <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 rounded-2xl bg-[#FAFAFC] border border-black/[0.06]">
               <div className="flex items-center gap-2 min-w-0">
                 <span
                   aria-hidden="true"
@@ -1558,29 +1598,74 @@ export function ProjectDatabaseModal({
                 />
                 <span className="text-[12px] font-semibold text-[#0B0B0F] truncate">
                   {builtFiles.length} {builtFiles.length === 1 ? 'file' : 'files'} ·{' '}
-                  {isStreaming ? 'Writing live...' : 'Synced'}
+                  {isStreaming ? 'Writing live...' : isEditingActiveFile ? 'Editing' : 'Synced'}
                 </span>
               </div>
               {activeFile && (
-                <button
-                  type="button"
-                  onClick={() => void handleCopyFile(activeFile)}
-                  className="inline-flex items-center gap-1 h-7 px-2.5 rounded-lg border border-black/[0.08] bg-white hover:bg-black/[0.03] text-[11.5px] font-medium text-[#0B0B0F]"
-                >
-                  {copiedFilePath === activeFile.path ? (
-                    <>
-                      <Check className="w-3 h-3 text-emerald-600" />
-                      <span>Copied</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="w-3 h-3" />
-                      <span>Copy file</span>
-                    </>
+                <div className="flex items-center gap-1.5">
+                  {activeFile.editable && onApplyHtmlEdit && !isStreaming && (
+                    isEditingActiveFile ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingFilePath(null);
+                            setEditError(null);
+                          }}
+                          className="inline-flex items-center gap-1 h-7 px-2.5 rounded-lg border border-black/[0.08] bg-white hover:bg-black/[0.03] text-[11.5px] font-medium text-[#52525B]"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>Cancel</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleApplyFileEdit()}
+                          className="inline-flex items-center gap-1 h-7 px-2.5 rounded-lg bg-[#6D4AFF] hover:bg-[#5B35F5] text-white text-[11.5px] font-semibold"
+                        >
+                          <Save className="w-3 h-3" />
+                          <span>Save & Apply</span>
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => handleStartEditFile(activeFile)}
+                        className="inline-flex items-center gap-1 h-7 px-2.5 rounded-lg border border-black/[0.08] bg-white hover:bg-black/[0.03] text-[11.5px] font-medium text-[#0B0B0F]"
+                      >
+                        <Pencil className="w-3 h-3" />
+                        <span>Edit</span>
+                      </button>
+                    )
                   )}
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyFile(activeFile)}
+                    className="inline-flex items-center gap-1 h-7 px-2.5 rounded-lg border border-black/[0.08] bg-white hover:bg-black/[0.03] text-[11.5px] font-medium text-[#0B0B0F]"
+                  >
+                    {copiedFilePath === activeFile.path ? (
+                      <>
+                        <Check className="w-3 h-3 text-emerald-600" />
+                        <span>Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3 h-3" />
+                        <span>Copy</span>
+                      </>
+                    )}
+                  </button>
+                </div>
               )}
             </div>
+
+            {editError && (
+              <p
+                role="alert"
+                className="px-3 py-2 rounded-xl bg-red-50 border border-red-200 text-red-700 text-[12px] font-medium"
+              >
+                {editError}
+              </p>
+            )}
 
             {/* File Selector Strip */}
             <div className="flex flex-wrap gap-1.5">
@@ -1590,7 +1675,11 @@ export function ProjectDatabaseModal({
                   <button
                     key={file.path}
                     type="button"
-                    onClick={() => setSelectedFilePath(file.path)}
+                    onClick={() => {
+                      setSelectedFilePath(file.path);
+                      setEditingFilePath(null);
+                      setEditError(null);
+                    }}
                     className={`px-2.5 py-1.5 rounded-xl border text-[11.5px] font-mono font-medium inline-flex items-center gap-1.5 transition-all ${
                       isSelected
                         ? 'bg-[#0B0B0F] text-white border-[#0B0B0F]'
@@ -1608,18 +1697,30 @@ export function ProjectDatabaseModal({
               })}
             </div>
 
-            {/* Live File Content Viewer */}
+            {/* Live File Content Viewer / Editor */}
             {activeFile && (
               <div className="rounded-2xl border border-black/[0.08] bg-[#111118] text-[#E4E4E7] overflow-hidden">
                 <div className="px-3.5 py-2 bg-[#1A1A24] border-b border-white/10 flex items-center justify-between text-[11px] font-mono text-[#A1A1AA]">
                   <span className="truncate">{activeFile.path}</span>
                   <span className="tabular-nums shrink-0">
-                    {activeFile.lineCount} lines · {(activeFile.bytes / 1024).toFixed(1)} KB
+                    {isEditingActiveFile
+                      ? `${editDraft.split('\n').length} lines · ${(editDraft.length / 1024).toFixed(1)} KB`
+                      : `${activeFile.lineCount} lines · ${(activeFile.bytes / 1024).toFixed(1)} KB`}
                   </span>
                 </div>
-                <pre className="p-3.5 text-[11.5px] leading-relaxed font-mono overflow-auto max-h-[300px] whitespace-pre">
-                  {activeFile.content}
-                </pre>
+                {isEditingActiveFile ? (
+                  <textarea
+                    value={editDraft}
+                    onChange={(e) => setEditDraft(e.target.value)}
+                    spellCheck={false}
+                    aria-label={`Edit ${activeFile.label}`}
+                    className="w-full h-[300px] p-3.5 bg-[#111118] text-[#E4E4E7] text-[12px] leading-relaxed font-mono resize-none focus:outline-none"
+                  />
+                ) : (
+                  <pre className="p-3.5 text-[11.5px] leading-relaxed font-mono overflow-auto max-h-[300px] whitespace-pre">
+                    {activeFile.content}
+                  </pre>
+                )}
               </div>
             )}
           </div>
@@ -1644,7 +1745,7 @@ interface ProjectDeployModalProps {
   databaseConfig: ProjectDatabaseConfig;
   deployment: ProjectDeploymentConfig;
   onClose: () => void;
-  onDeploy: (slug: string) => void;
+  onDeploy: (slug: string) => Promise<boolean> | void;
   onOpenPreview: () => void;
   onOpenCode: () => void;
   onShare: () => Promise<string>;
@@ -1688,13 +1789,17 @@ export function ProjectDeployModal({
     ? `${(latestPreviewHtml.length / 1024).toFixed(1)} KB`
     : '0 KB';
 
-  const handleDeployClick = () => {
+  const handleDeployClick = async () => {
     if (!hasBuiltApp) {
       setStatusNote('Build your app in chat first before deploying.');
       return;
     }
-    onDeploy(cleanedSlug);
-    setStatusNote(`Deployed ${projectTitle} (v${deployment.version + 1})`);
+    const result = await onDeploy(cleanedSlug);
+    if (result === false) {
+      setStatusNote('Unable to publish live link right now. Please try again.');
+      return;
+    }
+    setStatusNote(`Published live at /p/${cleanedSlug} (v${deployment.version + 1})`);
   };
 
   const handleDownloadHtml = () => {
@@ -1803,7 +1908,7 @@ export function ProjectDeployModal({
               )}
             </div>
             {deployment.liveUrl && (
-              <div className="rounded-xl border border-black/[0.09] bg-[#FAFAFC] px-3 py-2 flex items-center gap-2.5">
+              <div className="rounded-xl border border-black/[0.09] bg-[#FAFAFC] px-3 py-2 flex items-center gap-2">
                 {deployment.logoUrl && (
                   <img
                     src={deployment.logoUrl}
@@ -1825,7 +1930,7 @@ export function ProjectDeployModal({
                   type="button"
                   onClick={() => void handleCopyLiveUrl()}
                   aria-label="Copy live URL"
-                  className="min-h-[36px] px-2.5 rounded-lg border border-black/[0.1] bg-white hover:bg-black/[0.03] text-[12px] font-medium text-[#0B0B0F] inline-flex items-center gap-1 shrink-0"
+                  className="min-h-[34px] px-2.5 rounded-lg border border-black/[0.1] bg-white hover:bg-black/[0.03] text-[12px] font-medium text-[#0B0B0F] inline-flex items-center gap-1 shrink-0"
                 >
                   {copiedLiveUrl ? (
                     <>
@@ -1839,6 +1944,16 @@ export function ProjectDeployModal({
                     </>
                   )}
                 </button>
+                <a
+                  href={deployment.liveUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="Open live hosted app"
+                  className="min-h-[34px] px-2.5 rounded-lg bg-[#0B0B0F] hover:bg-[#27272A] text-white text-[12px] font-medium inline-flex items-center gap-1 shrink-0"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Open</span>
+                </a>
               </div>
             )}
           </div>
@@ -1847,7 +1962,7 @@ export function ProjectDeployModal({
         {/* App Slug Input */}
         <div>
           <label className="block text-[12px] font-medium text-[#52525B] mb-1.5">
-            App Slug
+            Public App Slug
           </label>
           <input
             type="text"
@@ -1856,8 +1971,11 @@ export function ProjectDeployModal({
             placeholder="my-app-slug"
             className="w-full h-11 px-3.5 rounded-xl border border-black/[0.12] bg-[#FAFAFC] font-mono text-[13px] text-[#0B0B0F] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
           />
+          <p className="text-[11.5px] text-[#71717A] mt-1.5 font-mono truncate">
+            Shareable route: /p/{cleanedSlug}
+          </p>
           {deployment.deployedAt && (
-            <p className="text-[11.5px] text-[#71717A] mt-1.5">
+            <p className="text-[11.5px] text-[#71717A] mt-0.5">
               Last deployed {new Date(deployment.deployedAt).toLocaleString()}
             </p>
           )}
@@ -1875,12 +1993,22 @@ export function ProjectDeployModal({
         {/* Primary Deploy CTA */}
         <button
           type="button"
-          onClick={handleDeployClick}
-          disabled={!hasBuiltApp}
+          onClick={() => void handleDeployClick()}
+          disabled={!hasBuiltApp || Boolean(deployment.livePublishing)}
           className="w-full h-11 rounded-xl bg-[#6D4AFF] hover:bg-[#5B35F5] disabled:bg-[#BEB5F9] text-white text-[14px] font-semibold flex items-center justify-center gap-2 active:scale-[0.99] transition-all"
         >
-          <Rocket className="w-4 h-4" />
-          <span>{isPublished ? 'Update Live Deployment' : 'Deploy App'}</span>
+          {deployment.livePublishing ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <Rocket className="w-4 h-4" />
+          )}
+          <span>
+            {deployment.livePublishing
+              ? 'Publishing Live...'
+              : isPublished
+                ? 'Update Live Link'
+                : 'Publish Live App'}
+          </span>
         </button>
 
         {/* Secondary Actions */}

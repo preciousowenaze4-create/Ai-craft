@@ -74,6 +74,42 @@
       "destination": "/api/apps?id=:id"
     },
     {
+      "source": "/p/:id/manifest.webmanifest",
+      "destination": "/api/apps?id=:id&asset=manifest&prefix=p"
+    },
+    {
+      "source": "/p/:id/sw.js",
+      "destination": "/api/apps?id=:id&asset=sw&prefix=p"
+    },
+    {
+      "source": "/p/:id/icon.svg",
+      "destination": "/api/apps?id=:id&asset=icon-svg&prefix=p"
+    },
+    {
+      "source": "/p/:id/icon-180.png",
+      "destination": "/api/apps?id=:id&asset=icon-180&prefix=p"
+    },
+    {
+      "source": "/p/:id/icon-192.png",
+      "destination": "/api/apps?id=:id&asset=icon-192&prefix=p"
+    },
+    {
+      "source": "/p/:id/icon-512.png",
+      "destination": "/api/apps?id=:id&asset=icon-512&prefix=p"
+    },
+    {
+      "source": "/p/:id/icon-maskable.png",
+      "destination": "/api/apps?id=:id&asset=icon-maskable&prefix=p"
+    },
+    {
+      "source": "/p/:id/",
+      "destination": "/api/apps?id=:id&prefix=p"
+    },
+    {
+      "source": "/p/:id",
+      "destination": "/api/apps?id=:id&prefix=p"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }

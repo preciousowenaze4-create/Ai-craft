@@ -3515,43 +3515,88 @@ export default function App() {
                 )
               );
             }}
-            onDeployProject={(slug) => {
+            onUpdatePreviewHtml={async (nextHtml) => {
+              const targetId = activeProject.id;
+              setProjects((prev) =>
+                prev.map((proj) => {
+                  if (proj.id !== targetId) return proj;
+                  let targetTurnIdx = -1;
+                  for (let i = proj.turns.length - 1; i >= 0; i -= 1) {
+                    if (proj.turns[i]?.previewHtml) {
+                      targetTurnIdx = i;
+                      break;
+                    }
+                  }
+                  if (targetTurnIdx === -1 && proj.turns.length > 0) {
+                    targetTurnIdx = proj.turns.length - 1;
+                  }
+                  if (targetTurnIdx === -1) return proj;
+                  const nextTurns = proj.turns.map((t, idx) =>
+                    idx === targetTurnIdx
+                      ? {
+                          ...t,
+                          previewHtml: nextHtml,
+                          bytesBuilt: nextHtml.length,
+                        }
+                      : t
+                  );
+                  return {
+                    ...proj,
+                    updatedAt: Date.now(),
+                    turns: nextTurns,
+                  };
+                })
+              );
+
+              const isAppPublished =
+                Boolean(publishedProjects[targetId]) ||
+                activeProject.deployment?.status === 'deployed';
+              if (isAppPublished) {
+                await publishProjectLive(targetId, nextHtml);
+              }
+              setInlineNotice('Code changes saved to Preview');
+            }}
+            onDeployProject={async (slug) => {
               const latestHtml =
                 [...activeProject.turns]
                   .reverse()
                   .find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
               if (latestHtml) {
-                void publishProjectLive(activeProject.id, latestHtml, {
+                const ok = await publishProjectLive(activeProject.id, latestHtml, {
                   slug,
                   customAppId: slug,
                   forceBump: true,
                 });
-              } else {
-                const nowIso = new Date().toISOString();
-                setPublishedProjects((prev) => ({
-                  ...prev,
-                  [activeProject.id]: true,
-                }));
-                setProjects((prev) =>
-                  prev.map((proj) => {
-                    if (proj.id !== activeProject.id) return proj;
-                    const prevVersion = proj.deployment?.version ?? 0;
-                    return {
-                      ...proj,
-                      deployment: {
-                        status: 'deployed',
-                        slug,
-                        appId: proj.deployment?.appId,
-                        liveUrl: proj.deployment?.liveUrl,
-                        version: prevVersion + 1,
-                        deployedAt: nowIso,
-                        environment: 'production',
-                      },
-                    };
-                  })
-                );
+                if (ok) {
+                  setInlineNotice(`${activeProject.title} live at /p/${slug}`);
+                }
+                return ok;
               }
+              const nowIso = new Date().toISOString();
+              setPublishedProjects((prev) => ({
+                ...prev,
+                [activeProject.id]: true,
+              }));
+              setProjects((prev) =>
+                prev.map((proj) => {
+                  if (proj.id !== activeProject.id) return proj;
+                  const prevVersion = proj.deployment?.version ?? 0;
+                  return {
+                    ...proj,
+                    deployment: {
+                      status: 'deployed',
+                      slug,
+                      appId: proj.deployment?.appId,
+                      liveUrl: proj.deployment?.liveUrl,
+                      version: prevVersion + 1,
+                      deployedAt: nowIso,
+                      environment: 'production',
+                    },
+                  };
+                })
+              );
               setInlineNotice(`${activeProject.title} deployed live`);
+              return true;
             }}
             onBack={() => {
               if (activeWorkspaceView !== 'chat') {

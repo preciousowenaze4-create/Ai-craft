@@ -16,11 +16,13 @@ import {
   extractSuggestionsFromRaw,
   finalizePartialPreviewHtml,
   formatWebSearchContext,
+  isGameBuildPrompt,
   mergeParsedDbTables,
   runLiveBrowserSearch,
   sanitizeAndHardenPreviewHtml,
   sanitizeBuildProse,
   shouldRunChatSearch,
+  shouldSkipSlowWebSearchForBuild,
   stripReasoningTags,
   validateBuiltAppHtml,
   type ParsedDbTable,
@@ -214,6 +216,8 @@ export interface PreparedRealtimePrompt {
   naturalMediaIntent: 'image' | 'music' | 'video' | null;
   requestedModelLabel: string;
   shouldGenerateTitle: boolean;
+  isPatchMode?: boolean;
+  isGameBuild?: boolean;
   systemPrompt: string;
   userPrompt: string;
   historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -367,9 +371,14 @@ export async function prepareRealtimePrompt(
         Boolean(input.attachmentDataUrl)
       );
 
+  const isGameBuild = initialRoute === 'build' && isGameBuildPrompt(message);
   const focusedSearchQuery = buildFocusedSearchQuery(message);
+  const skipBuildSearch =
+    initialRoute === 'build' &&
+    shouldSkipSlowWebSearchForBuild(message, Boolean(input.attachmentDataUrl));
   const wantsSearch =
     input.webSearchEnabled !== false &&
+    !skipBuildSearch &&
     (initialRoute !== 'chat' || shouldRunChatSearch(message, hasPreviousHtml));
 
   const previewSummary = extractPreviewStructureSummary(previousHtml);
@@ -377,24 +386,28 @@ export async function prepareRealtimePrompt(
     /\b(redesign|restyle\s*(?:all|everything|the\s*whole|entire)|rebuild\s*from\s*scratch|start\s*over|completely\s*new)\b/i.test(
       message
     );
+  const isPatchMode =
+    hasPreviousHtml &&
+    initialRoute !== 'chat' &&
+    !wantsFullRedesign &&
+    !/\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(message);
+
+  // Only invoke the extra visual architect pre-pass when a screenshot is attached or user explicitly asks for a full redesign.
   const shouldRunDesignEngine =
     !input.forceChat &&
     !naturalMediaIntent &&
     hasServerFreeAiKey() &&
     initialRoute === 'build' &&
-    (!hasPreviousHtml || wantsFullRedesign);
+    (Boolean(input.attachmentDataUrl) || wantsFullRedesign);
 
   if (wantsSearch || shouldRunDesignEngine) {
     input.onStage?.({
       phase: 'understanding',
       kind: initialRoute === 'build' ? 'build' : 'chat',
-      action: wantsSearch ? 'Searching' : 'Designing',
-      label:
-        wantsSearch && shouldRunDesignEngine
-          ? 'Searching live web & designing visual architecture...'
-          : wantsSearch
-            ? 'Searching live web & references...'
-            : 'Designing UI layout & visual architecture...',
+      action: 'Building',
+      label: wantsSearch
+        ? 'Searching references...'
+        : 'Analyzing layout & screenshot...',
     });
   }
 
@@ -424,13 +437,17 @@ export async function prepareRealtimePrompt(
   input.onStage?.({
     phase: 'understanding',
     kind: initialRoute === 'build' ? 'build' : 'chat',
-    action: 'Thinking',
+    action: initialRoute === 'build' ? 'Building' : 'Thinking',
     label:
       initialRoute === 'build'
-        ? 'Planning screens & database architecture...'
+        ? isGameBuild
+          ? 'Designing game mechanics & controls...'
+          : isPatchMode
+            ? 'Planning update...'
+            : 'Planning app layout & database...'
         : initialRoute === 'chat'
-          ? 'Thinking through your message...'
-          : 'Understanding your request...',
+          ? 'Thinking...'
+          : 'Understanding request...',
   });
 
   const timeContext = [
@@ -469,7 +486,9 @@ export async function prepareRealtimePrompt(
   const activeFlags: string[] = [];
   if (input.reactEnabled) activeFlags.push('Rich interactive SPA views');
   if (input.backendEnabled) activeFlags.push('Persistent real-time database (`window.AICraft.db`)');
-  if (input.webSearchEnabled !== false) activeFlags.push('Live browser search & real photography');
+  if (input.webSearchEnabled !== false && !skipBuildSearch) {
+    activeFlags.push('Live browser search & real photography');
+  }
 
   const systemPrompt = buildCraftSystemPrompt({
     mediaKind,
@@ -485,6 +504,7 @@ export async function prepareRealtimePrompt(
     previewSummary,
     mode: input.mode,
     activeFlags,
+    isGameBuild,
   });
 
   const historyMessages: Array<{ role: 'user' | 'assistant'; content: string }> = history
@@ -543,6 +563,8 @@ CRITICAL PRESERVATION RULES:
     naturalMediaIntent,
     requestedModelLabel: executionPlan.requestedModelLabel,
     shouldGenerateTitle,
+    isPatchMode,
+    isGameBuild,
     systemPrompt,
     userPrompt: userBlocks.join('\n\n'),
     historyMessages,
@@ -751,25 +773,33 @@ function buildStreamGenerateConfig(
   candidate: DynamicGeminiCandidate,
   systemPrompt: string,
   route: 'chat' | 'build' | 'auto',
-  enableThinking: boolean
+  enableThinking: boolean,
+  isFastPatch = false
 ): GenerateContentConfig {
   const config: GenerateContentConfig = {
     systemInstruction: systemPrompt,
   };
   if (enableThinking && candidate.thinkingMode === 'level') {
     config.thinkingConfig = {
-      includeThoughts: route === 'build',
+      includeThoughts: route === 'build' && !isFastPatch,
       thinkingLevel:
         route === 'build'
-          ? ThinkingLevel.HIGH
-          : route === 'auto'
-            ? ThinkingLevel.MEDIUM
-            : ThinkingLevel.LOW,
+          ? isFastPatch
+            ? ThinkingLevel.LOW
+            : ThinkingLevel.MEDIUM
+          : ThinkingLevel.LOW,
     };
   } else if (enableThinking && candidate.thinkingMode === 'budget') {
     config.thinkingConfig = {
-      includeThoughts: route === 'build',
-      thinkingBudget: route === 'build' ? 4096 : route === 'auto' ? 1024 : 256,
+      includeThoughts: route === 'build' && !isFastPatch,
+      thinkingBudget:
+        route === 'build'
+          ? isFastPatch
+            ? 512
+            : 1024
+          : route === 'auto'
+            ? 512
+            : 256,
     };
   }
   return config;
@@ -790,6 +820,7 @@ function extractThoughtsFromChunk(chunk: GenerateContentResponse): string {
 export async function streamServerFreeAiRealTime(params: {
   requestedModel?: string;
   initialRoute?: 'chat' | 'build' | 'auto';
+  isFastPatch?: boolean;
   systemPrompt: string;
   historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
   userPrompt: string;
@@ -888,7 +919,8 @@ export async function streamServerFreeAiRealTime(params: {
             candidate,
             params.systemPrompt,
             route,
-            enableThinking
+            enableThinking,
+            Boolean(params.isFastPatch)
           );
           const streamResponse = await Promise.race([
             ai.models.generateContentStream({

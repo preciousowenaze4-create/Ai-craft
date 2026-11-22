@@ -1617,19 +1617,20 @@ async function startServer() {
   const servePublishedAsset = (
     res: express.Response,
     record: NonNullable<Awaited<ReturnType<typeof loadPublishedApp>>>,
-    asset: string
+    asset: string,
+    routePrefix: '/p' | '/app' = '/p'
   ) => {
     if (asset === 'manifest') {
       res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
       res.setHeader('Cache-Control', 'no-store, max-age=0');
-      res.send(JSON.stringify(buildAppManifestJson(record)));
+      res.send(JSON.stringify(buildAppManifestJson(record, routePrefix)));
       return true;
     }
     if (asset === 'sw') {
       res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
-      res.setHeader('Service-Worker-Allowed', `/app/${record.appId}`);
+      res.setHeader('Service-Worker-Allowed', `${routePrefix}/${record.appId}`);
       res.setHeader('Cache-Control', 'no-store, max-age=0');
-      res.send(buildAppServiceWorkerJs(record));
+      res.send(buildAppServiceWorkerJs(record, routePrefix));
       return true;
     }
     if (asset === 'icon-svg') {
@@ -1678,7 +1679,11 @@ async function startServer() {
       res.send(buildNotFoundAppHtml(cleanId));
       return;
     }
-    if (asset && servePublishedAsset(res, record, asset)) {
+    const routePrefix: '/p' | '/app' =
+      typeof req.query.prefix === 'string' && req.query.prefix.toLowerCase() === 'app'
+        ? '/app'
+        : '/p';
+    if (asset && servePublishedAsset(res, record, asset, routePrefix)) {
       return;
     }
     if (req.query.format === 'json') {
@@ -1693,11 +1698,12 @@ async function startServer() {
         slug: record.slug,
         mode: record.mode,
         version: record.version,
+        path: `${routePrefix}/${record.appId}`,
         ...(hasLogoOrPwa && logo
           ? {
               themeColor: logo.themeColor,
-              logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
-              manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
+              logoUrl: `${routePrefix}/${record.appId}/icon-180.png?v=${record.version}`,
+              manifestUrl: `${routePrefix}/${record.appId}/manifest.webmanifest?v=${record.version}`,
             }
           : {}),
         updatedAt: record.updatedAt,
@@ -1706,7 +1712,7 @@ async function startServer() {
     }
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store, max-age=0');
-    res.send(buildStandaloneAppHtml(record));
+    res.send(buildStandaloneAppHtml(record, routePrefix));
   });
 
   app.get('/app/:id/:asset', async (req, res) => {
@@ -1721,7 +1727,7 @@ async function startServer() {
       res.status(404).json({ exists: false, appId: cleanId });
       return;
     }
-    if (!servePublishedAsset(res, record, asset)) {
+    if (!servePublishedAsset(res, record, asset, '/app')) {
       res.status(404).send('Asset not found');
     }
   });
@@ -1736,7 +1742,37 @@ async function startServer() {
     }
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store, max-age=0');
-    res.send(buildStandaloneAppHtml(record));
+    res.send(buildStandaloneAppHtml(record, '/app'));
+  });
+
+  app.get('/p/:id/:asset', async (req, res) => {
+    const cleanId = sanitizeAppId(req.params.id || '');
+    const asset = normalizeAssetParam(req.params.asset || '');
+    if (!asset) {
+      res.status(404).send('Asset not found');
+      return;
+    }
+    const record = await loadPublishedApp(cleanId);
+    if (!record || !record.html) {
+      res.status(404).json({ exists: false, appId: cleanId });
+      return;
+    }
+    if (!servePublishedAsset(res, record, asset, '/p')) {
+      res.status(404).send('Asset not found');
+    }
+  });
+
+  app.get('/p/:id', async (req, res) => {
+    const cleanId = sanitizeAppId(req.params.id || '');
+    const record = await loadPublishedApp(cleanId);
+    if (!record || !record.html) {
+      res.status(404).setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.send(buildNotFoundAppHtml(cleanId));
+      return;
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    res.send(buildStandaloneAppHtml(record, '/p'));
   });
 
   app.post('/api/apps', async (req, res) => {
@@ -1842,11 +1878,11 @@ async function startServer() {
       ok: true,
       appId: record.appId,
       slug: record.slug,
-      path: `/app/${record.appId}`,
+      path: `/p/${record.appId}`,
       ...(hasLogoOrPwa && logo
         ? {
-            logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
-            manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
+            logoUrl: `/p/${record.appId}/icon-180.png?v=${record.version}`,
+            manifestUrl: `/p/${record.appId}/manifest.webmanifest?v=${record.version}`,
             themeColor: logo.themeColor,
           }
         : {}),

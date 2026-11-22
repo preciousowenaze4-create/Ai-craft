@@ -128,31 +128,22 @@ export function PromptComposer({
           : '0 6px 24px rgba(15, 15, 30, 0.045)',
       }}
     >
-      {/* Selected AI Header Bar at the top of the chat box */}
-      <div className="flex items-center justify-between gap-2 pb-1.5 mb-1 border-b border-black/[0.05]">
-        <div className="flex items-center gap-2 min-w-0">
-          <ProviderLogo
-            provider={activeModel?.provider}
-            modelId={activeModel?.id || selectedModel}
-            size={20}
-            trackingColor={theme.accentColor}
-          />
-          <span className="text-[12.5px] font-medium text-[#18181B] truncate">
-            {activeModel?.name ??
-              (modelsLoading
-                ? 'Connecting AI Craft Engine...'
-                : 'AI Craft Pro (4 Hydrogen)')}
-          </span>
-        </div>
-
-        <div className="flex items-center gap-1.5 -mr-1 shrink-0">
-          {isRestricted && (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 border border-amber-200 text-amber-800 text-[10.5px] font-semibold">
-              <ShieldAlert className="w-3 h-3" />
-              <span>Restricted</span>
+      {models.length > 1 && (
+        <div className="flex items-center justify-between gap-2 pb-1.5 mb-1 border-b border-black/[0.05]">
+          <div className="flex items-center gap-2 min-w-0">
+            <ProviderLogo
+              provider={activeModel?.provider}
+              modelId={activeModel?.id || selectedModel}
+              size={20}
+              trackingColor={theme.accentColor}
+            />
+            <span className="text-[12.5px] font-medium text-[#18181B] truncate">
+              {activeModel?.name ??
+                (modelsLoading ? 'Connecting AI Craft Engine...' : 'AI Craft')}
             </span>
-          )}
-          {models.length > 1 ? (
+          </div>
+
+          <div className="flex items-center gap-1.5 -mr-1 shrink-0">
             <ModelSelectorPopover
               mode={mode}
               models={models}
@@ -162,17 +153,9 @@ export function PromptComposer({
               onSelectModel={onSelectModel}
               onRetryModels={onRetryModels}
             />
-          ) : (
-            <span
-              className="inline-flex items-center gap-1.5 pr-1.5 text-[11px] font-medium text-[#71717A]"
-              title="Automatic backend multi-model failover active"
-            >
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-              <span>Auto</span>
-            </span>
-          )}
+          </div>
         </div>
-      </div>
+      )}
 
       {isRestricted && (
         <div className="mb-1.5 rounded-xl bg-amber-50 border border-amber-200 px-3 py-1.5 flex items-center gap-2 text-[12px] font-medium text-amber-900">

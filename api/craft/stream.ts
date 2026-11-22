@@ -202,7 +202,8 @@ export async function POST(request: Request): Promise<Response> {
           type: 'phase',
           phase: 'understanding',
           kind: 'chat',
-          label: 'Searching live web & thinking...',
+          action: 'Building',
+          label: 'Understanding request...',
         });
 
         const memAuth =
@@ -327,6 +328,7 @@ export async function POST(request: Request): Promise<Response> {
         await streamServerFreeAiRealTime({
           requestedModel,
           initialRoute: prepared.initialRoute,
+          isFastPatch: Boolean(prepared.isPatchMode),
           systemPrompt: prepared.systemPrompt,
           historyMessages: prepared.historyMessages,
           userPrompt: prepared.userPrompt,
@@ -355,12 +357,14 @@ export async function POST(request: Request): Promise<Response> {
               const headingMatches = Array.from(reasoningBuffer.matchAll(/\*\*([^*\n]{4,72})\*\*/g));
               const latestHeading =
                 headingMatches[headingMatches.length - 1]?.[1]?.trim() ||
-                'Planning screens, data & layout step by step...';
+                (prepared.initialRoute === 'build'
+                  ? 'Planning layout & logic...'
+                  : 'Thinking...');
               sendEvent({
                 type: 'phase',
                 phase: 'understanding',
                 kind: prepared.initialRoute === 'build' ? 'build' : 'chat',
-                action: 'Thinking',
+                action: prepared.initialRoute === 'build' ? 'Building' : 'Thinking',
                 label: latestHeading,
               });
             }
@@ -421,9 +425,10 @@ export async function POST(request: Request): Promise<Response> {
                   type: 'phase',
                   phase: 'building',
                   kind: 'build',
+                  action: 'Coding',
                   label: codeStart.isPatch
-                    ? 'Applying surgical code updates...'
-                    : 'Writing real-time code...',
+                    ? 'Updating code...'
+                    : 'Coding app files...',
                 });
               }
 
@@ -442,7 +447,7 @@ export async function POST(request: Request): Promise<Response> {
                 const active = artifacts[artifacts.length - 1];
                 sendEvent({
                   type: 'file',
-                  action: codeStart.isPatch ? 'Updating' : active?.action || 'Coding',
+                  action: 'Coding',
                   path: active?.path || 'index.html',
                   allFiles: paths,
                   bytesBuilt: htmlSoFar.length,

@@ -239,10 +239,13 @@ export function getAppLogoConfig(record: PublishedAppRecord): AppLogoConfig {
   });
 }
 
-export function buildAppManifestJson(record: PublishedAppRecord) {
+export function buildAppManifestJson(
+  record: PublishedAppRecord,
+  routePrefix: '/p' | '/app' = '/p'
+) {
   const logo = getAppLogoConfig(record);
   const v = Math.max(1, Number(record.version) || 1);
-  const basePath = `/app/${record.appId}`;
+  const basePath = `${routePrefix}/${record.appId}`;
   return {
     id: basePath,
     name: record.title || 'App',
@@ -278,8 +281,11 @@ export function buildAppManifestJson(record: PublishedAppRecord) {
   };
 }
 
-export function buildAppServiceWorkerJs(record: PublishedAppRecord): string {
-  const basePath = `/app/${record.appId}`;
+export function buildAppServiceWorkerJs(
+  record: PublishedAppRecord,
+  routePrefix: '/p' | '/app' = '/p'
+): string {
+  const basePath = `${routePrefix}/${record.appId}`;
   const cacheName = `aicraft-app-${record.appId}-v${Math.max(1, Number(record.version) || 1)}`;
   return `const CACHE_NAME = ${JSON.stringify(cacheName)};
 const APP_URL = ${JSON.stringify(basePath)};
@@ -344,14 +350,17 @@ self.addEventListener('fetch', (event) => {
 `;
 }
 
-export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
+export function buildStandaloneAppHtml(
+  record: PublishedAppRecord,
+  routePrefix: '/p' | '/app' = '/p'
+): string {
   let html = String(record.html || '').trim();
   if (!html) return '';
 
   const pwaAndLogoEnabled = isAppLogoOrPwaEnabled(record);
   const logo = getAppLogoConfig(record);
   const v = Math.max(1, Number(record.version) || 1);
-  const basePath = `/app/${record.appId}`;
+  const basePath = `${routePrefix}/${record.appId}`;
 
   // Strip stale or unsolicited PWA icon/manifest tags so non-PWA apps stay clean web/app pages
   html = html
@@ -554,8 +563,9 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
 
   if (pwaInfo.enabled && 'serviceWorker' in navigator) {
     window.addEventListener('load', function() {
+      var swScope = ${JSON.stringify(basePath)};
       navigator.serviceWorker
-        .register('/app/' + encodeURIComponent(pwaInfo.appId) + '/sw.js', { scope: '/app/' + pwaInfo.appId })
+        .register(swScope + '/sw.js', { scope: swScope })
         .catch(function() {});
     });
   }
