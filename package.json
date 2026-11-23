@@ -13,7 +13,11 @@
     "start": "tsx server.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "npm run lint && npm run build && npm run test:mesh && npm run test:e2e && npm run test:friendly",
+    "test:mesh": "tsx scripts/test-free-ai-mesh.ts",
+    "test:e2e": "tsx scripts/test-e2e-mesh-stream.ts",
+    "test:friendly": "tsx scripts/test-friendly-error.ts"
   },
   "dependencies": {
     "@google/genai": "^3.6.0",

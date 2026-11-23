@@ -3,6 +3,12 @@
  * Verifies the full SSE pipeline works keyless: mesh failover → done + fullText.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import { emptyAiEnv, scrubAiEnv } from './_testEnv.js';
+
+// Strip ambient provider credentials BEFORE spawning the server (it inherits
+// process.env) — CI runners have open networks, so a leaked GITHUB_TOKEN or
+// default Pollinations URL could answer for real and break assertions.
+scrubAiEnv();
 
 const children: ChildProcess[] = [];
 
@@ -52,16 +58,16 @@ run('node', ['scripts/mock-free-ai-server.mjs', 'rate-limited', '4591']);
 run('node', ['scripts/mock-free-ai-server.mjs', 'streaming', '4592']);
 await new Promise((r) => setTimeout(r, 600));
 
-// 2. dev server with mesh env (no Gemini keys)
+// 2. dev server with mesh env (no Gemini keys). emptyAiEnv() shields the
+// spawn from a local .env file: dotenv skips keys already present (even as
+// ''), so real credentials can never leak into the test server process.
 const PORT = process.env.E2E_PORT || '4610';
 const server = run(
   'npx',
   ['tsx', 'server.ts'],
   {
+    ...emptyAiEnv(),
     PORT,
-    GEMINI_API_KEY: '',
-    GEMINI_API_KEY_1: '',
-    GOOGLE_API_KEY: '',
     SELF_HOSTED_LLM_URL: 'http://127.0.0.1:4591/v1',
     SELF_HOSTED_LLM_MODEL: 'mock-rate-limited',
     POLLINATIONS_BASE_URL: 'http://127.0.0.1:4592/openai',
