@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDown,
   ArrowUp,
@@ -1193,6 +1193,78 @@ export function BuilderWorkspace({
     return `${bridgeScript}${latestPreviewHtml}`;
   }, [latestPreviewHtml, secrets, projectId]);
 
+  // Live preview rendering: blob-URL iframe instead of srcDoc.
+  // Blob documents have an opaque base URL, so we inject a <base href> to keep
+  // relative asset resolution identical to the previous srcDoc behavior.
+  // While streaming, rebuild the blob at most every 1200ms (throttle with the
+  // latest HTML); rebuild immediately on first render, when the stream ends,
+  // and for any non-streaming change (secrets, manual refresh).
+  const [previewObjectUrl, setPreviewObjectUrl] = useState<string | null>(null);
+  const previewObjectUrlRef = useRef<string | null>(null);
+  const lastPreviewBuildRef = useRef(0);
+
+  useLayoutEffect(() => {
+    if (!connectedPreviewHtml) {
+      const prev = previewObjectUrlRef.current;
+      previewObjectUrlRef.current = null;
+      lastPreviewBuildRef.current = 0;
+      setPreviewObjectUrl(null);
+      if (prev) URL.revokeObjectURL(prev);
+      return;
+    }
+    const buildObjectUrl = () => {
+      const html = connectedPreviewHtml;
+      if (!html) return;
+      let baseHref = '/';
+      try {
+        baseHref = new URL('.', window.location.href).href;
+      } catch {
+        // fall back to root
+      }
+      const baseTag = `<base href="${baseHref}">`;
+      let withBase = html;
+      if (!/<base\b/i.test(html)) {
+        if (/<head[^>]*>/i.test(html)) {
+          withBase = html.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`);
+        } else if (/<html[^>]*>/i.test(html)) {
+          withBase = html.replace(/<html([^>]*)>/i, `<html$1><head>${baseTag}</head>`);
+        } else {
+          const doctypeMatch = /^<!DOCTYPE[^>]*>/i.exec(html);
+          withBase = doctypeMatch
+            ? html.slice(0, doctypeMatch[0].length) +
+              `<html><head>${baseTag}</head>` +
+              html.slice(doctypeMatch[0].length)
+            : baseTag + html;
+        }
+      }
+      const url = URL.createObjectURL(new Blob([withBase], { type: 'text/html' }));
+      const prev = previewObjectUrlRef.current;
+      previewObjectUrlRef.current = url;
+      lastPreviewBuildRef.current = Date.now();
+      setPreviewObjectUrl(url);
+      if (prev && prev !== url) URL.revokeObjectURL(prev);
+    };
+    const sinceLastBuild = Date.now() - lastPreviewBuildRef.current;
+    const minGapMs = isStreaming ? 1200 : 0;
+    const delayMs = Math.max(0, minGapMs - sinceLastBuild);
+    if (delayMs === 0) {
+      buildObjectUrl();
+      return;
+    }
+    const timer = window.setTimeout(buildObjectUrl, delayMs);
+    return () => window.clearTimeout(timer);
+  }, [connectedPreviewHtml, isStreaming]);
+
+  // Revoke the last blob URL on unmount.
+  useEffect(
+    () => () => {
+      const current = previewObjectUrlRef.current;
+      previewObjectUrlRef.current = null;
+      if (current) URL.revokeObjectURL(current);
+    },
+    []
+  );
+
   const activeModel = useMemo(
     () => models.find((m) => m.id === selectedModel) ?? null,
     [models, selectedModel]
@@ -1741,7 +1813,7 @@ export function BuilderWorkspace({
             ref={previewIframeRef}
             key={`${projectId}-${previewKey}-${secretsFingerprint}`}
             title={`${projectTitle} Preview`}
-            srcDoc={connectedPreviewHtml}
+            src={previewObjectUrl ?? undefined}
             sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads"
             className="w-full h-full border-0 block bg-transparent"
           />

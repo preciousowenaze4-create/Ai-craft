@@ -52,6 +52,12 @@ import {
   recordGeminiApiError,
   recordGeminiApiUsage,
 } from './_geminiUsage.js';
+import {
+  FreeAiMeshUnavailableError,
+  completeFreeAiMesh,
+  isFreeAiMeshAvailable,
+  streamFreeAiMesh,
+} from './_freeAiMesh.js';
 
 export function createGeminiClient(apiKey: string): GoogleGenAI {
   return new GoogleGenAI({
@@ -252,7 +258,8 @@ async function runBackendDesignArchitect(params: {
   visualHints?: VisualHintsSpec | null;
   searchQuery?: string;
 }): Promise<string> {
-  if (!hasServerFreeAiKey()) return '';
+  const hasGemini = hasServerFreeAiKey();
+  if (!hasGemini && !isFreeAiMeshAvailable()) return '';
 
   const designerParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
 
@@ -295,50 +302,65 @@ async function runBackendDesignArchitect(params: {
   });
 
   const generatePromise = (async () => {
-    const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'design' });
-    const clientMap = new Map<string, GoogleGenAI>();
-    const badKeys = new Set<string>();
+    if (hasGemini) {
+      const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'design' });
+      const clientMap = new Map<string, GoogleGenAI>();
+      const badKeys = new Set<string>();
 
-    for (const candidate of candidates.slice(0, 6)) {
-      if (badKeys.has(candidate.keyFingerprint)) continue;
-      let ai = clientMap.get(candidate.apiKey);
-      if (!ai) {
-        ai = createGeminiClient(candidate.apiKey);
-        clientMap.set(candidate.apiKey, ai);
-      }
+      for (const candidate of candidates.slice(0, 6)) {
+        if (badKeys.has(candidate.keyFingerprint)) continue;
+        let ai = clientMap.get(candidate.apiKey);
+        if (!ai) {
+          ai = createGeminiClient(candidate.apiKey);
+          clientMap.set(candidate.apiKey, ai);
+        }
 
-      try {
-        const response = await ai.models.generateContent({
-          model: candidate.upstreamModelId,
-          contents: [{ role: 'user', parts: designerParts }],
-          config: {
-            systemInstruction:
-              'You are the internal UI/UX Design Architect inside AI Craft. Produce a crisp, practical visual design blueprint (colors, layout hierarchy, components, multi-screen structure) with zero HTML or code fences.',
-          },
-        });
-        const textOut = (response.text || '').trim().slice(0, 1400);
-        const usage = response.usageMetadata;
-        void recordGeminiApiUsage({
-          modelId: candidate.upstreamModelId,
-          promptTokens: usage?.promptTokenCount,
-          candidatesTokens: usage?.candidatesTokenCount,
-          totalTokens: usage?.totalTokenCount ?? Math.max(120, Math.ceil(textOut.length / 4)),
-          source: 'design-architect',
-        });
-        if (textOut) return textOut;
-      } catch (err) {
-        const lower = extractReadableErrorMessage(err).toLowerCase();
-        if (isInvalidApiKeyError(lower)) {
-          markApiKeyInvalidCooldown(candidate.apiKey);
-          badKeys.add(candidate.keyFingerprint);
-        } else if (isModelRetiredOrUnavailableError(lower)) {
-          markGatewayCandidateCooldown(candidate.cooldownKey, 6 * 60 * 60_000, true);
-        } else {
-          markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
+        try {
+          const response = await ai.models.generateContent({
+            model: candidate.upstreamModelId,
+            contents: [{ role: 'user', parts: designerParts }],
+            config: {
+              systemInstruction:
+                'You are the internal UI/UX Design Architect inside AI Craft. Produce a crisp, practical visual design blueprint (colors, layout hierarchy, components, multi-screen structure) with zero HTML or code fences.',
+            },
+          });
+          const textOut = (response.text || '').trim().slice(0, 1400);
+          const usage = response.usageMetadata;
+          void recordGeminiApiUsage({
+            modelId: candidate.upstreamModelId,
+            promptTokens: usage?.promptTokenCount,
+            candidatesTokens: usage?.candidatesTokenCount,
+            totalTokens: usage?.totalTokenCount ?? Math.max(120, Math.ceil(textOut.length / 4)),
+            source: 'design-architect',
+          });
+          if (textOut) return textOut;
+        } catch (err) {
+          const lower = extractReadableErrorMessage(err).toLowerCase();
+          if (isInvalidApiKeyError(lower)) {
+            markApiKeyInvalidCooldown(candidate.apiKey);
+            badKeys.add(candidate.keyFingerprint);
+          } else if (isModelRetiredOrUnavailableError(lower)) {
+            markGatewayCandidateCooldown(candidate.cooldownKey, 6 * 60 * 60_000, true);
+          } else {
+            markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
+          }
         }
       }
     }
-    return '';
+
+    // Free AI mesh fallback so the design pre-pass also runs keyless.
+    const meshText = await completeFreeAiMesh({
+      taskKind: 'chat',
+      systemPrompt:
+        'You are the internal UI/UX Design Architect inside AI Craft. Produce a crisp, practical visual design blueprint (colors, layout hierarchy, components, multi-screen structure) with zero HTML or code fences.',
+      userPrompt: designerParts
+        .map((p) => p.text || '')
+        .filter(Boolean)
+        .join('\n'),
+      attachmentDataUrl: params.attachmentDataUrl ?? null,
+      timeoutMs: 3800,
+    });
+    return meshText ? meshText.trim().slice(0, 1400) : '';
   })();
 
   return Promise.race([generatePromise, timeoutPromise]);
@@ -396,7 +418,7 @@ export async function prepareRealtimePrompt(
   const shouldRunDesignEngine =
     !input.forceChat &&
     !naturalMediaIntent &&
-    hasServerFreeAiKey() &&
+    (hasServerFreeAiKey() || isFreeAiMeshAvailable()) &&
     initialRoute === 'build' &&
     (Boolean(input.attachmentDataUrl) || wantsFullRedesign);
 
@@ -831,16 +853,29 @@ export async function streamServerFreeAiRealTime(params: {
   onContentChunk: (chunkText: string) => void;
 }): Promise<{ rawOutput: string; modelUsed: string; modelName: string; provider: string }> {
   const allKeys = getServerGeminiApiKeys();
-  if (allKeys.length === 0) {
-    throw new Error(
-      'GEMINI_API_KEY is not configured on the server yet. Add GEMINI_API_KEY in Vercel Environment Variables (or Settings > Secrets) and redeploy.'
-    );
-  }
-
   const parsedModel = parseGatewayModelIdentifier(params.requestedModel);
   const flagshipModel = GEMINI_BUILDER_MODELS[0];
   const route = params.initialRoute || 'build';
   const taskKind = route === 'chat' ? 'chat' : 'build';
+
+  const runFreeAiMeshLane = () =>
+    streamFreeAiMesh({
+      taskKind,
+      systemPrompt: params.systemPrompt,
+      historyMessages: params.historyMessages,
+      userPrompt: params.userPrompt,
+      attachmentDataUrl: params.attachmentDataUrl ?? null,
+      signal: params.signal,
+      onModelMeta: params.onModelMeta,
+      onContentChunk: params.onContentChunk,
+      onReasoningChunk: params.onReasoningChunk,
+    });
+
+  if (allKeys.length === 0) {
+    // No Gemini keys configured — the free AI mesh (self-hosted, free-tier
+    // providers, keyless Pollinations) is the primary engine.
+    return runFreeAiMeshLane();
+  }
 
   params.onModelMeta?.({
     modelId: flagshipModel.id,
@@ -1101,7 +1136,17 @@ export async function streamServerFreeAiRealTime(params: {
       source: 'craft-stream',
     }).catch(() => undefined);
   }
-  throw new Error(formatGeminiApiError(errorToReport, flagshipModel.name));
+
+  // Gemini passes exhausted → fail over to the free AI mesh (self-hosted,
+  // free-tier providers, keyless Pollinations) before surfacing an error.
+  try {
+    return await runFreeAiMeshLane();
+  } catch (meshErr) {
+    if (meshErr instanceof FreeAiMeshUnavailableError) {
+      throw new Error(formatGeminiApiError(errorToReport, flagshipModel.name));
+    }
+    throw meshErr;
+  }
 }
 
 /**
@@ -1113,7 +1158,7 @@ export async function repairIncompleteBuildHtml(params: {
   userMessage: string;
   mode: 'mobile' | 'web';
 }): Promise<string> {
-  if (!hasServerFreeAiKey() || !params.brokenHtml.trim()) return '';
+  if (!params.brokenHtml.trim()) return '';
 
   const repairPrompt = [
     `The built ${params.mode} app HTML for "${params.userMessage.slice(0, 200)}" failed validation: ${params.validationReason}`,
@@ -1124,30 +1169,50 @@ export async function repairIncompleteBuildHtml(params: {
     '```',
   ].join('\n');
 
+  const extractAndHarden = (raw: string): string => {
+    const extracted = extractPreviewHtmlFromRaw(raw) || finalizePartialPreviewHtml(raw);
+    if (!extracted) return '';
+    const hardened = sanitizeAndHardenPreviewHtml(extracted);
+    return validateBuiltAppHtml(hardened).valid ? hardened : '';
+  };
+
   const repairPromise = (async () => {
-    const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'repair' });
-    const clientMap = new Map<string, GoogleGenAI>();
-    for (const candidate of candidates.slice(0, 5)) {
-      let ai = clientMap.get(candidate.apiKey);
-      if (!ai) {
-        ai = createGeminiClient(candidate.apiKey);
-        clientMap.set(candidate.apiKey, ai);
-      }
-      try {
-        const res = await ai.models.generateContent({
-          model: candidate.upstreamModelId,
-          contents: [{ role: 'user', parts: [{ text: repairPrompt }] }],
-        });
-        const raw = (res.text || '').trim();
-        const extracted = extractPreviewHtmlFromRaw(raw) || finalizePartialPreviewHtml(raw);
-        if (extracted) {
-          const hardened = sanitizeAndHardenPreviewHtml(extracted);
-          if (validateBuiltAppHtml(hardened).valid) {
-            return hardened;
-          }
+    if (hasServerFreeAiKey()) {
+      const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'repair' });
+      const clientMap = new Map<string, GoogleGenAI>();
+      for (const candidate of candidates.slice(0, 5)) {
+        let ai = clientMap.get(candidate.apiKey);
+        if (!ai) {
+          ai = createGeminiClient(candidate.apiKey);
+          clientMap.set(candidate.apiKey, ai);
         }
-      } catch {
-        // try next fast repair candidate
+        try {
+          const res = await ai.models.generateContent({
+            model: candidate.upstreamModelId,
+            contents: [{ role: 'user', parts: [{ text: repairPrompt }] }],
+          });
+          const raw = (res.text || '').trim();
+          const hardened = extractAndHarden(raw);
+          if (hardened) return hardened;
+        } catch {
+          // try next fast repair candidate
+        }
+      }
+    }
+
+    // Free AI mesh fallback (self-hosted / free-tier providers / keyless
+    // Pollinations) so repair also works with zero Gemini keys configured.
+    if (isFreeAiMeshAvailable()) {
+      const meshRaw = await completeFreeAiMesh({
+        taskKind: 'build',
+        systemPrompt:
+          'You are a strict single-file HTML repair engine. Output ONLY the complete corrected document, no commentary.',
+        userPrompt: repairPrompt,
+        timeoutMs: 10000,
+      });
+      if (meshRaw) {
+        const hardened = extractAndHarden(meshRaw);
+        if (hardened) return hardened;
       }
     }
     return '';

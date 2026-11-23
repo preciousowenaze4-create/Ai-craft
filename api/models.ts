@@ -3,6 +3,7 @@ import {
   fetchAllGatewayModels,
   hasServerFreeAiKey,
 } from './_aiGateways.js';
+import { getFreeAiMeshStatus } from './_freeAiMesh.js';
 
 export async function GET(request: Request): Promise<Response> {
   try {
@@ -11,16 +12,22 @@ export async function GET(request: Request): Promise<Response> {
     const forceRefresh = reqUrl.searchParams.get('refresh') === '1';
 
     const result = await fetchAllGatewayModels(referer, forceRefresh);
+    const mesh = getFreeAiMeshStatus();
 
     return Response.json(
       {
         models: result.models,
         gateways: result.gateways,
         geminiConfigured: result.geminiConfigured,
-        serverFreeAiReady: result.serverFreeAiReady,
-        pollinationsConfigured: false,
+        serverFreeAiReady: result.geminiConfigured || mesh.hasAny,
+        pollinationsConfigured: mesh.pollinationsConfigured,
         puterConfigured: false,
-        keyless: false,
+        keyless: mesh.hasKeyless,
+        freeAiMesh: {
+          hasAny: mesh.hasAny,
+          hasKeyless: mesh.hasKeyless,
+          providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
+        },
         freeOnly: true,
       },
       {
@@ -30,14 +37,20 @@ export async function GET(request: Request): Promise<Response> {
       }
     );
   } catch {
+    const mesh = getFreeAiMeshStatus();
     return Response.json(
       {
         models: GEMINI_BUILDER_MODELS,
         geminiConfigured: hasServerFreeAiKey(),
-        serverFreeAiReady: hasServerFreeAiKey(),
-        pollinationsConfigured: false,
+        serverFreeAiReady: hasServerFreeAiKey() || mesh.hasAny,
+        pollinationsConfigured: mesh.pollinationsConfigured,
         puterConfigured: false,
-        keyless: false,
+        keyless: mesh.hasKeyless,
+        freeAiMesh: {
+          hasAny: mesh.hasAny,
+          hasKeyless: mesh.hasKeyless,
+          providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
+        },
         freeOnly: true,
       },
       {
