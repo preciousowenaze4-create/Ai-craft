@@ -464,7 +464,10 @@ export default function App() {
   const [transactionsLoading, setTransactionsLoading] = useState<boolean>(false);
 
   // Track active network readers per turnId (never globally aborted when switching projects)
-  const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
+  // Transient mesh errors (busy/cooling) auto-retry silently before we ever
+// show a red bubble — the user should almost never see "all engines busy".
+const transientAutoRetryRef = useRef<Record<string, number>>({});
+const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
   const retriedTurnsRef = useRef<Map<string, number>>(new Map());
   const notifiedTurnIdsRef = useRef<Set<string>>(new Set());
   const wasBackgroundedRef = useRef<boolean>(false);
@@ -2029,12 +2032,40 @@ export default function App() {
                 sawTerminalEvent = true;
                 stopCreditTicker();
                 flushBuffered();
-                updateTurn(projectId, turnId, (t) => ({
-                  ...t,
-                  phase: 'error',
-                  phaseLabel: 'Error',
-                  errorMessage: evt.message ?? 'AI Craft encountered an error.',
-                }));
+                const rawMsg = evt.message ?? 'AI Craft encountered an error.';
+                const isTransientMesh =
+                  /busy or unreachable|cooling down|retry in a few seconds|No free AI engine/i.test(
+                    rawMsg
+                  );
+                const priorAuto = transientAutoRetryRef.current[turnId] ?? 0;
+                if (isTransientMesh && priorAuto < 2) {
+                  // Silent auto-retry: another free AI lane takes over after a
+                  // short pause instead of surfacing a wall of red text.
+                  transientAutoRetryRef.current[turnId] = priorAuto + 1;
+                  updateTurn(projectId, turnId, (t) => ({
+                    ...t,
+                    phase: 'building',
+                    phaseLabel:
+                      priorAuto === 0
+                        ? 'Free engines were busy — retrying…'
+                        : 'Switching to another free AI…',
+                    errorMessage: undefined,
+                  }));
+                  window.setTimeout(() => {
+                    void resumeJobStreamRef.current?.(projectId, turnId, latestJobId);
+                  }, 3_500 + priorAuto * 2_500);
+                } else {
+                  if (!isTransientMesh) transientAutoRetryRef.current[turnId] = 0;
+                  updateTurn(projectId, turnId, (t) => ({
+                    ...t,
+                    phase: 'error',
+                    phaseLabel: 'Error',
+                    errorMessage:
+                      rawMsg.length > 260
+                        ? `${rawMsg.slice(0, 260)}… Please retry in a few seconds.`
+                        : rawMsg,
+                  }));
+                }
               }
             } catch {
               // ignore malformed chunk
@@ -2250,11 +2281,36 @@ export default function App() {
             err instanceof Error
               ? err.message
               : 'Unable to reach AI Craft engine right now.';
+          const isTransientMesh =
+            /busy or unreachable|cooling down|retry in a few seconds|No free AI engine/i.test(
+              msg
+            );
+          const priorAuto = transientAutoRetryRef.current[turnId] ?? 0;
+          if (isTransientMesh && priorAuto < 2) {
+            transientAutoRetryRef.current[turnId] = priorAuto + 1;
+            updateTurn(projectId, turnId, (t) => ({
+              ...t,
+              phase: 'building',
+              phaseLabel:
+                priorAuto === 0
+                  ? 'Free engines were busy — retrying…'
+                  : 'Switching to another free AI…',
+              errorMessage: undefined,
+            }));
+            window.setTimeout(() => {
+              void resumeJobStreamRef.current?.(projectId, turnId, knownJobId);
+            }, 3_500 + priorAuto * 2_500);
+            return;
+          }
+          if (!isTransientMesh) transientAutoRetryRef.current[turnId] = 0;
           updateTurn(projectId, turnId, (t) => ({
             ...t,
             phase: 'error',
             phaseLabel: 'Error',
-            errorMessage: msg,
+            errorMessage:
+              msg.length > 260
+                ? `${msg.slice(0, 260)}… Please retry in a few seconds.`
+                : msg,
           }));
         }
       }

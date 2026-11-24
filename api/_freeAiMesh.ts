@@ -92,7 +92,13 @@ export class FreeAiMeshAllFailedError extends Error {
   readonly code = 'mesh_all_failed' as const;
   readonly details: string[];
   constructor(details: string[]) {
-    const tail = details.slice(-3).join('; ');
+    // Keep the user-facing bubble SHORT: each detail is already capped by
+    // normalizeMeshError, but three long provider messages still made a wall
+    // of red text on mobile. Show the last two, hard-truncated.
+    const tail = details
+      .slice(-2)
+      .map((d) => (d.length > 110 ? `${d.slice(0, 110)}...` : d))
+      .join('; ');
     super(
       `All free AI engines are busy or unreachable right now${tail ? ` (${tail})` : ''}. Please retry in a few seconds.`
     );
@@ -766,6 +772,16 @@ function normalizeMeshError(err: unknown): MeshErrorInfo {
   return { status: null, message: String(err).slice(0, 300) };
 }
 
+/** Pollinations-style "someone else is using this lane right now" — always
+ *  transient; callers should wait out the short cooldown and retry instead of
+ *  burning the walk / failing the agent. */
+export function isBusyMeshError(info: MeshErrorInfo): boolean {
+  const lower = info.message.toLowerCase();
+  return /previous request is still running|1 request at a time per ip|wait for it to finish/.test(
+    lower
+  );
+}
+
 export function cooldownForMeshError(
   info: MeshErrorInfo
 ): { ms: number; hard: boolean } {
@@ -775,11 +791,7 @@ export function cooldownForMeshError(
   // attempt gets the single-flight slot, so cool for seconds only. Checked
   // BEFORE every other branch (busy arrives with various status codes) so a
   // busy storm can never pin models on 45–90s cooldowns.
-  if (
-    /previous request is still running|1 request at a time per ip|wait for it to finish/.test(
-      lower
-    )
-  ) {
+  if (isBusyMeshError(info)) {
     return { ms: 6_000, hard: false };
   }
   if (
@@ -1365,25 +1377,25 @@ function pickRaceCandidates(candidates: MeshCandidate[], count: number): MeshCan
  */
 export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStreamResult> {
   const budget = budgetFor(params.taskKind);
-  let cooldownWaitTried = false;
+  let cooldownWaits = 0;
 
   // Bounded self-heal: when every configured engine is only SHORT-cooling
   // (busy storms recover in seconds), wait for the earliest one instead of
   // surfacing "all configured engines are cooling down". Long cooldowns
   // (rate-limit 90s, network 45s…) still fail fast with the friendly error.
   const tryWaitForCooldowns = async (): Promise<boolean> => {
-    if (cooldownWaitTried) return false;
+    // Up to two bounded waits per walk: busy cooldowns are 6s, so one wait
+    // can expire while a cross-instance lane still holds the provider —
+    // a second short wait gives it room to finish instead of failing.
+    if (cooldownWaits >= 2) return false;
     if (!getFreeAiMeshStatus().hasAny) return false;
     if (buildMeshCandidates().length > 0) return false;
     const earliest = earliestMeshCooldownMs();
     if (earliest <= 0) return false;
-    const capMs = readEnvNumber(
-      'MESH_COOLDOWN_WAIT_MS',
-      params.taskKind === 'chat' ? 8_000 : 6_000
-    );
+    const capMs = readEnvNumber('MESH_COOLDOWN_WAIT_MS', 8_000);
     if (earliest > capMs) return false;
-    cooldownWaitTried = true;
-    await sleepWithSignal(Math.min(earliest + 200, capMs + 200), params.signal).catch(
+    cooldownWaits += 1;
+    await sleepWithSignal(Math.min(earliest + 300, capMs + 300), params.signal).catch(
       () => undefined
     );
     return buildMeshCandidates().length > 0;
@@ -1434,17 +1446,34 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
       if (params.signal?.aborted) throw new Error('Request cancelled.');
       if (Date.now() > deadlineAt || attempts >= budget.maxAttempts) return null;
       attempts += 1;
-      try {
-        return await runMeshStreamAttempt({
-          candidate,
-          walk: params,
-          budget,
-          onForwardChunk: (chunk) => params.onContentChunk?.(chunk),
-        });
-      } catch (err) {
-        if (params.signal?.aborted) throw new Error('Request cancelled.');
-        const info = normalizeMeshError(err);
-        details.push(`${candidate.providerId}: ${info.message}`);
+      let busyRetries = 0;
+      for (;;) {
+        try {
+          return await runMeshStreamAttempt({
+            candidate,
+            walk: params,
+            budget,
+            onForwardChunk: (chunk) => params.onContentChunk?.(chunk),
+          });
+        } catch (err) {
+          if (params.signal?.aborted) throw new Error('Request cancelled.');
+          const info = normalizeMeshError(err);
+          // Another lane (chat race, side agent, separate serverless instance)
+          // holds this provider right now. Wait out the 6s busy cooldown and
+          // retry THIS lane once — a fault elsewhere must not fail the walk.
+          if (
+            isBusyMeshError(info) &&
+            busyRetries < 1 &&
+            Date.now() + 6_800 < deadlineAt
+          ) {
+            busyRetries += 1;
+            await sleepWithSignal(6_400, params.signal).catch(() => undefined);
+            if (params.signal?.aborted) throw new Error('Request cancelled.');
+            continue;
+          }
+          details.push(`${candidate.providerId}: ${info.message}`);
+          break;
+        }
       }
     }
     return null;
@@ -1485,7 +1514,9 @@ export async function completeFreeAiMesh(params: {
     // Short busy cooldowns: wait them out once (bounded) instead of silently
     // degrading the caller to architect-only output.
     const earliest = earliestMeshCooldownMs();
-    const waitCapMs = Math.min(attemptMs, 5_000);
+    // Must be able to cover a full 6s busy cooldown (was 5s — always too
+    // short, so side agents failed instantly while Pollinations was busy).
+    const waitCapMs = Math.min(attemptMs, 8_000);
     if (earliest > 0 && earliest <= waitCapMs && getFreeAiMeshStatus().hasAny) {
       await sleepWithSignal(earliest + 200, params.signal).catch(() => undefined);
       candidates = buildMeshCandidates();
@@ -1501,30 +1532,48 @@ export async function completeFreeAiMesh(params: {
   for (const candidate of candidates) {
     if (params.signal?.aborted) return null;
     if (Date.now() > deadlineAt) return null;
-    const controller = new AbortController();
-    const unlink = linkSignal(params.signal, controller);
-    try {
-      const out = await completeOneMeshCandidate(candidate, {
-        taskKind: params.taskKind,
-        systemPrompt: params.systemPrompt,
-        historyMessages: params.historyMessages,
-        userPrompt: params.userPrompt,
-        attachmentDataUrl: params.attachmentDataUrl,
-        signal: controller,
-        firstByteTimeoutMs: attemptMs,
-      });
-      if (out.trim()) {
-        recordDailyUsage(candidate.providerId, candidate.model);
-        return out;
+    let busyRetries = 0;
+    for (;;) {
+      const controller = new AbortController();
+      const unlink = linkSignal(params.signal, controller);
+      try {
+        const out = await completeOneMeshCandidate(candidate, {
+          taskKind: params.taskKind,
+          systemPrompt: params.systemPrompt,
+          historyMessages: params.historyMessages,
+          userPrompt: params.userPrompt,
+          attachmentDataUrl: params.attachmentDataUrl,
+          signal: controller,
+          firstByteTimeoutMs: attemptMs,
+        });
+        if (out.trim()) {
+          recordDailyUsage(candidate.providerId, candidate.model);
+          return out;
+        }
+        markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
+        break;
+      } catch (err) {
+        if (params.signal?.aborted) return null;
+        const info = normalizeMeshError(err);
+        const { ms, hard } = cooldownForMeshError(info);
+        markGatewayCandidateCooldown(candidate.cooldownKey, ms, hard);
+        // Busy = another lane holds the provider. Wait out the short cooldown
+        // and retry this lane once before moving on (fault isolation).
+        if (
+          isBusyMeshError(info) &&
+          !hard &&
+          busyRetries < 1 &&
+          Date.now() + ms + 600 < deadlineAt
+        ) {
+          busyRetries += 1;
+          await sleepWithSignal(ms + 400, params.signal).catch(() => undefined);
+          if (params.signal?.aborted) return null;
+          continue;
+        }
+        break;
+      } finally {
+        unlink();
       }
-      markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
-    } catch (err) {
-      if (params.signal?.aborted) return null;
-      const info = normalizeMeshError(err);
-      const { ms, hard } = cooldownForMeshError(info);
-      markGatewayCandidateCooldown(candidate.cooldownKey, ms, hard);
-    } finally {
-      unlink();
     }
   }
   return null;
