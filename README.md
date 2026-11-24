@@ -66,9 +66,21 @@ Other scripts:
 
 | Script | Purpose |
 | --- | --- |
+| `npm test` | Full gate: lint → build → mesh/e2e/friendly-error tests (same as CI) |
+| `npm run test:mesh` | Free AI mesh failover/cooldown tests against local mocks |
+| `npm run test:e2e` | Boots the server + drives `/api/craft/stream` over SSE (chat + build) |
+| `npm run test:friendly` | Asserts the keyless friendly-error contract |
 | `npm run lint` | TypeScript type-check (`tsc --noEmit`) |
 | `npm run preview` | Vite preview of the built client only |
 | `npm run clean` | Remove `dist/` |
+
+### Continuous integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs `npm ci` + `npm test` on every
+push and pull request. The test suites scrub all ambient AI-provider
+credentials and talk only to local mock lanes (`scripts/mock-free-ai-server.mjs`),
+so CI needs no secrets and stays deterministic even though runners have open
+network access.
 
 ## Environment variables
 

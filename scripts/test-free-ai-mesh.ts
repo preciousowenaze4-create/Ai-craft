@@ -13,17 +13,20 @@
  *   3. completeFreeAiMesh returns non-streaming text from the healthy lane.
  *   4. streamServerFreeAiRealTime (engine entry) works with zero Gemini keys.
  */
-process.env.GEMINI_API_KEY = '';
-process.env.GEMINI_API_KEY_1 = '';
-delete process.env.GOOGLE_API_KEY;
+// Scrub ambient provider credentials first (CI runners have open networks —
+// a leaked GITHUB_TOKEN or GROQ key could answer for real and break assertions),
+// then configure only the two local mock lanes this test drives.
+import { scrubAiEnv } from './_testEnv.js';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+
+scrubAiEnv();
 process.env.SELF_HOSTED_LLM_URL = 'http://127.0.0.1:4591/v1';
 process.env.SELF_HOSTED_LLM_MODEL = 'mock-rate-limited';
 process.env.POLLINATIONS_BASE_URL = 'http://127.0.0.1:4592/openai';
 process.env.POLLINATIONS_MODELS = 'openai,openai-fast';
 
 // Spawn the two mock servers this test expects (rate-limited lane + healthy lane).
-import { spawn } from 'node:child_process';
-import path from 'node:path';
 
 const mockScript = path.join(import.meta.dirname, 'mock-free-ai-server.mjs');
 const mocks = [

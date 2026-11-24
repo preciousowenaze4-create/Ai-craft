@@ -1,10 +1,15 @@
-// Default env: no gemini keys, live providers blocked in sandbox → mesh all-fail
-// must produce the friendly aggregate error, not the old GEMINI_API_KEY message.
-delete process.env.GEMINI_API_KEY;
-delete process.env.GEMINI_API_KEY_1;
-delete process.env.GOOGLE_API_KEY;
-delete process.env.SELF_HOSTED_LLM_URL;
-delete process.env.POLLINATIONS_BASE_URL;
+// Keyless default env → mesh all-fail must produce the friendly aggregate
+// error, not the old GEMINI_API_KEY message.
+//
+// Scrub ALL ambient provider credentials, then point the one keyless lane
+// (Pollinations) at an unreachable local endpoint so every lane fails
+// deterministically — CI runners have open networks, unlike sandboxes, so
+// leaving the default https://text.pollinations.ai URL would actually
+// succeed there and break this test.
+import { scrubAiEnv } from './_testEnv.js';
+
+scrubAiEnv();
+process.env.POLLINATIONS_BASE_URL = 'http://127.0.0.1:9/openai';
 process.env.POLLINATIONS_MODELS = 'openai';
 
 const { streamServerFreeAiRealTime } = await import('../api/_realtimeEngine.js');
