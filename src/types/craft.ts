@@ -159,6 +159,15 @@ export interface ComposerOptions {
   forceChat?: boolean;
 }
 
+/** Live status of one of the 3 parallel build agents (free AI mesh). */
+export interface MeshAgentState {
+  role: 'architect' | 'designer' | 'engineer';
+  status: 'running' | 'done' | 'failed';
+  durationMs?: number;
+  provider?: string;
+  model?: string;
+}
+
 export interface BuilderTurn {
   id: string;
   jobId?: string;
@@ -191,6 +200,8 @@ export interface BuilderTurn {
   pausedMessage?: string;
   pausedAt?: string;
   errorMessage?: string;
+  /** Snapshot of the 3 parallel build agents (fresh builds only). */
+  agents?: MeshAgentState[];
 }
 
 export interface CraftProject {
@@ -252,7 +263,7 @@ export const MODE_THEMES: Record<BuildMode, ModeThemeConfig> = {
     label: 'iOS&Android',
     headline: 'Build iOS & Android Apps. Instantly. No Code.',
     subtitle: 'Idea → Chat → App Store',
-    placeholder: 'Ask AI Craft to create',
+    placeholder: 'Ask the free AI to build your app...',
     artworkSrc: '/assets/aistudio/IMG_5323_802cf4cd.png',
     artworkAlt: 'Classical marble figure holding a glowing smartphone in golden light',
     themeColor: '#FFFBEB',
@@ -268,7 +279,7 @@ export const MODE_THEMES: Record<BuildMode, ModeThemeConfig> = {
     label: 'Website',
     headline: 'No Code. Build Full-Stack Web Apps',
     subtitle: 'From idea to launch in minutes.',
-    placeholder: 'Ask AI Craft to create a prototype',
+    placeholder: 'Describe your app — 3 AIs build it at once...',
     artworkSrc: '/assets/aistudio/IMG_5324_4d3c7f62.png',
     artworkAlt: 'Classical marble sculptor crafting a desktop monitor in orchid light',
     themeColor: '#FDF4FF',

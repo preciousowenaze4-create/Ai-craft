@@ -13,6 +13,15 @@ function resolveProviderKey(provider?: string, modelId?: string): string {
   if (raw === 'auto' || raw.includes('aicraft') || modelId === 'auto::architect') {
     return 'aicraft';
   }
+  // Free AI mesh (the only engine now): selector ids, gateway, and mesh providers.
+  if (
+    raw.includes('mesh') ||
+    modelId?.startsWith('mesh::') ||
+    raw === 'pollinations' ||
+    raw === 'self-hosted'
+  ) {
+    return 'aicraft';
+  }
   if (raw.includes('gemini') || raw.includes('google') || modelId?.startsWith('gemini::')) {
     return 'google';
   }
