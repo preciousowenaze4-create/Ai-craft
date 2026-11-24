@@ -936,7 +936,7 @@ async function runParallelBuildAgents(
   };
   emitSnapshot();
 
-  const sideAgent = (role: 'designer' | 'engineer') =>
+  const runSideAgent = (role: 'designer' | 'engineer') =>
     completeFreeAiMesh({
       taskKind: 'build',
       systemPrompt: withMeshRoleDirective(params.systemPrompt, role),
@@ -945,18 +945,31 @@ async function runParallelBuildAgents(
       attachmentDataUrl: params.attachmentDataUrl ?? null,
       signal: params.signal,
       timeoutMs: 35_000,
-    })
-      .then((html) => {
-        markAgent(role, html ? { status: 'done' } : { status: 'failed' });
-        return html;
-      })
-      .catch(() => {
-        markAgent(role, { status: 'failed' });
-        return null;
-      });
+    });
 
-  const designerPromise = sideAgent('designer');
-  const engineerPromise = sideAgent('engineer');
+  const sideAgent = async (role: 'designer' | 'engineer'): Promise<string | null> => {
+    let html = await runSideAgent(role).catch(() => null);
+    if (!html && !params.signal?.aborted) {
+      // Fault isolation: one busy/failed lane must NOT break the build.
+      // Keep the chip "running" and hand the role to another free AI pass.
+      await new Promise((resolve) => setTimeout(resolve, 1_200));
+      html = await runSideAgent(role).catch(() => null);
+    }
+    markAgent(role, html ? { status: 'done' } : { status: 'failed' });
+    return html;
+  };
+
+  // Stagger side agents so the architect grabs the single-flight provider
+  // slot first — fewer same-IP "previous request still running" collisions
+  // on Pollinations Classic while all 3 AIs build at once.
+  const designerPromise = (async () => {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    return sideAgent('designer');
+  })();
+  const engineerPromise = (async () => {
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    return sideAgent('engineer');
+  })();
 
   let architectResult: {
     rawOutput: string;
@@ -964,8 +977,8 @@ async function runParallelBuildAgents(
     modelName: string;
     provider: string;
   };
-  try {
-    architectResult = await streamFreeAiMesh({
+  const runArchitectLane = () =>
+    streamFreeAiMesh({
       taskKind: 'build',
       systemPrompt: withMeshRoleDirective(params.systemPrompt, 'architect'),
       historyMessages: params.historyMessages,
@@ -976,12 +989,24 @@ async function runParallelBuildAgents(
       onContentChunk: params.onContentChunk,
       onReasoningChunk: params.onReasoningChunk,
     });
+
+  try {
+    architectResult = await runArchitectLane();
   } catch (err) {
-    // Architect failed — sides can't salvage a live stream; let them settle
-    // quietly (completeFreeAiMesh never throws) and surface the error.
-    await Promise.allSettled([designerPromise, engineerPromise]);
-    markAgent('architect', { status: 'failed' });
-    throw err;
+    if (params.signal?.aborted) {
+      await Promise.allSettled([designerPromise, engineerPromise]);
+      markAgent('architect', { status: 'failed' });
+      throw err;
+    }
+    // One full architect failover: a busy storm or dead lane must not kill
+    // the build on the first strike — another free AI retries the role.
+    try {
+      architectResult = await runArchitectLane();
+    } catch (err2) {
+      await Promise.allSettled([designerPromise, engineerPromise]);
+      markAgent('architect', { status: 'failed' });
+      throw err2;
+    }
   }
   markAgent('architect', {
     status: 'done',

@@ -15,15 +15,21 @@ import {
   Globe,
   Image as ImageIcon,
   KeyRound,
+  LayoutGrid,
   Loader2,
+  MessageSquare,
+  Monitor,
   MoreVertical,
   Music,
   Paperclip,
   Pencil,
   Rocket,
   RotateCcw,
+  RotateCw,
   Save,
+  Share2,
   ShieldAlert,
+  Smartphone,
   Square,
   Volume2,
   X,
@@ -50,7 +56,6 @@ import {
   extractEditableCodeFiles,
 } from '../utils/codeFileEditor';
 import { buildProjectSecretHints } from '../utils/secretHints';
-import { FloatingLogoMenu } from './FloatingLogoMenu';
 import { LivingBotanicalWallpaper } from './LivingBotanicalWallpaper';
 import { ModelSelectorPopover } from './ModelSelectorPopover';
 import {
@@ -207,6 +212,7 @@ export function BuilderWorkspace({
   const [codeSaveNotice, setCodeSaveNotice] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [previewSurfaceBg, setPreviewSurfaceBg] = useState<string>('#ffffff');
+  const [previewDevice, setPreviewDevice] = useState<'phone' | 'full'>('phone');
 
   const hasWorkingTurn = useMemo(
     () => turns.some((t) => t.phase === 'understanding' || t.phase === 'building'),
@@ -1802,38 +1808,126 @@ export function BuilderWorkspace({
     }
   };
 
-  // Full-screen Preview Mode: renders built app full-screen (or Living Botanical Wallpaper if not built yet)
-  // plus the draggable right-side round blue AI Craft logo button
+  // Preview Mode: framed app preview (never edge-to-edge full-screen on
+  // mobile) with a top bar + a thumb-reachable bottom toolbar — every main
+  // action sits in the lower half of the screen where a hand can reach it.
   if (activeView === 'preview') {
+    const previewFrameClass =
+      previewDevice === 'phone'
+        ? 'max-w-[430px] rounded-3xl'
+        : 'max-w-[1100px] rounded-2xl';
     return (
-      <div
-        className="fixed inset-0 w-full h-full overflow-hidden"
-        style={{ backgroundColor: hasBuiltApp ? previewSurfaceBg : '#070B14' }}
-      >
-        {hasBuiltApp ? (
-          <iframe
-            ref={previewIframeRef}
-            key={`${projectId}-${previewKey}-${secretsFingerprint}`}
-            title={`${projectTitle} Preview`}
-            src={previewObjectUrl ?? undefined}
-            sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads"
-            className="w-full h-full border-0 block bg-transparent"
-          />
-        ) : (
-          <LivingBotanicalWallpaper isBuilding={isStreaming} />
-        )}
+      <div className="relative h-dvh w-full flex flex-col overflow-hidden bg-[#F4F4F5]">
+        {/* Top bar — back + title + view controls (always visible) */}
+        <header className="shrink-0 w-full bg-white/95 backdrop-blur border-b border-black/[0.07] pt-safe">
+          <div className="w-full max-w-[1100px] mx-auto px-2.5 py-2 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => onSetView('chat')}
+              aria-label="Back to chat"
+              className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#0B0B0F] hover:bg-black/[0.05] active:scale-95 transition-all shrink-0"
+            >
+              <ChevronLeft className="w-6 h-6 stroke-[2]" />
+            </button>
+            <div className="min-w-0 flex-1">
+              <h1 className="font-display font-bold text-[15px] tracking-[-0.02em] text-[#0B0B0F] truncate">
+                {projectTitle}
+              </h1>
+              <p className="text-[11px] text-[#71717A] truncate">
+                {isStreaming ? 'Building your app…' : hasBuiltApp ? 'Live preview' : 'Nothing built yet'}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPreviewDevice((d) => (d === 'phone' ? 'full' : 'phone'))}
+              aria-label={previewDevice === 'phone' ? 'Fit to width' : 'Phone size'}
+              title={previewDevice === 'phone' ? 'Fit to width' : 'Phone size'}
+              className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#52525B] hover:bg-black/[0.05] active:scale-95 transition-all shrink-0"
+            >
+              {previewDevice === 'phone' ? (
+                <Monitor className="w-5 h-5" />
+              ) : (
+                <Smartphone className="w-5 h-5" />
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => setPreviewKey((k) => k + 1)}
+              aria-label="Refresh preview"
+              title="Refresh preview"
+              className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#52525B] hover:bg-black/[0.05] active:scale-95 transition-all shrink-0"
+            >
+              <RotateCw className="w-5 h-5" />
+            </button>
+          </div>
+        </header>
 
-        <FloatingLogoMenu
-          projectTitle={projectTitle}
-          hasBuiltApp={hasBuiltApp}
-          isPublished={isPublished}
-          onBackToChat={() => onSetView('chat')}
-          onViewCode={() => onSetView('code')}
-          onShare={handleShare}
-          onPublish={onPublish}
-          onRefreshPreview={() => setPreviewKey((k) => k + 1)}
-          onOpenApps={onOpenApps}
-        />
+        {/* Framed preview — NOT full-screen; phone frame keeps controls reachable */}
+        <div className="flex-1 min-h-0 flex items-stretch justify-center overflow-hidden px-3 py-3">
+          <div
+            className={`relative w-full overflow-hidden border border-black/10 bg-white shadow-[0_10px_36px_rgba(0,0,0,0.14)] ${previewFrameClass}`}
+            style={{ backgroundColor: hasBuiltApp ? previewSurfaceBg : '#070B14' }}
+          >
+            {hasBuiltApp ? (
+              <iframe
+                ref={previewIframeRef}
+                key={`${projectId}-${previewKey}-${secretsFingerprint}`}
+                title={`${projectTitle} Preview`}
+                src={previewObjectUrl ?? undefined}
+                sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads"
+                className="w-full h-full border-0 block bg-transparent"
+              />
+            ) : (
+              <LivingBotanicalWallpaper isBuilding={isStreaming} />
+            )}
+          </div>
+        </div>
+
+        {/* Bottom toolbar — thumb zone: every key action within easy reach */}
+        <footer className="shrink-0 w-full bg-white/95 backdrop-blur border-t border-black/[0.07] pb-safe">
+          <div className="w-full max-w-[1100px] mx-auto px-2 pt-1.5 pb-2 grid grid-cols-5 gap-1">
+            <button
+              type="button"
+              onClick={() => onSetView('chat')}
+              className="min-h-[52px] rounded-2xl flex flex-col items-center justify-center gap-0.5 text-[#52525B] hover:bg-black/[0.05] active:scale-95 transition-all"
+            >
+              <MessageSquare className="w-5 h-5" />
+              <span className="text-[10.5px] font-medium">Chat</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onSetView('code')}
+              className="min-h-[52px] rounded-2xl flex flex-col items-center justify-center gap-0.5 text-[#52525B] hover:bg-black/[0.05] active:scale-95 transition-all"
+            >
+              <Code2 className="w-5 h-5" />
+              <span className="text-[10.5px] font-medium">Code</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setPreviewKey((k) => k + 1)}
+              className="min-h-[52px] rounded-2xl flex flex-col items-center justify-center gap-0.5 text-[#52525B] hover:bg-black/[0.05] active:scale-95 transition-all"
+            >
+              <RotateCw className="w-5 h-5" />
+              <span className="text-[10.5px] font-medium">Refresh</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleShare()}
+              className="min-h-[52px] rounded-2xl flex flex-col items-center justify-center gap-0.5 text-[#52525B] hover:bg-black/[0.05] active:scale-95 transition-all"
+            >
+              <Share2 className="w-5 h-5" />
+              <span className="text-[10.5px] font-medium">Share</span>
+            </button>
+            <button
+              type="button"
+              onClick={onOpenApps}
+              className="min-h-[52px] rounded-2xl flex flex-col items-center justify-center gap-0.5 text-[#52525B] hover:bg-black/[0.05] active:scale-95 transition-all"
+            >
+              <LayoutGrid className="w-5 h-5" />
+              <span className="text-[10.5px] font-medium">Apps</span>
+            </button>
+          </div>
+        </footer>
       </div>
     );
   }
@@ -2323,7 +2417,9 @@ export function BuilderWorkspace({
                   {/* AI Response Prose or Error */}
                   {turn.errorMessage ? (
                     <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-[14px] text-red-700 leading-relaxed flex flex-col gap-2.5">
-                      <span>{turn.errorMessage}</span>
+                      <span className="line-clamp-5 break-words" title={turn.errorMessage}>
+                        {turn.errorMessage}
+                      </span>
                       <div>
                         <button
                           type="button"
