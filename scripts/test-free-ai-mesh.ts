@@ -4,14 +4,17 @@
  * Expects:
  *   - mock rate-limited server on 127.0.0.1:4591 (SELF_HOSTED_LLM_URL lane)
  *   - mock streaming server  on 127.0.0.1:4592 (POLLINATIONS_BASE_URL lane)
- *   - NO Gemini keys
+ *   - NO Gemini keys (the Gemini path no longer exists — mesh is the engine)
  *
  * Asserts:
- *   1. streamFreeAiMesh skips the 429 self-hosted lane (cooldown) and returns
- *      the Pollinations lane's streamed text.
+ *   1. streamFreeAiMesh races/skips the 429 self-hosted lane (cooldown) and
+ *      returns the Pollinations lane's streamed text.
  *   2. A second stream call does NOT re-hit the cooled-down lane.
  *   3. completeFreeAiMesh returns non-streaming text from the healthy lane.
- *   4. streamServerFreeAiRealTime (engine entry) works with zero Gemini keys.
+ *   4. streamServerFreeAiRealTime (engine entry) works with zero API keys.
+ *   5. Model pool status: catalog size, active models, daily reset timestamp.
+ *   6. Daily quotas: an exhausted (provider, model) is skipped and the next
+ *      model continues; when every model is exhausted → friendly all-failed.
  */
 // Scrub ambient provider credentials first (CI runners have open networks —
 // a leaked GITHUB_TOKEN or GROQ key could answer for real and break assertions),
@@ -74,6 +77,32 @@ const configured = status.providers.filter((p) => p.configured).map((p) => p.id)
 console.log('configured providers:', configured.join(', '));
 assert(configured.includes('self-hosted'), 'self-hosted lane configured');
 assert(configured.includes('pollinations'), 'pollinations lane configured');
+
+// --- 5: model pool status (catalog + daily reset) -------------------------
+console.log(
+  'model pool:',
+  JSON.stringify(status.modelPool),
+  'resets in',
+  Math.round((Date.parse(status.modelPool.dailyResetsAt) - Date.now()) / 60_000),
+  'min'
+);
+assert(
+  status.modelPool.catalogSize >= 100,
+  `catalog should list 100+ free models, got ${status.modelPool.catalogSize}`
+);
+assert(
+  status.modelPool.activeModels >= 2,
+  `at least pollinations models should be active, got ${status.modelPool.activeModels}`
+);
+const resetsAt = Date.parse(status.modelPool.dailyResetsAt);
+assert(
+  Number.isFinite(resetsAt) && resetsAt > Date.now() && resetsAt <= Date.now() + 26 * 3600_000,
+  'dailyResetsAt should be the next UTC midnight'
+);
+assert(
+  status.modelPool.dailyLimitPerModel >= 1,
+  'daily limit per model should be a positive number'
+);
 
 // --- 1+2: streaming failover + cooldown ----------------------------------
 const seenModels: string[] = [];
@@ -151,9 +180,71 @@ console.log(
 );
 assert(
   engineResult.rawOutput.includes('free AI mesh'),
-  'engine entry should return mesh output without Gemini keys'
+  'engine entry should return mesh output without API keys'
 );
 assert(engineText.includes('free AI mesh'), 'engine should stream chunks via onContentChunk');
+
+// --- 6: daily quotas — exhausted model steps aside, next one continues ----
+// Uses taskKind 'build' (sequential walk) so exactly one model is consumed
+// per call — deterministic. Chat would race 2 models and consume both.
+const { getMeshDailyUsage, resetMeshDailyUsage, FreeAiMeshAllFailedError } = await import(
+  '../api/_freeAiMesh.js'
+);
+resetMeshDailyUsage();
+process.env.MESH_DAILY_LIMIT_PER_MODEL = '1';
+
+// First call: openai model serves (usage 0 → 1) — self-hosted still cooling.
+const quota1 = await streamFreeAiMesh({
+  taskKind: 'build',
+  systemPrompt: 'sys',
+  historyMessages: [],
+  userPrompt: 'Say hello',
+});
+console.log('quota #1:', quota1.modelUsed);
+assert(
+  quota1.modelUsed === 'mesh::pollinations::openai',
+  `quota call 1 should use pollinations::openai, got ${quota1.modelUsed}`
+);
+const usageAfterFirst = getMeshDailyUsage();
+assert(
+  (usageAfterFirst['pollinations|openai|' + new Date().toISOString().slice(0, 10)] ?? 0) >= 1,
+  'quota counters should record the successful response'
+);
+
+// Second call: the used model is capped for the day → the next model continues.
+const quota2 = await streamFreeAiMesh({
+  taskKind: 'build',
+  systemPrompt: 'sys',
+  historyMessages: [],
+  userPrompt: 'Say hello again',
+});
+console.log('quota #2 (failover):', quota2.modelUsed);
+assert(
+  quota2.modelUsed === 'mesh::pollinations::openai-fast',
+  `exhausted model must be skipped and openai-fast continue, got ${quota2.modelUsed}`
+);
+
+// Third call: every pollinations model is now capped + self-hosted cooling →
+// friendly aggregate error (the "everything busy" path).
+let quotaError: unknown = null;
+try {
+  await streamFreeAiMesh({
+    taskKind: 'build',
+    systemPrompt: 'sys',
+    historyMessages: [],
+    userPrompt: 'One more',
+  });
+} catch (err) {
+  quotaError = err;
+} finally {
+  delete process.env.MESH_DAILY_LIMIT_PER_MODEL;
+}
+assert(
+  quotaError instanceof FreeAiMeshAllFailedError ||
+    (quotaError instanceof Error && /busy or unreachable/i.test(quotaError.message)),
+  `expected friendly all-failed error when every model is quota-capped, got: ${String(quotaError)}`
+);
+console.log('quota failover + daily-cap error OK:', (quotaError as Error).message.slice(0, 120));
 
 console.log('ALL MESH TESTS PASSED');
 process.exit(0);

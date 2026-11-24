@@ -11,12 +11,13 @@ export async function GET(): Promise<Response> {
     {
       ok: true,
       geminiConfigured: Boolean(getServerGeminiApiKey()),
-      serverFreeAiReady: Boolean(getServerGeminiApiKey()) || mesh.hasAny,
+      serverFreeAiReady: mesh.hasAny,
       freeAiMesh: {
         hasAny: mesh.hasAny,
         hasKeyless: mesh.hasKeyless,
         pollinationsEnabled: mesh.pollinationsEnabled,
         providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
+        modelPool: mesh.modelPool,
       },
       supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
       paymentsConfigured: Boolean(getPaymentSecretKey()),

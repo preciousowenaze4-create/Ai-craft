@@ -211,6 +211,35 @@ if (!previewHtml.includes('<!DOCTYPE html>') || !previewHtml.includes('Mesh Todo
   process.exit(1);
 }
 
+// 3-agent parallel build: the SSE stream must report all three agents and the
+// merged final HTML must contain each agent's stamp (architect document +
+// designer CSS + engineer JS) — proof that three AIs built at once.
+const agentsEvents = buildEvents.filter((e) => e.type === 'agents');
+const lastAgents = agentsEvents[agentsEvents.length - 1] as
+  | { agents?: Array<{ role: string; status: string }> }
+  | undefined;
+const agentList = lastAgents?.agents ?? [];
+console.log('agents:', JSON.stringify(agentList));
+if (agentList.length !== 3) {
+  console.error('FAIL: expected 3 agents in SSE snapshot, got', agentList.length);
+  process.exit(1);
+}
+for (const role of ['architect', 'designer', 'engineer']) {
+  const agent = agentList.find((a) => a.role === role);
+  if (!agent || agent.status !== 'done') {
+    console.error(`FAIL: agent ${role} missing or not done:`, agent);
+    process.exit(1);
+  }
+}
+const hasReplace = buildEvents.some((e) => e.type === 'previewReplace');
+console.log('previewReplace emitted:', hasReplace);
+for (const mark of ['mesh-architect-mark', 'mesh-designer-mark', 'mesh-engineer-mark']) {
+  if (!previewHtml.includes(mark)) {
+    console.error(`FAIL: merged previewHtml missing ${mark} — parallel merge broken`);
+    process.exit(1);
+  }
+}
+
 console.log('E2E STREAM TEST PASSED');
 cleanup();
 process.exit(0);

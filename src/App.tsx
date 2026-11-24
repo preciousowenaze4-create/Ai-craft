@@ -1091,11 +1091,11 @@ export default function App() {
           return matched ? matched.id : fetched[0].id;
         });
       } else if (!response.ok || data?.error) {
-        setModelsError(data?.error || 'Unable to load Gemini models.');
+        setModelsError(data?.error || 'Unable to load free AI models.');
       }
     } catch (err) {
       setModelsError(
-        err instanceof Error ? err.message : 'Unable to load Gemini models.'
+        err instanceof Error ? err.message : 'Unable to load free AI models.'
       );
     } finally {
       setModelsLoading(false);
@@ -1487,6 +1487,13 @@ export default function App() {
                 fullText?: string;
                 previewHtml?: string;
                 media?: GeneratedMediaPayload;
+                agents?: Array<{
+                  role: string;
+                  status: string;
+                  durationMs?: number;
+                  provider?: string;
+                  model?: string;
+                }>;
                 message?: string;
                 errorMessage?: string;
                 reason?: BuilderTurn['pausedReason'];
@@ -1679,6 +1686,17 @@ export default function App() {
                     typeof evt.bytesBuilt === 'number'
                       ? evt.bytesBuilt
                       : t.bytesBuilt,
+                }));
+              } else if (evt.type === 'agents' && Array.isArray(evt.agents)) {
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  agents: evt.agents as BuilderTurn['agents'],
+                }));
+              } else if (evt.type === 'previewReplace' && evt.previewHtml) {
+                // 3-agent merge finished: swap in the merged HTML live.
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  previewHtml: evt.previewHtml,
                 }));
               } else if (evt.type === 'reset') {
                 stopCreditTicker();

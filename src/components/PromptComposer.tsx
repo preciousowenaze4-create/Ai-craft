@@ -13,6 +13,20 @@ import { ModelSelectorPopover } from './ModelSelectorPopover';
 import { ProviderLogo } from './ProviderLogo';
 import { VoiceInputButton } from './VoiceInputButton';
 
+/** Quick-start prompts shown while the chat box is empty. */
+const QUICK_STARTS: Record<BuildMode, string[]> = {
+  mobile: [
+    'Habit tracker with streaks',
+    'Food delivery app with cart',
+    'Fitness dashboard',
+  ],
+  web: [
+    'SaaS landing page with pricing',
+    'Portfolio with blog',
+    'Team task dashboard',
+  ],
+};
+
 interface PromptComposerProps {
   mode: BuildMode;
   prompt: string;
@@ -139,7 +153,11 @@ export function PromptComposer({
             />
             <span className="text-[12.5px] font-medium text-[#18181B] truncate">
               {activeModel?.name ??
-                (modelsLoading ? 'Connecting AI Craft Engine...' : 'AI Craft')}
+                (modelsLoading ? 'Connecting free AI mesh...' : 'Free AI Mesh')}
+            </span>
+            <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 border border-emerald-200 px-2 py-0.5 text-[10.5px] font-semibold text-emerald-700 shrink-0">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+              Free · no key
             </span>
           </div>
 
@@ -161,6 +179,21 @@ export function PromptComposer({
         <div className="mb-1.5 rounded-xl bg-amber-50 border border-amber-200 px-3 py-1.5 flex items-center gap-2 text-[12px] font-medium text-amber-900">
           <ShieldAlert className="w-4 h-4 text-amber-700 shrink-0" />
           <span>Account restricted — messages cannot enter this chat box.</span>
+        </div>
+      )}
+
+      {!isRestricted && prompt.trim().length === 0 && (
+        <div className="flex flex-wrap gap-1.5 pb-1">
+          {QUICK_STARTS[mode].map((chip) => (
+            <button
+              key={chip}
+              type="button"
+              onClick={() => onPromptChange(chip)}
+              className="rounded-full border border-black/[0.08] bg-[#FAFAFA] px-2.5 py-1 text-[11.5px] font-medium text-[#52525B] hover:bg-black/[0.04] hover:text-[#18181B] transition-colors duration-150"
+            >
+              {chip}
+            </button>
+          ))}
         </div>
       )}
 

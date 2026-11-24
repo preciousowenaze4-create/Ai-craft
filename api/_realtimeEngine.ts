@@ -30,32 +30,19 @@ import {
   type SearchResultItem,
   type SearchVideoItem,
 } from './_builderCore.js';
+import { GoogleGenAI } from '@google/genai';
 import {
-  GoogleGenAI,
-  ThinkingLevel,
-  type GenerateContentConfig,
-  type GenerateContentResponse,
-} from '@google/genai';
-import {
-  GEMINI_BUILDER_MODELS,
   buildGatewayExecutionPlan,
-  getServerGeminiApiKeys,
   hasServerFreeAiKey,
-  invalidateDiscoveredGeminiModelsCache,
   markApiKeyInvalidCooldown,
   markGatewayCandidateCooldown,
-  parseGatewayModelIdentifier,
   resolveDynamicGeminiExecutionMatrix,
-  type DynamicGeminiCandidate,
 } from './_aiGateways.js';
+import { recordGeminiApiUsage } from './_geminiUsage.js';
 import {
-  recordGeminiApiError,
-  recordGeminiApiUsage,
-} from './_geminiUsage.js';
-import {
-  FreeAiMeshUnavailableError,
   completeFreeAiMesh,
   isFreeAiMeshAvailable,
+  isMeshParallelBuildsEnabled,
   streamFreeAiMesh,
 } from './_freeAiMesh.js';
 
@@ -149,31 +136,6 @@ function isThinkingConfigRejectedError(rawLower: string): boolean {
     rawLower.includes('includethoughts') ||
     (rawLower.includes('invalid_argument') && rawLower.includes('config'))
   );
-}
-
-function formatGeminiApiError(err: unknown, modelName: string): string {
-  const rawMsg = extractReadableErrorMessage(err);
-  const lower = rawMsg.toLowerCase();
-
-  if (isInvalidApiKeyError(lower)) {
-    return 'The configured GEMINI_API_KEY was rejected or expired. Add a valid GEMINI_API_KEY in Vercel Environment Variables and redeploy.';
-  }
-  if (lower.includes('resource_exhausted') || lower.includes('429') || lower.includes('quota')) {
-    return `${modelName} reached its current API quota across all active backup models. Please wait a moment or recharge/add a backup GEMINI_API_KEY.`;
-  }
-  if (
-    lower.includes('503') ||
-    lower.includes('unavailable') ||
-    lower.includes('high demand') ||
-    lower.includes('overloaded') ||
-    lower.includes('timed out')
-  ) {
-    return `${modelName} and all live backup engines are experiencing temporary high demand on Google servers. Tap Continue / Retry in a few seconds.`;
-  }
-  if (isModelRetiredOrUnavailableError(lower)) {
-    return `${modelName} could not reach an active Gemini model on this GEMINI_API_KEY yet. Check API key permissions or try again shortly.`;
-  }
-  return rawMsg.slice(0, 220);
 }
 
 export interface VisualHintsSpec {
@@ -514,7 +476,7 @@ export async function prepareRealtimePrompt(
 
   const systemPrompt = buildCraftSystemPrompt({
     mediaKind,
-    requestedModel: input.requestedModel || 'gemini::gemini-4-hydrogen',
+    requestedModel: input.requestedModel || 'mesh::auto',
     requestedModelLabel: executionPlan.requestedModelLabel,
     initialRoute,
     shouldGenerateTitle,
@@ -654,9 +616,9 @@ export function finalizeRealtimeOutput(
   const cleanedRaw = stripReasoningTags(input.rawOutput || '');
   const startedAt = typeof input.startedAt === 'number' ? input.startedAt : Date.now();
   const thoughtSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-  const modelUsed = input.modelUsed || 'gemini::gemini-4-hydrogen';
-  const modelName = input.modelName || 'AI Craft Pro (4 Hydrogen)';
-  const provider = input.provider || 'aicraft';
+  const modelUsed = input.modelUsed || 'mesh::auto';
+  const modelName = input.modelName || 'Free AI Mesh · Auto';
+  const provider = input.provider || 'free-mesh';
 
   const explicitTitleMatch = /\[\[\s*TITLE\s*:\s*([^\]]+?)\s*\]\]/i.exec(cleanedRaw);
   const title = explicitTitleMatch?.[1]?.trim()
@@ -791,70 +753,268 @@ export function finalizeRealtimeOutput(
   };
 }
 
-function buildStreamGenerateConfig(
-  candidate: DynamicGeminiCandidate,
-  systemPrompt: string,
-  route: 'chat' | 'build' | 'auto',
-  enableThinking: boolean,
-  isFastPatch = false
-): GenerateContentConfig {
-  const config: GenerateContentConfig = {
-    systemInstruction: systemPrompt,
-  };
-  if (enableThinking && candidate.thinkingMode === 'level') {
-    config.thinkingConfig = {
-      includeThoughts: route === 'build' && !isFastPatch,
-      thinkingLevel:
-        route === 'build'
-          ? isFastPatch
-            ? ThinkingLevel.LOW
-            : ThinkingLevel.MEDIUM
-          : ThinkingLevel.LOW,
-    };
-  } else if (enableThinking && candidate.thinkingMode === 'budget') {
-    config.thinkingConfig = {
-      includeThoughts: route === 'build' && !isFastPatch,
-      thinkingBudget:
-        route === 'build'
-          ? isFastPatch
-            ? 512
-            : 1024
-          : route === 'auto'
-            ? 512
-            : 256,
-    };
-  }
-  return config;
+export interface RealtimeAgentStatus {
+  role: 'architect' | 'designer' | 'engineer';
+  status: 'running' | 'done' | 'failed';
+  durationMs?: number;
+  provider?: string;
+  model?: string;
 }
 
-function extractThoughtsFromChunk(chunk: GenerateContentResponse): string {
-  const parts = chunk?.candidates?.[0]?.content?.parts;
-  if (!Array.isArray(parts)) return '';
-  let thoughts = '';
-  for (const part of parts) {
-    if (part && part.thought === true && typeof part.text === 'string') {
-      thoughts += part.text;
-    }
-  }
-  return thoughts;
-}
-
-export async function streamServerFreeAiRealTime(params: {
+interface StreamServerFreeAiParams {
   requestedModel?: string;
   initialRoute?: 'chat' | 'build' | 'auto';
+  /** Set by patch/continue callers — those never fan out to parallel agents. */
   isFastPatch?: boolean;
   systemPrompt: string;
   historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
   userPrompt: string;
   attachmentDataUrl?: string | null;
   signal?: AbortSignal;
+  /** Fresh full builds run 3 agents (architect + designer + engineer) at once. */
+  allowParallelAgents?: boolean;
   onModelMeta?: (meta: { modelId: string; modelName: string; provider: string }) => void;
   onReasoningChunk?: (reasoningText: string) => void;
   onContentChunk: (chunkText: string) => void;
-}): Promise<{ rawOutput: string; modelUsed: string; modelName: string; provider: string }> {
-  const allKeys = getServerGeminiApiKeys();
-  const parsedModel = parseGatewayModelIdentifier(params.requestedModel);
-  const flagshipModel = GEMINI_BUILDER_MODELS[0];
+  /** Live 3-agent progress: emitted at start and on every agent completion. */
+  onAgentsSnapshot?: (agents: RealtimeAgentStatus[]) => void;
+  /** Fires when the 3-agent merge produced the final HTML (replaces the stream). */
+  onReplaceRawOutput?: (rawOutput: string, previewHtml: string) => void;
+}
+
+const MESH_ROLE_DIRECTIVES: Record<RealtimeAgentStatus['role'], string> = {
+  architect:
+    'MESH_ROLE=architect. You are the lead application architect on a 3-agent build team. Output ONLY the complete single-file HTML application (from <!DOCTYPE html> to </html>) with correct document structure, all screens, the domain data model, and fully wired JavaScript. Prioritize a complete working end-to-end flow over decorative polish.',
+  designer:
+    'MESH_ROLE=designer. You are the UI/UX design specialist on a 3-agent build team. Output ONLY a complete single-file HTML document whose strength is exceptional visual design: refined CSS design tokens, typography, spacing, visual hierarchy, micro-animations, and responsive layout for every screen.',
+  engineer:
+    'MESH_ROLE=engineer. You are the front-end reliability engineer on a 3-agent build team. Output ONLY a complete single-file HTML document whose strength is rock-solid interactivity: state management, CRUD handlers, form validation, edge cases, and error-free vanilla JavaScript.',
+};
+
+function withMeshRoleDirective(
+  systemPrompt: string,
+  role: RealtimeAgentStatus['role']
+): string {
+  return `${systemPrompt}\n\n${MESH_ROLE_DIRECTIVES[role]}`;
+}
+
+function extractLongestInlineStyle(html: string): string {
+  const match = /<style\b[^>]*>([\s\S]*?)<\/style>/i.exec(html);
+  return (match?.[1] || '').trim();
+}
+
+function extractMainInlineScript(html: string): string {
+  const regex = /<script(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi;
+  let best = '';
+  for (const match of html.matchAll(regex)) {
+    const code = (match[1] || '').trim();
+    if (code.length > best.length) best = code;
+  }
+  return best;
+}
+
+function collectDomIds(html: string): Set<string> {
+  const ids = new Set<string>();
+  for (const match of html.matchAll(/\bid\s*=\s*["']([^"']+)["']/g)) {
+    ids.add(match[1]);
+  }
+  return ids;
+}
+
+function collectScriptDomRefs(script: string): string[] {
+  const refs = new Set<string>();
+  for (const match of script.matchAll(/getElementById\(\s*["']([^"']+)["']\s*\)/g)) {
+    refs.add(match[1]);
+  }
+  for (const match of script.matchAll(/querySelector\(\s*["']#([A-Za-z0-9_-]+)["']\s*\)/g)) {
+    refs.add(match[1]);
+  }
+  return [...refs];
+}
+
+function spliceMergedHtmlIntoRaw(raw: string, html: string): string {
+  if (
+    /<<<\s*AICRAFT_APP_HTML\s*>>>/i.test(raw) &&
+    /<<<\s*END_AICRAFT_APP_HTML\s*>>>/i.test(raw)
+  ) {
+    return raw.replace(
+      /(<<<\s*AICRAFT_APP_HTML\s*>>>)[\s\S]*?(<<<\s*END_AICRAFT_APP_HTML\s*>>>)/i,
+      (_m, open: string, close: string) => `${open}\n${html}\n${close}`
+    );
+  }
+  const docStart = raw.search(/<!doctype|<html\b/i);
+  if (docStart >= 0) return `${raw.slice(0, docStart)}${html}\n`;
+  return html;
+}
+
+/**
+ * Deterministic 3-agent merge: architect HTML is the base; the designer's
+ * <style> and the engineer's main <script> are adopted only when safe —
+ * CSS is cosmetic, and the script is adopted only if every DOM id it
+ * references exists in the architect's document (so no handler breaks).
+ */
+function mergeParallelAgentHtml(
+  baseHtml: string,
+  designerHtml: string,
+  engineerHtml: string
+): { html: string; applied: string[] } {
+  let html = baseHtml;
+  const applied: string[] = [];
+
+  const designerStyle = designerHtml ? extractLongestInlineStyle(designerHtml) : '';
+  if (designerStyle.length >= 120) {
+    if (/<style\b[^>]*>[\s\S]*?<\/style>/i.test(html)) {
+      const next = html.replace(
+        /(<style\b[^>]*>)[\s\S]*?(<\/style>)/i,
+        (_m, open: string, close: string) => `${open}\n${designerStyle}\n${close}`
+      );
+      if (next !== html) {
+        html = next;
+        applied.push('designer');
+      }
+    } else if (/<\/head>/i.test(html)) {
+      html = html.replace(/<\/head>/i, `<style>\n${designerStyle}\n</style>\n</head>`);
+      applied.push('designer');
+    }
+  }
+
+  const engineerScript = engineerHtml ? extractMainInlineScript(engineerHtml) : '';
+  if (engineerScript.length >= 300) {
+    const baseIds = collectDomIds(baseHtml);
+    const refs = collectScriptDomRefs(engineerScript);
+    const safe = refs.every((id) => baseIds.has(id));
+    if (safe) {
+      const scriptTag = `<script>\n${engineerScript}\n</script>`;
+      let bestIdx = -1;
+      let bestLen = 0;
+      const inlineRegex = /<script(?![^>]*\bsrc\s*=)[^>]*>[\s\S]*?<\/script>/gi;
+      for (const match of html.matchAll(inlineRegex)) {
+        if (match.index !== undefined && match[0].length > bestLen) {
+          bestLen = match[0].length;
+          bestIdx = match.index;
+        }
+      }
+      if (bestIdx >= 0 && bestLen >= 300) {
+        html = `${html.slice(0, bestIdx)}${scriptTag}${html.slice(bestIdx + bestLen)}`;
+        applied.push('engineer');
+      } else if (/<\/body>/i.test(html)) {
+        html = html.replace(/<\/body>/i, `${scriptTag}\n</body>`);
+        applied.push('engineer');
+      }
+    }
+  }
+
+  return { html, applied };
+}
+
+/**
+ * 3-agent parallel build: the architect streams the live preview while the
+ * designer and engineer draft concurrently; a safety-checked merge then
+ * swaps designer CSS + engineer JS into the architect's document.
+ */
+async function runParallelBuildAgents(
+  params: StreamServerFreeAiParams
+): Promise<{ rawOutput: string; modelUsed: string; modelName: string; provider: string }> {
+  const agents: RealtimeAgentStatus[] = [
+    { role: 'architect', status: 'running' },
+    { role: 'designer', status: 'running' },
+    { role: 'engineer', status: 'running' },
+  ];
+  const startedAt = Date.now();
+  const emitSnapshot = () => params.onAgentsSnapshot?.(agents.map((a) => ({ ...a })));
+  const markAgent = (
+    role: RealtimeAgentStatus['role'],
+    patch: Partial<RealtimeAgentStatus>
+  ) => {
+    const agent = agents.find((a) => a.role === role);
+    if (!agent) return;
+    Object.assign(agent, patch);
+    if (patch.status && patch.status !== 'running' && agent.durationMs === undefined) {
+      agent.durationMs = Date.now() - startedAt;
+    }
+    emitSnapshot();
+  };
+  emitSnapshot();
+
+  const sideAgent = (role: 'designer' | 'engineer') =>
+    completeFreeAiMesh({
+      taskKind: 'build',
+      systemPrompt: withMeshRoleDirective(params.systemPrompt, role),
+      historyMessages: params.historyMessages,
+      userPrompt: params.userPrompt,
+      attachmentDataUrl: params.attachmentDataUrl ?? null,
+      signal: params.signal,
+      timeoutMs: 35_000,
+    })
+      .then((html) => {
+        markAgent(role, html ? { status: 'done' } : { status: 'failed' });
+        return html;
+      })
+      .catch(() => {
+        markAgent(role, { status: 'failed' });
+        return null;
+      });
+
+  const designerPromise = sideAgent('designer');
+  const engineerPromise = sideAgent('engineer');
+
+  let architectResult: {
+    rawOutput: string;
+    modelUsed: string;
+    modelName: string;
+    provider: string;
+  };
+  try {
+    architectResult = await streamFreeAiMesh({
+      taskKind: 'build',
+      systemPrompt: withMeshRoleDirective(params.systemPrompt, 'architect'),
+      historyMessages: params.historyMessages,
+      userPrompt: params.userPrompt,
+      attachmentDataUrl: params.attachmentDataUrl ?? null,
+      signal: params.signal,
+      onModelMeta: params.onModelMeta,
+      onContentChunk: params.onContentChunk,
+      onReasoningChunk: params.onReasoningChunk,
+    });
+  } catch (err) {
+    // Architect failed — sides can't salvage a live stream; let them settle
+    // quietly (completeFreeAiMesh never throws) and surface the error.
+    await Promise.allSettled([designerPromise, engineerPromise]);
+    markAgent('architect', { status: 'failed' });
+    throw err;
+  }
+  markAgent('architect', {
+    status: 'done',
+    provider: architectResult.provider,
+    model: architectResult.modelUsed,
+  });
+
+  const [designerHtml, engineerHtml] = await Promise.all([
+    designerPromise,
+    engineerPromise,
+  ]);
+
+  const baseHtml = extractPreviewHtmlFromRaw(architectResult.rawOutput);
+  if (baseHtml && (designerHtml || engineerHtml)) {
+    const merged = mergeParallelAgentHtml(baseHtml, designerHtml || '', engineerHtml || '');
+    if (merged.html !== baseHtml && validateBuiltAppHtml(merged.html).valid) {
+      const finalRaw = spliceMergedHtmlIntoRaw(architectResult.rawOutput, merged.html);
+      params.onReplaceRawOutput?.(finalRaw, merged.html);
+      return { ...architectResult, rawOutput: finalRaw };
+    }
+  }
+  return architectResult;
+}
+
+/**
+ * The single chat/build engine: ALWAYS the free AI mesh — zero API keys
+ * required, daily-quota failover across the whole free-model catalog, and
+ * (for fresh full builds) three agents building architecture + UI + logic
+ * at the same time. The old Gemini-key path was removed entirely.
+ */
+export async function streamServerFreeAiRealTime(
+  params: StreamServerFreeAiParams
+): Promise<{ rawOutput: string; modelUsed: string; modelName: string; provider: string }> {
   const route = params.initialRoute || 'build';
   const taskKind = route === 'chat' ? 'chat' : 'build';
 
@@ -871,282 +1031,16 @@ export async function streamServerFreeAiRealTime(params: {
       onReasoningChunk: params.onReasoningChunk,
     });
 
-  if (allKeys.length === 0) {
-    // No Gemini keys configured — the free AI mesh (self-hosted, free-tier
-    // providers, keyless Pollinations) is the primary engine.
-    return runFreeAiMeshLane();
+  const parallelRequested =
+    Boolean(params.allowParallelAgents) &&
+    taskKind === 'build' &&
+    !params.isFastPatch &&
+    isMeshParallelBuildsEnabled();
+
+  if (parallelRequested) {
+    return runParallelBuildAgents(params);
   }
-
-  params.onModelMeta?.({
-    modelId: flagshipModel.id,
-    modelName: flagshipModel.name,
-    provider: 'aicraft',
-  });
-
-  const contents: Array<{
-    role: 'user' | 'model';
-    parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }>;
-  }> = params.historyMessages.map((m) => ({
-    role: m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: m.content }],
-  }));
-
-  const userParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
-  if (params.attachmentDataUrl && params.attachmentDataUrl.startsWith('data:image/')) {
-    const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/.exec(
-      params.attachmentDataUrl
-    );
-    if (match?.[1] && match?.[2]) {
-      userParts.push({
-        inlineData: {
-          mimeType: match[1],
-          data: match[2],
-        },
-      });
-    }
-  }
-  userParts.push({ text: params.userPrompt });
-  contents.push({ role: 'user', parts: userParts });
-
-  const clientMap = new Map<string, GoogleGenAI>();
-  const getClient = (apiKey: string) => {
-    let client = clientMap.get(apiKey);
-    if (!client) {
-      client = createGeminiClient(apiKey);
-      clientMap.set(apiKey, client);
-    }
-    return client;
-  };
-
-  const invalidatedKeysThisRun = new Set<string>();
-  const attemptedKeyModels = new Set<string>();
-  let lastError: unknown = null;
-  let lastMeaningfulError: unknown = null;
-  let lastAttemptedUpstreamId = parsedModel.upstreamModelId || 'gemini-4-hydrogen';
-
-  const runCandidateList = async (candidates: DynamicGeminiCandidate[]) => {
-    for (const candidate of candidates) {
-      if (params.signal?.aborted) {
-        throw new Error('Request cancelled.');
-      }
-      const dedupKey = `${candidate.keyFingerprint}::${candidate.upstreamModelId}`;
-      if (attemptedKeyModels.has(dedupKey)) continue;
-      if (invalidatedKeysThisRun.has(candidate.keyFingerprint)) continue;
-      attemptedKeyModels.add(dedupKey);
-
-      lastAttemptedUpstreamId = candidate.upstreamModelId;
-      const ai = getClient(candidate.apiKey);
-
-      // Try with thinkingConfig enabled first; if rejected solely for thinking parameter, retry cleanly without thinkingConfig
-      const thinkingAttempts =
-        candidate.thinkingMode !== 'none' ? [true, false] : [false];
-
-      for (const enableThinking of thinkingAttempts) {
-        let fullContent = '';
-        let emittedAnyChunk = false;
-        let lastPromptTokens = 0;
-        let lastCandidatesTokens = 0;
-        let lastTotalTokens = 0;
-
-        try {
-          const streamConnectTimeoutMs = 15000;
-          const config = buildStreamGenerateConfig(
-            candidate,
-            params.systemPrompt,
-            route,
-            enableThinking,
-            Boolean(params.isFastPatch)
-          );
-          const streamResponse = await Promise.race([
-            ai.models.generateContentStream({
-              model: candidate.upstreamModelId,
-              contents,
-              config,
-            }),
-            new Promise<never>((_, reject) =>
-              setTimeout(
-                () =>
-                  reject(
-                    new Error(`${candidate.label} stream timed out waiting for first byte.`)
-                  ),
-                streamConnectTimeoutMs
-              )
-            ),
-          ]);
-
-          for await (const chunk of streamResponse) {
-            if (params.signal?.aborted) break;
-            const c = chunk as GenerateContentResponse;
-            if (c.usageMetadata) {
-              lastPromptTokens = c.usageMetadata.promptTokenCount ?? lastPromptTokens;
-              lastCandidatesTokens =
-                c.usageMetadata.candidatesTokenCount ?? lastCandidatesTokens;
-              lastTotalTokens = c.usageMetadata.totalTokenCount ?? lastTotalTokens;
-            }
-            const thoughtChunk = extractThoughtsFromChunk(c);
-            if (thoughtChunk) {
-              params.onReasoningChunk?.(thoughtChunk);
-            }
-            const text = typeof c.text === 'string' ? c.text : '';
-            if (text) {
-              fullContent += text;
-              emittedAnyChunk = true;
-              params.onContentChunk(text);
-            }
-          }
-
-          if (!fullContent.trim()) {
-            throw new Error(`${candidate.label} returned an empty response.`);
-          }
-
-          const fallbackEstimate = Math.max(
-            1,
-            Math.ceil(
-              (params.userPrompt.length + params.systemPrompt.length + fullContent.length) / 4
-            )
-          );
-          await recordGeminiApiUsage({
-            modelId: candidate.upstreamModelId,
-            promptTokens:
-              lastPromptTokens ||
-              Math.ceil((params.userPrompt.length + params.systemPrompt.length) / 4),
-            candidatesTokens: lastCandidatesTokens || Math.ceil(fullContent.length / 4),
-            totalTokens: lastTotalTokens || fallbackEstimate,
-            source: 'craft-stream',
-          }).catch(() => undefined);
-
-          return {
-            rawOutput: fullContent,
-            modelUsed: flagshipModel.id,
-            modelName: flagshipModel.name,
-            provider: 'aicraft',
-          };
-        } catch (err) {
-          lastError = err;
-          const lower = extractReadableErrorMessage(err).toLowerCase();
-
-          // If streaming partially wrote output already, propagate clean formatted error
-          if (emittedAnyChunk) {
-            throw new Error(formatGeminiApiError(err, flagshipModel.name));
-          }
-
-          // If thinking parameter wasn't accepted by this model variant, retry immediately without thinkingConfig
-          if (enableThinking && isThinkingConfigRejectedError(lower)) {
-            continue;
-          }
-
-          if (isInvalidApiKeyError(lower)) {
-            markApiKeyInvalidCooldown(candidate.apiKey);
-            invalidatedKeysThisRun.add(candidate.keyFingerprint);
-            if (!lastMeaningfulError) lastMeaningfulError = err;
-            break;
-          }
-
-          if (isModelRetiredOrUnavailableError(lower)) {
-            // Hard-block retired / 404 / single-model-403 for 6 hours and keep switching!
-            markGatewayCandidateCooldown(candidate.cooldownKey, 6 * 60 * 60_000, true);
-            break;
-          }
-
-          // Transient 503 / 429 / timeout / empty response: preserve as meaningful error & cool down 45s
-          lastMeaningfulError = err;
-          markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
-          break;
-        }
-      }
-    }
-    return null;
-  };
-
-  // Pass 1: Dynamic execution matrix across all configured keys & live-discovered models
-  const initialMatrix = await resolveDynamicGeminiExecutionMatrix({
-    preferredUpstreamId: parsedModel.upstreamModelId,
-    taskKind,
-  });
-  const pass1Result = await runCandidateList(initialMatrix);
-  if (pass1Result) return pass1Result;
-
-  // Pass 2: Force-refresh Google's live /v1beta/models catalog in case a newly deployed or updated key unlocks newer models
-  if (!params.signal?.aborted) {
-    invalidateDiscoveredGeminiModelsCache();
-    const refreshedMatrix = await resolveDynamicGeminiExecutionMatrix({
-      preferredUpstreamId: parsedModel.upstreamModelId,
-      forceRefresh: true,
-      taskKind,
-    });
-    const pass2Result = await runCandidateList(refreshedMatrix);
-    if (pass2Result) return pass2Result;
-
-    // Pass 3: Non-streaming safety net on top live active candidates in case streaming edge dropped
-    const nonStreamPool = refreshedMatrix
-      .filter((c) => !invalidatedKeysThisRun.has(c.keyFingerprint))
-      .slice(0, 3);
-    for (const candidate of nonStreamPool) {
-      if (params.signal?.aborted) break;
-      try {
-        const ai = getClient(candidate.apiKey);
-        const res = await Promise.race([
-          ai.models.generateContent({
-            model: candidate.upstreamModelId,
-            contents,
-            config: {
-              systemInstruction: params.systemPrompt,
-            },
-          }),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('Non-stream fallback timed out.')), 28000)
-          ),
-        ]);
-        const textOut = typeof res.text === 'string' ? res.text : '';
-        if (textOut.trim()) {
-          params.onReasoningChunk?.('Assembling verified architecture...');
-          params.onContentChunk(textOut);
-          const usage = res.usageMetadata;
-          await recordGeminiApiUsage({
-            modelId: candidate.upstreamModelId,
-            promptTokens: usage?.promptTokenCount,
-            candidatesTokens: usage?.candidatesTokenCount,
-            totalTokens:
-              usage?.totalTokenCount ??
-              Math.max(1, Math.ceil((params.userPrompt.length + textOut.length) / 4)),
-            source: 'craft-fallback',
-          }).catch(() => undefined);
-          return {
-            rawOutput: textOut,
-            modelUsed: flagshipModel.id,
-            modelName: flagshipModel.name,
-            provider: 'aicraft',
-          };
-        }
-      } catch (err) {
-        lastError = err;
-        const lower = extractReadableErrorMessage(err).toLowerCase();
-        if (!isModelRetiredOrUnavailableError(lower)) {
-          lastMeaningfulError = err;
-        }
-      }
-    }
-  }
-
-  const errorToReport = lastMeaningfulError || lastError;
-  if (errorToReport) {
-    await recordGeminiApiError({
-      modelId: lastAttemptedUpstreamId,
-      error: errorToReport,
-      source: 'craft-stream',
-    }).catch(() => undefined);
-  }
-
-  // Gemini passes exhausted → fail over to the free AI mesh (self-hosted,
-  // free-tier providers, keyless Pollinations) before surfacing an error.
-  try {
-    return await runFreeAiMeshLane();
-  } catch (meshErr) {
-    if (meshErr instanceof FreeAiMeshUnavailableError) {
-      throw new Error(formatGeminiApiError(errorToReport, flagshipModel.name));
-    }
-    throw meshErr;
-  }
+  return runFreeAiMeshLane();
 }
 
 /**

@@ -185,6 +185,8 @@ export function BuilderWorkspace({
   isOwner = false,
 }: BuilderWorkspaceProps) {
   const theme = MODE_THEMES[mode];
+  const activeTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+  const meshAgents = activeTurn?.agents ?? [];
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const previewIframeRef = useRef<HTMLIFrameElement | null>(null);
@@ -2707,6 +2709,37 @@ export function BuilderWorkspace({
               isRestricted ? 'border-amber-400/70' : 'border-black/[0.1]'
             }`}
           >
+            {meshAgents.length > 0 && (
+              <div className="flex items-center gap-1.5 flex-wrap pb-1.5" aria-label="Build agents">
+                {meshAgents.map((agent) => (
+                  <span
+                    key={agent.role}
+                    className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10.5px] font-semibold capitalize ${
+                      agent.status === 'done'
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                        : agent.status === 'failed'
+                          ? 'bg-red-50 border-red-200 text-red-600'
+                          : 'bg-amber-50 border-amber-200 text-amber-700'
+                    }`}
+                  >
+                    {agent.status === 'done' ? (
+                      <Check className="w-3 h-3" />
+                    ) : agent.status === 'failed' ? (
+                      <span className="w-3 h-3 text-center leading-3">!</span>
+                    ) : (
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                    )}
+                    {agent.role}
+                  </span>
+                ))}
+                <span className="text-[10.5px] font-medium text-[#71717A]">
+                  {meshAgents.every((a) => a.status === 'done')
+                    ? '3 AIs merged the build'
+                    : '3 AIs building at once'}
+                </span>
+              </div>
+            )}
+
             {models.length > 1 && (
               <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-black/[0.05]">
                 <div className="flex items-center gap-2 min-w-0">
@@ -2719,7 +2752,11 @@ export function BuilderWorkspace({
                   />
                   <span className="text-[12px] font-medium text-[#18181B] truncate">
                     {activeModel?.name ??
-                      (modelsLoading ? 'Connecting...' : 'AI Craft')}
+                      (modelsLoading ? 'Connecting free AI mesh...' : 'Free AI Mesh')}
+                  </span>
+                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 border border-emerald-200 px-2 py-0.5 text-[10.5px] font-semibold text-emerald-700 shrink-0">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                    Free · no key
                   </span>
                 </div>
                 <ModelSelectorPopover
@@ -2759,8 +2796,8 @@ export function BuilderWorkspace({
                       : isVoiceTranscribing
                         ? 'Transcribing speech...'
                         : mode === 'mobile'
-                          ? 'Ask, attach screenshot, or add a feature...'
-                          : 'Ask, attach screenshot, or update your web app...'
+                          ? 'Ask the free AI, attach a screenshot, or add a feature...'
+                          : 'Describe your app — 3 AIs build it live. Attach a screenshot...'
                 }
                 rows={2}
                 aria-label={

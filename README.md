@@ -7,6 +7,12 @@ pipeline generates a complete, runnable single-page application (UI, logic, loca
 Supabase database, secrets integration) with live preview, revision history, and
 one-tap publishing to a shareable URL.
 
+Chat and builds run on the **free AI mesh** — 130+ curated free models across nine
+providers with automatic daily quota resets (UTC midnight) and instant failover, so
+**no API key is required**. Fresh builds fan out to **three AI agents at once**
+(architect + designer + engineer) whose output is merged into the final app, and
+chat replies are raced across the top candidates for minimum latency.
+
 ---
 
 ## Tech stack
@@ -17,7 +23,7 @@ one-tap publishing to a shareable URL.
 | PWA | vite-plugin-pwa (auto-update service worker, install prompts) |
 | Backend (self-hosted) | Express (`server.ts`) run via `tsx` |
 | Backend (serverless) | Vercel-style handlers under `api/` (see `vercel.json` rewrites) |
-| AI | Google Gemini (`@google/genai`) with gateway/model fallback matrix |
+| AI | Free AI mesh (`api/_freeAiMesh.ts`): keyless multi-provider failover, daily quotas, top-3 chat race, 3 parallel build agents |
 | Auth & data | Supabase (email/password + OAuth, Row-Level Security) |
 | Payments | Paystack checkout, webhooks, and credit-based billing |
 | 3D hero | three.js + GLB asset served with pre-computed gzip |
@@ -88,7 +94,7 @@ Copy `.env.example` to `.env` and fill in values. All secrets stay server-side.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | optional | Server-side Gemini key for the build/stream pipeline (highest priority when set) |
+| `GEMINI_API_KEY` | optional | **Not needed for chat/build** — mesh handles both. Only feeds optional extras (incomplete-build repair, media pre-pass, transcription) when present |
 | `SUPABASE_URL` | ✅* | Supabase project URL (*needed for auth, cloud save, memory) |
 | `SUPABASE_ANON_KEY` | ✅* | Supabase anon (public) key |
 | `SUPABASE_SERVICE_ROLE_KEY` | ✅* | Supabase service-role key (server-only) |
@@ -101,29 +107,52 @@ Copy `.env.example` to `.env` and fill in values. All secrets stay server-side.
 | `OPENAI_COMPATIBLE_BASE_URL/KEY/MODEL` | optional | Generic OpenAI-compatible endpoint lane |
 | `POLLINATIONS_ENABLED` | optional | Keyless text fallback (default `true`) |
 
-### Free AI mesh (automatic failover)
+### Free AI mesh (the only chat/build engine)
 
-Chat and build requests run through one ordered multi-provider mesh — no Gemini
-key required:
+Chat and build requests run through one ordered multi-provider mesh — **no API
+key required, ever**:
 
-1. **Gemini** (when `GEMINI_API_KEY` is set — existing 3-pass failover)
-2. **Self-hosted** GPU (`SELF_HOSTED_LLM_*`)
-3. **OpenAI-compatible** endpoint (`OPENAI_COMPATIBLE_*`)
-4. Free-tier keys: **Groq → Cerebras → OpenRouter (`:free` models) → Mistral →
+1. **Self-hosted** GPU (`SELF_HOSTED_LLM_*`)
+2. **OpenAI-compatible** endpoint (`OPENAI_COMPATIBLE_*`)
+3. Free-tier keys: **Groq → Cerebras → OpenRouter (`:free` models) → Mistral →
    HuggingFace → GitHub Models → Together → DeepInfra**
-5. **Pollinations** — keyless, always last (opt out with `POLLINATIONS_ENABLED=false`)
+4. **Pollinations** — keyless, always last (opt out with `POLLINATIONS_ENABLED=false`)
 
-Providers that rate-limit or error are cooled down (429/quota → 90s, auth →
-10min, retired model → 6h, 5xx/network → 30-45s) in a shared registry, so the
-next request skips them instantly with zero added latency. Repair and the design
-architect pre-pass use the same mesh. Media generation additionally falls back to
-keyless Pollinations image AI before web search (`POLLINATIONS_IMAGE_ENABLED`).
+**Honest model counts.** The curated catalog ships **130 free models** (Groq 12,
+Cerebras 5, OpenRouter 42, Mistral 6, HuggingFace 7, GitHub Models 32, Together 6,
+DeepInfra 8, Pollinations 11) and can merge additional `:free` OpenRouter models
+via live discovery — `/api/models` always reports the real active count
+(`freeAiMesh.modelPool`), never a fabricated number.
+
+**Resets every day.** Usage is tracked per `(provider, model)` against a daily
+quota that resets automatically at **00:00 UTC**. When one model hits its limit or
+errors, the mesh cools it down (429/quota → 90s, auth → 10min, retired model →
+6h, 5xx/network → 30-45s) and the **next free model continues immediately**.
+
+**Fast chat.** Chat requests race the top 3 candidates concurrently — the first
+emitter wins while losers keep the quota/failover bookkeeping — and the chat
+system prompt enforces SPEED FIRST (short, answer-first replies). Builds use
+tighter timeouts with a sequential failover walk.
+
+**Three AIs build at once.** On fresh builds (no previous HTML), the architect
+streams the app live while a designer and an engineer run concurrently with
+role-specific directives; their CSS/JS output is deterministically merged into the
+architect's document and re-validated (`validateBuiltAppHtml`) before the preview
+swaps in. Progress arrives as `agents` + `previewReplace` SSE events and renders
+as Architect/Designer/Engineer pills in the chat box. Parallel builds are gated
+(`MESH_PARALLEL_BUILDS=false` disables) and fall back to the architect's HTML if
+the merge would be unsafe.
+
+Repair and the design architect pre-pass also use the same mesh (they keep an
+optional Gemini branch that degrades to mesh when no key is set). Media
+generation additionally falls back to keyless Pollinations image AI before web
+search (`POLLINATIONS_IMAGE_ENABLED`).
 
 Without Supabase/payments the server still boots and reports status:
 
 ```bash
 curl http://localhost:3000/api/health
-# {"ok":true,"geminiConfigured":…,"serverFreeAiReady":true,"freeAiMesh":{…},"supabaseConfigured":…,"paymentsConfigured":…}
+# {"ok":true,"geminiConfigured":false,"serverFreeAiReady":true,"freeAiMesh":{"hasAny":true,"hasKeyless":true,"providers":[…],"modelPool":{"activeModels":3,"catalogSize":130,"dailyResetsAt":"…T00:00:00.000Z","dailyLimitPerModel":400}},…}
 ```
 
 ## Database (Supabase)

@@ -316,8 +316,11 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     let rawOutput = '';
+    const previousHtmlForRoute =
+      typeof body.previousHtml === 'string' ? body.previousHtml : '';
     const streamRes = await streamServerFreeAiRealTime({
       requestedModel: typeof body.model === 'string' ? body.model : undefined,
+      initialRoute: prepared.initialRoute,
       systemPrompt: prepared.systemPrompt,
       historyMessages: prepared.historyMessages,
       userPrompt: prepared.userPrompt,
@@ -325,6 +328,16 @@ export async function POST(request: Request): Promise<Response> {
         typeof (body.attachmentDataUrl ?? opts.attachmentDataUrl) === 'string'
           ? String(body.attachmentDataUrl ?? opts.attachmentDataUrl)
           : null,
+      allowParallelAgents:
+        prepared.initialRoute === 'build' &&
+        !prepared.isPatchMode &&
+        previousHtmlForRoute.trim().length === 0 &&
+        !/\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(
+          typeof body.message === 'string' ? body.message : ''
+        ),
+      onReplaceRawOutput: (raw) => {
+        rawOutput = raw;
+      },
       onContentChunk: (chunk) => {
         rawOutput += chunk;
       },

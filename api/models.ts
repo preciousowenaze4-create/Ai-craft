@@ -1,25 +1,26 @@
-import {
-  GEMINI_BUILDER_MODELS,
-  fetchAllGatewayModels,
-  hasServerFreeAiKey,
-} from './_aiGateways.js';
-import { getFreeAiMeshStatus } from './_freeAiMesh.js';
+import { hasServerFreeAiKey } from './_aiGateways.js';
+import { getFreeAiMeshStatus, getFreeMeshModelOptions } from './_freeAiMesh.js';
 
 export async function GET(request: Request): Promise<Response> {
   try {
-    const reqUrl = new URL(request.url);
-    const referer = process.env.APP_URL || `${reqUrl.protocol}//${reqUrl.host}`;
-    const forceRefresh = reqUrl.searchParams.get('refresh') === '1';
-
-    const result = await fetchAllGatewayModels(referer, forceRefresh);
     const mesh = getFreeAiMeshStatus();
 
     return Response.json(
       {
-        models: result.models,
-        gateways: result.gateways,
-        geminiConfigured: result.geminiConfigured,
-        serverFreeAiReady: result.geminiConfigured || mesh.hasAny,
+        models: getFreeMeshModelOptions(),
+        gateways: [
+          {
+            id: 'free-mesh',
+            label: 'Free AI Mesh',
+            baseUrl: 'keyless failover across free providers',
+            configured: mesh.hasAny,
+            keyCount: 0,
+            modelCount: mesh.modelPool.activeModels,
+            defaultModel: 'mesh::auto',
+          },
+        ],
+        geminiConfigured: false,
+        serverFreeAiReady: mesh.hasAny,
         pollinationsConfigured: mesh.pollinationsConfigured,
         puterConfigured: false,
         keyless: mesh.hasKeyless,
@@ -27,7 +28,9 @@ export async function GET(request: Request): Promise<Response> {
           hasAny: mesh.hasAny,
           hasKeyless: mesh.hasKeyless,
           providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
+          modelPool: mesh.modelPool,
         },
+        modelPool: mesh.modelPool,
         freeOnly: true,
       },
       {
@@ -40,9 +43,9 @@ export async function GET(request: Request): Promise<Response> {
     const mesh = getFreeAiMeshStatus();
     return Response.json(
       {
-        models: GEMINI_BUILDER_MODELS,
+        models: getFreeMeshModelOptions(),
         geminiConfigured: hasServerFreeAiKey(),
-        serverFreeAiReady: hasServerFreeAiKey() || mesh.hasAny,
+        serverFreeAiReady: mesh.hasAny,
         pollinationsConfigured: mesh.pollinationsConfigured,
         puterConfigured: false,
         keyless: mesh.hasKeyless,
@@ -50,7 +53,9 @@ export async function GET(request: Request): Promise<Response> {
           hasAny: mesh.hasAny,
           hasKeyless: mesh.hasKeyless,
           providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
+          modelPool: mesh.modelPool,
         },
+        modelPool: mesh.modelPool,
         freeOnly: true,
       },
       {
