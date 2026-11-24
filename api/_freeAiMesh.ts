@@ -27,6 +27,16 @@
  *    fresh builds additionally fan out to 3 parallel agents (architect +
  *    designer + engineer) inside `_realtimeEngine`.
  *
+ * Concurrency & self-heal:
+ *  - every HTTP call acquires a per-provider single-flight slot first
+ *    (Pollinations Classic = 1 request per IP, env MESH_POLLINATIONS_CONCURRENCY),
+ *    so races and parallel agents queue instead of colliding;
+ *  - the chat race cancels losing lanes the moment the winner settles;
+ *  - "previous request is still running" busy errors cool for ~6s only, and
+ *    a walk whose candidates are ALL briefly cooling waits (bounded, env
+ *    MESH_COOLDOWN_WAIT_MS) for the earliest one instead of erroring —
+ *    cooldowns always expire; nothing is ever permanent.
+ *
  * Design rules:
  *  - Never throws for "no provider configured" silently — callers gate on
  *    `isFreeAiMeshAvailable()`; `streamFreeAiMesh` throws typed friendly errors.
@@ -38,6 +48,7 @@
 
 import {
   buildCandidateCooldownKey,
+  gatewayCandidateCooldownRemainingMs,
   isGatewayCandidateCoolingDown,
   markGatewayCandidateCooldown,
 } from './_aiGateways.js';
@@ -134,6 +145,74 @@ function toChatCompletionsUrl(rawBase: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Abortable sleep + per-provider single-flight slots.
+//
+// Pollinations' Classic API answers ONE request at a time per IP — firing the
+// chat race (or 3 parallel build agents) at it concurrently is exactly what
+// produced "Your previous request is still running" on every attempt, which
+// then cooled every model and surfaced "all configured engines are cooling
+// down". Every mesh HTTP call now acquires its provider's slot first, so
+// concurrent walks queue instead of colliding; busy errors additionally get
+// a SHORT cooldown (see cooldownForMeshError) so the next attempt recovers
+// in seconds — cooldowns are never permanent.
+// ---------------------------------------------------------------------------
+
+function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('Request cancelled.'));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error('Request cancelled.'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+const providerInFlight = new Map<string, number>();
+
+function providerConcurrencyLimit(providerId: string): number {
+  if (providerId === 'pollinations') {
+    // Pollinations Classic = 1 request at a time per IP (keyless).
+    return Math.max(1, readEnvNumber('MESH_POLLINATIONS_CONCURRENCY', 1));
+  }
+  return Math.max(1, readEnvNumber('MESH_PROVIDER_CONCURRENCY', 6));
+}
+
+async function acquireProviderSlot(
+  providerId: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const limit = providerConcurrencyLimit(providerId);
+  const startedAt = Date.now();
+  const maxWaitMs = 120_000;
+  for (;;) {
+    if (signal?.aborted) throw new Error('Request cancelled.');
+    const current = providerInFlight.get(providerId) ?? 0;
+    if (current < limit) {
+      providerInFlight.set(providerId, current + 1);
+      return;
+    }
+    if (Date.now() - startedAt > maxWaitMs) {
+      throw new MeshHttpError('timed out waiting for provider slot', null);
+    }
+    await sleepWithSignal(120, signal);
+  }
+}
+
+function releaseProviderSlot(providerId: string): void {
+  const current = providerInFlight.get(providerId) ?? 0;
+  if (current <= 1) providerInFlight.delete(providerId);
+  else providerInFlight.set(providerId, current - 1);
+}
+
+// ---------------------------------------------------------------------------
 // Provider registry (ordered — first healthy candidate wins)
 // ---------------------------------------------------------------------------
 
@@ -207,7 +286,7 @@ function resolvePollinationsModels(baseUrl: string): string[] {
   // Prefer well-known stable names first, then the rest of the live list.
   const preferred = POLLINATIONS_FALLBACK_MODELS.filter((m) => cached.includes(m));
   const rest = cached.filter((m) => !preferred.includes(m));
-  return [...preferred, ...rest].slice(0, 24);
+  return [...preferred, ...rest].slice(0, 40);
 }
 
 const MESH_PROVIDERS: MeshProviderDef[] = [
@@ -391,7 +470,7 @@ interface MeshCandidate {
   cooldownKey: string;
 }
 
-const MAX_MODELS_PER_PROVIDER = 5;
+const MAX_MODELS_PER_PROVIDER = 8;
 const MAX_ATTEMPTS_PER_WALK = 12;
 
 // ---------------------------------------------------------------------------
@@ -449,10 +528,11 @@ function budgetFor(taskKind: 'chat' | 'build'): MeshWalkBudget {
   return { firstByteMs: 10_000, idleMs: 45_000, walkMs: 65_000, maxAttempts: 12 };
 }
 
-function buildMeshCandidates(): MeshCandidate[] {
-  const out: MeshCandidate[] = [];
+/** Every candidate the walk may consider, with its remaining cooldown
+ *  (0 = usable right now). Quota-exhausted models are excluded entirely. */
+function enumerateMeshCandidates(): Array<{ candidate: MeshCandidate; coolingMs: number }> {
+  const all: Array<{ candidate: MeshCandidate; coolingMs: number }> = [];
   for (const def of MESH_PROVIDERS) {
-    if (out.length >= MAX_ATTEMPTS_PER_WALK) break;
     let resolved: ResolvedMeshProvider | null = null;
     try {
       resolved = def.resolve();
@@ -468,21 +548,43 @@ function buildMeshCandidates(): MeshCandidate[] {
         resolved.apiKey || def.id,
         model
       );
-      if (isGatewayCandidateCoolingDown(cooldownKey)) continue;
-      out.push({
-        providerId: def.id,
-        providerLabel: def.label,
-        keyless: def.keyless,
-        baseUrl: resolved.baseUrl,
-        apiKey: resolved.apiKey,
-        headers: resolved.headers,
-        model,
-        cooldownKey,
+      all.push({
+        candidate: {
+          providerId: def.id,
+          providerLabel: def.label,
+          keyless: def.keyless,
+          baseUrl: resolved.baseUrl,
+          apiKey: resolved.apiKey,
+          headers: resolved.headers,
+          model,
+          cooldownKey,
+        },
+        coolingMs: gatewayCandidateCooldownRemainingMs(cooldownKey),
       });
-      if (out.length >= MAX_ATTEMPTS_PER_WALK) break;
     }
   }
+  return all;
+}
+
+function buildMeshCandidates(): MeshCandidate[] {
+  const out: MeshCandidate[] = [];
+  for (const entry of enumerateMeshCandidates()) {
+    if (entry.coolingMs > 0) continue;
+    out.push(entry.candidate);
+    if (out.length >= MAX_ATTEMPTS_PER_WALK) break;
+  }
   return out;
+}
+
+/** Smallest remaining cooldown across every cooling candidate — 0 when at
+ *  least one candidate is usable or nothing is cooling at all. */
+function earliestMeshCooldownMs(): number {
+  let earliest = 0;
+  for (const entry of enumerateMeshCandidates()) {
+    if (entry.coolingMs <= 0) return 0; // someone is usable
+    if (earliest === 0 || entry.coolingMs < earliest) earliest = entry.coolingMs;
+  }
+  return earliest;
 }
 
 export function isFreeAiMeshAvailable(): boolean {
@@ -664,8 +766,22 @@ function normalizeMeshError(err: unknown): MeshErrorInfo {
   return { status: null, message: String(err).slice(0, 300) };
 }
 
-function cooldownForMeshError(info: MeshErrorInfo): { ms: number; hard: boolean } {
+export function cooldownForMeshError(
+  info: MeshErrorInfo
+): { ms: number; hard: boolean } {
   const lower = info.message.toLowerCase();
+  // Pollinations "previous request is still running / 1 request at a time per
+  // IP" (and pollen-key nags) are TRANSIENT concurrency busy — the next
+  // attempt gets the single-flight slot, so cool for seconds only. Checked
+  // BEFORE every other branch (busy arrives with various status codes) so a
+  // busy storm can never pin models on 45–90s cooldowns.
+  if (
+    /previous request is still running|1 request at a time per ip|wait for it to finish/.test(
+      lower
+    )
+  ) {
+    return { ms: 6_000, hard: false };
+  }
   if (
     info.status === 401 ||
     info.status === 403 ||
@@ -838,7 +954,7 @@ async function postMeshJson(
  * `onReasoningChunk`. Returns the accumulated raw output (may be '').
  * Throws MeshHttpError / abort errors; callers classify + cool down.
  */
-async function streamOneMeshCandidate(
+async function streamOneMeshCandidateRaw(
   candidate: MeshCandidate,
   params: MeshAttemptParams,
   onChunk: (text: string) => void,
@@ -987,7 +1103,23 @@ async function streamOneMeshCandidate(
   return '';
 }
 
-async function completeOneMeshCandidate(
+/** Stream one candidate while holding its provider's single-flight slot
+ *  (queueing instead of colliding — Pollinations Classic = 1 request/IP). */
+async function streamOneMeshCandidate(
+  candidate: MeshCandidate,
+  params: MeshAttemptParams,
+  onChunk: (text: string) => void,
+  onReasoning?: (text: string) => void
+): Promise<string> {
+  await acquireProviderSlot(candidate.providerId, params.signal?.signal);
+  try {
+    return await streamOneMeshCandidateRaw(candidate, params, onChunk, onReasoning);
+  } finally {
+    releaseProviderSlot(candidate.providerId);
+  }
+}
+
+async function completeOneMeshCandidateRaw(
   candidate: MeshCandidate,
   params: MeshAttemptParams
 ): Promise<string> {
@@ -1017,6 +1149,21 @@ async function completeOneMeshCandidate(
     ((json as { choices?: Array<{ message?: { content?: string } }> } | null)?.choices?.[0]
       ?.message?.content as string | undefined) || '';
   return content || text;
+}
+
+/** Non-streaming attempt while holding the provider's single-flight slot —
+ *  the queue wait happens BEFORE the caller's first-byte timer starts, so
+ *  side agents queued behind a long architect stream keep their budget. */
+async function completeOneMeshCandidate(
+  candidate: MeshCandidate,
+  params: MeshAttemptParams
+): Promise<string> {
+  await acquireProviderSlot(candidate.providerId, params.signal?.signal);
+  try {
+    return await completeOneMeshCandidateRaw(candidate, params);
+  } finally {
+    releaseProviderSlot(candidate.providerId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1204,8 @@ async function runMeshStreamAttempt(params: {
   walk: MeshWalkParams;
   budget: MeshWalkBudget;
   onForwardChunk: (chunk: string) => void;
+  /** Per-attempt cancel from raceMeshAttempts (leader already won). */
+  raceSignal?: AbortSignal;
 }): Promise<MeshStreamResult> {
   const { candidate, walk, budget } = params;
   const modelId = `mesh::${candidate.providerId}::${candidate.model}`;
@@ -1065,6 +1214,7 @@ async function runMeshStreamAttempt(params: {
 
   const controller = new AbortController();
   const unlink = linkSignal(walk.signal, controller);
+  const unlinkRace = linkSignal(params.raceSignal, controller);
   let emitted = false;
   try {
     const raw = await streamOneMeshCandidate(
@@ -1095,13 +1245,18 @@ async function runMeshStreamAttempt(params: {
     // Content already reached the caller — surface immediately so the engine
     // can finalize partial HTML exactly like the previous path did.
     if (emitted) throw err;
-    if (walk.signal?.aborted) throw new Error('Request cancelled.');
+    // Cancelled by the caller OR by the race (another lane already won) —
+    // never cooldown-mark a healthy model just because we stopped asking.
+    if (walk.signal?.aborted || params.raceSignal?.aborted) {
+      throw new Error('Request cancelled.');
+    }
     const info = normalizeMeshError(err);
     const { ms, hard } = cooldownForMeshError(info);
     markGatewayCandidateCooldown(candidate.cooldownKey, ms, hard);
     throw err;
   } finally {
     unlink();
+    unlinkRace();
   }
 }
 
@@ -1127,13 +1282,19 @@ async function raceMeshAttempts(params: {
 }): Promise<MeshRaceOutcome> {
   const { candidates, walk, budget } = params;
   let leaderIdx: number | null = null;
+  const attemptControllers = candidates.map(() => new AbortController());
+  let notifyLeaderSettled: () => void = () => undefined;
+  const leaderSettled = new Promise<void>((resolve) => {
+    notifyLeaderSettled = resolve;
+  });
 
-  const settled = await Promise.all(
+  const settledPromise = Promise.all(
     candidates.map((candidate, idx) =>
       runMeshStreamAttempt({
         candidate,
         walk,
         budget,
+        raceSignal: attemptControllers[idx].signal,
         onForwardChunk: (chunk) => {
           if (leaderIdx === null) leaderIdx = idx;
           if (leaderIdx === idx) walk.onContentChunk?.(chunk);
@@ -1143,8 +1304,23 @@ async function raceMeshAttempts(params: {
       })
         .then((result) => ({ idx, ok: true as const, result }))
         .catch((err: unknown) => ({ idx, ok: false as const, err }))
+        .then((entry) => {
+          if (leaderIdx === idx) notifyLeaderSettled();
+          return entry;
+        })
     )
   );
+
+  // The leader decided the stream — cancel every other attempt (including
+  // ones still queued on the provider single-flight slot) so chat returns
+  // the moment the winner finishes instead of waiting for the slowest lane.
+  void leaderSettled.then(() => {
+    attemptControllers.forEach((controller, idx) => {
+      if (idx !== leaderIdx) controller.abort();
+    });
+  });
+
+  const settled = await settledPromise;
 
   if (leaderIdx !== null) {
     const leader = settled[leaderIdx];
@@ -1159,6 +1335,25 @@ async function raceMeshAttempts(params: {
   return { kind: 'all-failed', details };
 }
 
+/** Top-N race picks with at most one lane per provider — two models of the
+ *  SAME provider would only queue behind each other on the single-flight
+ *  slot, so racing them together just wasted the walk budget. */
+function pickRaceCandidates(candidates: MeshCandidate[], count: number): MeshCandidate[] {
+  const picked: MeshCandidate[] = [];
+  const seenProviders = new Set<string>();
+  for (const candidate of candidates) {
+    if (picked.length >= count) break;
+    if (seenProviders.has(candidate.providerId)) continue;
+    seenProviders.add(candidate.providerId);
+    picked.push(candidate);
+  }
+  for (const candidate of candidates) {
+    if (picked.length >= count) break;
+    if (!picked.includes(candidate)) picked.push(candidate);
+  }
+  return picked;
+}
+
 /**
  * Streaming failover walk across the whole mesh.
  *  - chat: races the top-3 candidates, then falls back sequentially.
@@ -1170,30 +1365,61 @@ async function raceMeshAttempts(params: {
  */
 export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStreamResult> {
   const budget = budgetFor(params.taskKind);
-  const candidates = buildMeshCandidates();
+  let cooldownWaitTried = false;
+
+  // Bounded self-heal: when every configured engine is only SHORT-cooling
+  // (busy storms recover in seconds), wait for the earliest one instead of
+  // surfacing "all configured engines are cooling down". Long cooldowns
+  // (rate-limit 90s, network 45s…) still fail fast with the friendly error.
+  const tryWaitForCooldowns = async (): Promise<boolean> => {
+    if (cooldownWaitTried) return false;
+    if (!getFreeAiMeshStatus().hasAny) return false;
+    if (buildMeshCandidates().length > 0) return false;
+    const earliest = earliestMeshCooldownMs();
+    if (earliest <= 0) return false;
+    const capMs = readEnvNumber(
+      'MESH_COOLDOWN_WAIT_MS',
+      params.taskKind === 'chat' ? 8_000 : 6_000
+    );
+    if (earliest > capMs) return false;
+    cooldownWaitTried = true;
+    await sleepWithSignal(Math.min(earliest + 200, capMs + 200), params.signal).catch(
+      () => undefined
+    );
+    return buildMeshCandidates().length > 0;
+  };
+
+  let candidates = buildMeshCandidates();
   if (candidates.length === 0) {
     // Distinguish "nothing configured" from "everything configured but cooling
     // down / quota-capped" so the user gets an actionable message.
     if (getFreeAiMeshStatus().hasAny) {
-      throw new FreeAiMeshAllFailedError([
-        'all configured engines are cooling down after recent errors',
-      ]);
+      if (await tryWaitForCooldowns()) {
+        candidates = buildMeshCandidates();
+      } else {
+        throw new FreeAiMeshAllFailedError([
+          'all configured engines are cooling down after recent errors',
+        ]);
+      }
+    } else {
+      throw new FreeAiMeshUnavailableError();
     }
-    throw new FreeAiMeshUnavailableError();
   }
 
   const deadlineAt = Date.now() + budget.walkMs;
   const details: string[] = [];
   let attempts = 0;
-  let nextIndex = 0;
+  const racedSet = new Set<MeshCandidate>();
 
   // Fast path: chat races the top candidates so the quickest free AI answers.
+  // One lane per provider — same-provider models would only queue behind
+  // each other on the single-flight slot.
   if (params.taskKind === 'chat' && candidates.length > 1) {
-    const raceCount = Math.min(3, candidates.length);
-    attempts += raceCount;
-    nextIndex = raceCount;
+    const racePicks = pickRaceCandidates(candidates, Math.min(3, candidates.length));
+    attempts += racePicks.length;
+    for (const pick of racePicks) racedSet.add(pick);
     const raced = await raceMeshAttempts({
-      candidates: candidates.slice(0, raceCount),
+      candidates: racePicks,
       walk: params,
       budget,
     });
@@ -1202,23 +1428,36 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
     details.push(...raced.details);
   }
 
-  for (let i = nextIndex; i < candidates.length; i += 1) {
-    const candidate = candidates[i];
-    if (params.signal?.aborted) throw new Error('Request cancelled.');
-    if (Date.now() > deadlineAt || attempts >= budget.maxAttempts) break;
-    attempts += 1;
-    try {
-      return await runMeshStreamAttempt({
-        candidate,
-        walk: params,
-        budget,
-        onForwardChunk: (chunk) => params.onContentChunk?.(chunk),
-      });
-    } catch (err) {
+  const runSequential = async (list: MeshCandidate[]): Promise<MeshStreamResult | null> => {
+    for (const candidate of list) {
+      if (racedSet.has(candidate)) continue;
       if (params.signal?.aborted) throw new Error('Request cancelled.');
-      const info = normalizeMeshError(err);
-      details.push(`${candidate.providerId}: ${info.message}`);
+      if (Date.now() > deadlineAt || attempts >= budget.maxAttempts) return null;
+      attempts += 1;
+      try {
+        return await runMeshStreamAttempt({
+          candidate,
+          walk: params,
+          budget,
+          onForwardChunk: (chunk) => params.onContentChunk?.(chunk),
+        });
+      } catch (err) {
+        if (params.signal?.aborted) throw new Error('Request cancelled.');
+        const info = normalizeMeshError(err);
+        details.push(`${candidate.providerId}: ${info.message}`);
+      }
     }
+    return null;
+  };
+
+  const firstPass = await runSequential(candidates);
+  if (firstPass) return firstPass;
+
+  // Everything failed or raced — one bounded cooldown wait, then retry
+  // whatever recovered (busy cooldowns expire in seconds; never permanent).
+  if (await tryWaitForCooldowns()) {
+    const retryPass = await runSequential(buildMeshCandidates());
+    if (retryPass) return retryPass;
   }
 
   if (attempts === 0) throw new FreeAiMeshUnavailableError();
@@ -1240,10 +1479,25 @@ export async function completeFreeAiMesh(params: {
   /** Per-attempt first-byte budget (callers race this against their own timer). */
   timeoutMs?: number;
 }): Promise<string | null> {
-  const candidates = buildMeshCandidates();
-  if (candidates.length === 0) return null;
+  const attemptMs = Math.max(3_000, Math.min(params.timeoutMs ?? 25_000, 25_000));
+  let candidates = buildMeshCandidates();
+  if (candidates.length === 0) {
+    // Short busy cooldowns: wait them out once (bounded) instead of silently
+    // degrading the caller to architect-only output.
+    const earliest = earliestMeshCooldownMs();
+    const waitCapMs = Math.min(attemptMs, 5_000);
+    if (earliest > 0 && earliest <= waitCapMs && getFreeAiMeshStatus().hasAny) {
+      await sleepWithSignal(earliest + 200, params.signal).catch(() => undefined);
+      candidates = buildMeshCandidates();
+    }
+    if (candidates.length === 0) return null;
+  }
 
-  const deadlineAt = Date.now() + Math.max(5_000, params.timeoutMs ?? 25_000);
+  // Queue-tolerant deadline: the first-byte budget starts only AFTER the
+  // single-flight slot is granted (inside completeOneMeshCandidate), so a
+  // side agent queued behind a long architect stream must not have its whole
+  // budget consumed while waiting. Grace covers the slot wait itself.
+  const deadlineAt = Date.now() + attemptMs + 130_000;
   for (const candidate of candidates) {
     if (params.signal?.aborted) return null;
     if (Date.now() > deadlineAt) return null;
@@ -1257,7 +1511,7 @@ export async function completeFreeAiMesh(params: {
         userPrompt: params.userPrompt,
         attachmentDataUrl: params.attachmentDataUrl,
         signal: controller,
-        firstByteTimeoutMs: Math.max(3_000, Math.min(params.timeoutMs ?? 25_000, 25_000)),
+        firstByteTimeoutMs: attemptMs,
       });
       if (out.trim()) {
         recordDailyUsage(candidate.providerId, candidate.model);

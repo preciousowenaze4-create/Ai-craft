@@ -15,6 +15,12 @@
  *   5. Model pool status: catalog size, active models, daily reset timestamp.
  *   6. Daily quotas: an exhausted (provider, model) is skipped and the next
  *      model continues; when every model is exhausted → friendly all-failed.
+ *   7. Busy ("previous request is still running") errors → SHORT cooldown;
+ *      generic rate limits keep the long one.
+ *   8. Single-flight: concurrent walks serialize on Pollinations (peak=1)
+ *      and the chat race hits it exactly once (dedup + early-exit).
+ *   9. All-cooling walks wait out short cooldowns and self-heal instead of
+ *      erroring — cooldowns are never permanent.
  */
 // Scrub ambient provider credentials first (CI runners have open networks —
 // a leaked GITHUB_TOKEN or GROQ key could answer for real and break assertions),
@@ -183,6 +189,100 @@ assert(
   'engine entry should return mesh output without API keys'
 );
 assert(engineText.includes('free AI mesh'), 'engine should stream chunks via onContentChunk');
+
+// --- 7: busy-error classification (the screenshot regression) ------------
+// "Your previous request is still running / 1 request at a time per IP" must
+// cool for SECONDS (recoverable), never 45–90s — and generic rate limits
+// keep their longer cooldown.
+const { cooldownForMeshError } = await import('../api/_freeAiMesh.js');
+const busyCooldown = cooldownForMeshError({
+  status: 429,
+  message:
+    'Your previous request is still running. The Classic API answers 1 request at a time per IP. Wait for it to finish, or run requests in parallel with a pollen key at https://enter.pollinations.ai/?ref=classic',
+});
+assert(
+  busyCooldown.ms <= 10_000 && !busyCooldown.hard,
+  `busy error must be a SHORT non-hard cooldown, got ${busyCooldown.ms}ms hard=${busyCooldown.hard}`
+);
+const rateLimitCooldown = cooldownForMeshError({
+  status: 429,
+  message: 'Rate limit reached for this model.',
+});
+assert(
+  rateLimitCooldown.ms >= 60_000,
+  `generic rate-limit must keep its long cooldown, got ${rateLimitCooldown.ms}ms`
+);
+console.log('busy classification OK: busy→', busyCooldown.ms, 'ms, rate-limit→', rateLimitCooldown.ms, 'ms');
+
+// --- 8: single-flight — concurrent walks never overlap on Pollinations ----
+// Two build walks at once + one chat: the mock's /__stats peak must stay at
+// 1 (queued, not collided), and the chat race must hit the provider only ONCE
+// (provider-dedup picks + losing lane aborted while still queued).
+const mockStats = async (): Promise<{ count: number; active: number; peak: number }> =>
+  (await fetch('http://127.0.0.1:4592/__stats')).json();
+await fetch('http://127.0.0.1:4592/__stats/reset', { method: 'POST' });
+
+const [walkA, walkB] = await Promise.all([
+  streamFreeAiMesh({ taskKind: 'build', systemPrompt: 'sys', userPrompt: 'Say hello A' }),
+  streamFreeAiMesh({ taskKind: 'build', systemPrompt: 'sys', userPrompt: 'Say hello B' }),
+]);
+assert(
+  walkA.rawOutput.includes('free AI mesh') && walkB.rawOutput.includes('free AI mesh'),
+  'both concurrent walks must succeed'
+);
+const afterWalks = await mockStats();
+assert(
+  afterWalks.peak <= 1,
+  `pollinations must serialize concurrent walks (peak=${afterWalks.peak})`
+);
+console.log('single-flight OK: concurrent walks peak =', afterWalks.peak);
+
+await fetch('http://127.0.0.1:4592/__stats/reset', { method: 'POST' });
+const chatRace = await streamFreeAiMesh({
+  taskKind: 'chat',
+  systemPrompt: 'You are a helpful assistant.',
+  historyMessages: [],
+  userPrompt: 'Say hello once',
+});
+assert(chatRace.rawOutput.includes('free AI mesh'), 'chat race must succeed');
+const afterChat = await mockStats();
+assert(
+  afterChat.count === 1,
+  `chat race must hit pollinations exactly once (dedup + early-exit), got count=${afterChat.count}`
+);
+assert(afterChat.peak <= 1, `chat race must not overlap on pollinations (peak=${afterChat.peak})`);
+console.log('race dedup OK: chat hit pollinations', afterChat.count, 'time(s)');
+
+// --- 9: bounded cooldown wait — self-heals instead of erroring -----------
+// Cool EVERY configured candidate for 3s (well under the 6s build cap): the
+// walk must WAIT for the earliest cooldown and then succeed — never surface
+// "all configured engines are cooling down" for short cooldowns.
+const { buildCandidateCooldownKey, markGatewayCandidateCooldown } = await import(
+  '../api/_aiGateways.js'
+);
+for (const key of [
+  buildCandidateCooldownKey('mesh:self-hosted', 'self-hosted', 'mock-rate-limited'),
+  buildCandidateCooldownKey('mesh:pollinations', 'pollinations', 'openai'),
+  buildCandidateCooldownKey('mesh:pollinations', 'pollinations', 'openai-fast'),
+]) {
+  markGatewayCandidateCooldown(key, 3_000, false);
+}
+const healStartedAt = Date.now();
+const healed = await streamFreeAiMesh({
+  taskKind: 'build',
+  systemPrompt: 'sys',
+  userPrompt: 'Say hello after cooldown',
+});
+const healElapsed = Date.now() - healStartedAt;
+assert(
+  healed.rawOutput.includes('free AI mesh'),
+  'walk must self-heal after short cooldowns expire'
+);
+assert(
+  healElapsed >= 2_500,
+  `walk should have waited out the cooldowns, waited only ${healElapsed}ms`
+);
+console.log('cooldown self-heal OK: waited', healElapsed, 'ms then succeeded');
 
 // --- 6: daily quotas — exhausted model steps aside, next one continues ----
 // Uses taskKind 'build' (sequential walk) so exactly one model is consumed

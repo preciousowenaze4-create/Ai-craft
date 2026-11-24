@@ -226,6 +226,18 @@ export function isGatewayCandidateCoolingDown(cooldownKey: string): boolean {
   return true;
 }
 
+/** Milliseconds until this cooldown expires (0 = not cooling down). */
+export function gatewayCandidateCooldownRemainingMs(cooldownKey: string): number {
+  const entry = endpointCooldowns.get(cooldownKey);
+  if (!entry) return 0;
+  const remaining = entry.until - Date.now();
+  if (remaining <= 0) {
+    endpointCooldowns.delete(cooldownKey);
+    return 0;
+  }
+  return remaining;
+}
+
 export function isGatewayCandidateHardBlocked(cooldownKey: string): boolean {
   const entry = endpointCooldowns.get(cooldownKey);
   if (!entry) return false;

@@ -7,7 +7,7 @@ pipeline generates a complete, runnable single-page application (UI, logic, loca
 Supabase database, secrets integration) with live preview, revision history, and
 one-tap publishing to a shareable URL.
 
-Chat and builds run on the **free AI mesh** — 130+ curated free models across nine
+Chat and builds run on the **free AI mesh** — 210+ curated free models across nine
 providers with automatic daily quota resets (UTC midnight) and instant failover, so
 **no API key is required**. Fresh builds fan out to **three AI agents at once**
 (architect + designer + engineer) whose output is merged into the final app, and
@@ -118,25 +118,33 @@ key required, ever**:
    HuggingFace → GitHub Models → Together → DeepInfra**
 4. **Pollinations** — keyless, always last (opt out with `POLLINATIONS_ENABLED=false`)
 
-**Honest model counts.** The curated catalog ships **130 free models** (Groq 12,
-Cerebras 5, OpenRouter 42, Mistral 6, HuggingFace 7, GitHub Models 32, Together 6,
-DeepInfra 8, Pollinations 11) and can merge additional `:free` OpenRouter models
+**Honest model counts.** The curated catalog ships **211 free models** (Groq 14,
+Cerebras 9, OpenRouter 91, Mistral 9, HuggingFace 11, GitHub Models 42, Together 10,
+DeepInfra 12, Pollinations 13) and can merge additional `:free` OpenRouter models
 via live discovery — `/api/models` always reports the real active count
 (`freeAiMesh.modelPool`), never a fabricated number.
 
 **Resets every day.** Usage is tracked per `(provider, model)` against a daily
 quota that resets automatically at **00:00 UTC**. When one model hits its limit or
-errors, the mesh cools it down (429/quota → 90s, auth → 10min, retired model →
-6h, 5xx/network → 30-45s) and the **next free model continues immediately**.
+errors, the mesh cools it down (Pollinations "previous request still running" busy
+→ 6s, 429/quota → 90s, auth → 10min, retired model → 6h, 5xx/network → 30-45s)
+and the **next free model continues immediately**. When every engine is only
+briefly cooling, the walk waits — bounded (`MESH_COOLDOWN_WAIT_MS`, 8s chat /
+6s build) — for the earliest one instead of erroring, so cooldowns never surface
+a stuck error and are never permanent.
 
-**Fast chat.** Chat requests race the top 3 candidates concurrently — the first
-emitter wins while losers keep the quota/failover bookkeeping — and the chat
-system prompt enforces SPEED FIRST (short, answer-first replies). Builds use
-tighter timeouts with a sequential failover walk.
+**Fast chat.** Chat requests race the top 3 candidates concurrently — at most one
+lane per provider, so same-provider models never queue behind each other. The first
+emitter wins and every losing lane is cancelled immediately (including ones still
+waiting on the provider single-flight slot), and the chat system prompt enforces
+SPEED FIRST (short, answer-first replies). Builds use tighter timeouts with a
+sequential failover walk.
 
 **Three AIs build at once.** On fresh builds (no previous HTML), the architect
 streams the app live while a designer and an engineer run concurrently with
-role-specific directives; their CSS/JS output is deterministically merged into the
+role-specific directives — every mesh call takes a per-provider single-flight
+slot first (Pollinations Classic = 1 request per IP, `MESH_POLLINATIONS_CONCURRENCY`),
+so parallel agents queue instead of colliding with "previous request still running"; their CSS/JS output is deterministically merged into the
 architect's document and re-validated (`validateBuiltAppHtml`) before the preview
 swaps in. Progress arrives as `agents` + `previewReplace` SSE events and renders
 as Architect/Designer/Engineer pills in the chat box. Parallel builds are gated
@@ -152,7 +160,7 @@ Without Supabase/payments the server still boots and reports status:
 
 ```bash
 curl http://localhost:3000/api/health
-# {"ok":true,"geminiConfigured":false,"serverFreeAiReady":true,"freeAiMesh":{"hasAny":true,"hasKeyless":true,"providers":[…],"modelPool":{"activeModels":3,"catalogSize":130,"dailyResetsAt":"…T00:00:00.000Z","dailyLimitPerModel":400}},…}
+# {"ok":true,"geminiConfigured":false,"serverFreeAiReady":true,"freeAiMesh":{"hasAny":true,"hasKeyless":true,"providers":[…],"modelPool":{"activeModels":3,"catalogSize":211,"dailyResetsAt":"…T00:00:00.000Z","dailyLimitPerModel":400}},…}
 ```
 
 ## Database (Supabase)
