@@ -1883,6 +1883,7 @@ export function buildCraftSystemPrompt(params: {
         : '\nNo app has been built in Preview yet in this session.',
       titleRuleForChat,
       'HOW TO RESPOND RIGHT NOW (CHAT MODE — STRICT):',
+      '- SPEED FIRST: reply fast and tight — lead with the answer, keep most replies under 120 words unless the user explicitly asks for detail, no preamble, never restate the question.',
       '- Talk naturally like a real human engineer — concise, helpful, clear, and honest.',
       '- Answer normal questions directly without outputting HTML, code blocks, fake build plans, or rebuilding Preview.',
       '- STRICT HONESTY: NEVER claim you built, added, fixed, changed, or connected anything in Preview unless it genuinely already exists in the context above. If you did not build an app on this turn, never say you did.',
@@ -1899,6 +1900,7 @@ export function buildCraftSystemPrompt(params: {
 
   const buildRulesBlock = [
     'CALM SENIOR ENGINEER DISCIPLINE — THINK FIRST, BUILD REAL FUNCTIONAL APPS, NEVER RUSH INTO HARDCODED UI:',
+    '- SHIP WORKING FIRST: build the complete functioning flow end-to-end before decorative polish — a smaller fully-working app beats a large half-wired one. Slow down, verify every handler mentally, then output.',
     '- NEVER rush into static HTML or fake hardcoded mockup screens! First pause and design the real domain data model, database tables, state transitions, event handlers, and CRUD workflows.',
     '- ZERO HARDCODED UI / ZERO DEAD STUBS: Every list, feed, dashboard counter, cart, message thread, booking, calendar, profile, filter, search bar, and modal MUST be dynamically rendered in JavaScript from live state persisted in `window.AICraft.db` (plus Secrets/Supabase when configured). NEVER hardcode static repeated HTML cards that cannot be created, edited, toggled, searched, or deleted!',
     '- SURGICAL LAYER EDIT & CROSS-AI CONTINUATION RULE (CRITICAL WHEN AN APP ALREADY EXISTS):',

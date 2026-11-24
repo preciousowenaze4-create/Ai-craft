@@ -60,9 +60,6 @@ const PORT = Number(process.env.PORT || 3000);
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 import {
-  GEMINI_BUILDER_MODELS,
-  buildGatewayExecutionPlan,
-  fetchAllGatewayModels,
   getServerGeminiApiKey,
   hasServerFreeAiKey,
   resolveDynamicGeminiExecutionMatrix,
@@ -71,7 +68,7 @@ import {
   generateMediaAsset,
   type GeneratedMediaResult,
 } from './api/_mediaService.js';
-import { getFreeAiMeshStatus } from './api/_freeAiMesh.js';
+import { getFreeAiMeshStatus, getFreeMeshModelOptions } from './api/_freeAiMesh.js';
 import { cleanEnvKey } from './api/_openrouterModels.js';
 import {
   ModerationActionType,
@@ -540,12 +537,13 @@ async function startServer() {
     res.json({
       ok: true,
       geminiConfigured: Boolean(getServerGeminiApiKey()),
-      serverFreeAiReady: Boolean(getServerGeminiApiKey()) || mesh.hasAny,
+      serverFreeAiReady: mesh.hasAny,
       freeAiMesh: {
         hasAny: mesh.hasAny,
         hasKeyless: mesh.hasKeyless,
         pollinationsEnabled: mesh.pollinationsEnabled,
         providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
+        modelPool: mesh.modelPool,
       },
       supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
       paymentsConfigured: Boolean(getPaymentSecretKey()),
@@ -2101,45 +2099,36 @@ async function startServer() {
     }
   });
 
-  app.get('/api/models', async (req, res) => {
+  app.get('/api/models', (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    const referer = getAppBaseUrl(req);
     const mesh = getFreeAiMeshStatus();
-    try {
-      const forceRefresh = req.query.refresh === '1';
-      const result = await fetchAllGatewayModels(referer, forceRefresh);
-
-      res.json({
-        models: result.models,
-        gateways: result.gateways,
-        geminiConfigured: result.geminiConfigured,
-        serverFreeAiReady: result.geminiConfigured || mesh.hasAny,
-        pollinationsConfigured: mesh.pollinationsConfigured,
-        puterConfigured: false,
-        keyless: mesh.hasKeyless,
-        freeAiMesh: {
-          hasAny: mesh.hasAny,
-          hasKeyless: mesh.hasKeyless,
-          providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
+    res.json({
+      models: getFreeMeshModelOptions(),
+      gateways: [
+        {
+          id: 'free-mesh',
+          label: 'Free AI Mesh',
+          baseUrl: 'keyless failover across free providers',
+          configured: mesh.hasAny,
+          keyCount: 0,
+          modelCount: mesh.modelPool.activeModels,
+          defaultModel: 'mesh::auto',
         },
-        freeOnly: true,
-      });
-    } catch {
-      res.status(200).json({
-        models: GEMINI_BUILDER_MODELS,
-        geminiConfigured: hasServerFreeAiKey(),
-        serverFreeAiReady: hasServerFreeAiKey() || mesh.hasAny,
-        pollinationsConfigured: mesh.pollinationsConfigured,
-        puterConfigured: false,
-        keyless: mesh.hasKeyless,
-        freeAiMesh: {
-          hasAny: mesh.hasAny,
-          hasKeyless: mesh.hasKeyless,
-          providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
-        },
-        freeOnly: true,
-      });
-    }
+      ],
+      geminiConfigured: false,
+      serverFreeAiReady: mesh.hasAny,
+      pollinationsConfigured: mesh.pollinationsConfigured,
+      puterConfigured: false,
+      keyless: mesh.hasKeyless,
+      freeAiMesh: {
+        hasAny: mesh.hasAny,
+        hasKeyless: mesh.hasKeyless,
+        providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
+        modelPool: mesh.modelPool,
+      },
+      modelPool: mesh.modelPool,
+      freeOnly: true,
+    });
   });
 
   app.post('/api/media', async (req, res) => {
@@ -2538,8 +2527,11 @@ async function startServer() {
       }
 
       let rawOutput = '';
+      const previousHtmlForRoute =
+        typeof body.previousHtml === 'string' ? body.previousHtml : '';
       const streamRes = await streamServerFreeAiRealTime({
         requestedModel: typeof body.model === 'string' ? body.model : undefined,
+        initialRoute: prepared.initialRoute,
         systemPrompt: prepared.systemPrompt,
         historyMessages: prepared.historyMessages,
         userPrompt: prepared.userPrompt,
@@ -2547,6 +2539,16 @@ async function startServer() {
           typeof (body.attachmentDataUrl ?? opts.attachmentDataUrl) === 'string'
             ? String(body.attachmentDataUrl ?? opts.attachmentDataUrl)
             : null,
+        allowParallelAgents:
+          prepared.initialRoute === 'build' &&
+          !prepared.isPatchMode &&
+          previousHtmlForRoute.trim().length === 0 &&
+          !/\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(
+            typeof body.message === 'string' ? body.message : ''
+          ),
+        onReplaceRawOutput: (raw) => {
+          rawOutput = raw;
+        },
         onContentChunk: (chunk) => {
           rawOutput += chunk;
         },
@@ -2897,10 +2899,10 @@ async function startServer() {
       sendEvent({
         type: 'meta',
         kind: prepared.naturalMediaIntent ? 'media' : 'chat',
-        modelId: requestedModel || 'gemini::gemini-4-hydrogen',
-        modelName: prepared.requestedModelLabel || 'AI Craft Pro (4 Hydrogen)',
-        provider: 'aicraft',
-        gateway: 'gemini',
+        modelId: requestedModel || 'mesh::auto',
+        modelName: prepared.requestedModelLabel || 'Free AI Mesh · Auto',
+        provider: 'free-mesh',
+        gateway: 'mesh',
         isFallback: false,
       });
 
@@ -2938,8 +2940,8 @@ async function startServer() {
           creditsUsed: 0,
           billing: initialBillingSummary,
           media: mediaResult,
-          modelUsed: mediaResult.modelId || 'gemini::gemini-4-hydrogen',
-          modelName: prepared.requestedModelLabel || 'Gemini Studio',
+          modelUsed: mediaResult.modelId || 'free-media',
+          modelName: prepared.requestedModelLabel || 'Free AI Studio',
           provider: mediaResult.gateway,
           startedAt: job.startedAt,
         });
@@ -2957,9 +2959,10 @@ async function startServer() {
       let lastPreviewBytesSent = 0;
       let emittedReasoningPhase = false;
 
-      let activeModelUsed = requestedModel || 'gemini::gemini-4-hydrogen';
-      let activeModelName = prepared.requestedModelLabel || 'AI Craft Pro (4 Hydrogen)';
-      let activeProvider = 'aicraft';
+      let activeModelUsed = requestedModel || 'mesh::auto';
+      let activeModelName = prepared.requestedModelLabel || 'Free AI Mesh · Auto';
+      let activeProvider = 'free-mesh';
+      let parallelMergedRaw: string | null = null;
 
       let lastReasoningUpdateAt = 0;
       let reasoningBuffer = '';
@@ -2972,6 +2975,25 @@ async function startServer() {
         userPrompt: prepared.userPrompt,
         attachmentDataUrl,
         signal: clientAbort.signal,
+        // Fresh full builds fan out to 3 agents (architect streams live while
+        // designer + engineer draft concurrently); patches/continues stay on
+        // the single live stream.
+        allowParallelAgents:
+          prepared.initialRoute === 'build' &&
+          !prepared.isPatchMode &&
+          previousHtml.trim().length === 0 &&
+          !/\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(message),
+        onAgentsSnapshot: (agents) => {
+          sendEvent({ type: 'agents', agents });
+        },
+        onReplaceRawOutput: (raw, previewHtml) => {
+          parallelMergedRaw = raw;
+          sendEvent({
+            type: 'previewReplace',
+            previewHtml,
+            bytesBuilt: previewHtml.length,
+          });
+        },
         onModelMeta: (meta) => {
           activeModelUsed = meta.modelId;
           activeModelName = meta.modelName;
@@ -3099,6 +3121,12 @@ async function startServer() {
         },
       });
 
+      // 3-agent merge finished → swap the architect's streamed draft for the
+      // final merged HTML (designer CSS + engineer JS) before finalization.
+      if (parallelMergedRaw) {
+        rawAccumulated = parallelMergedRaw;
+      }
+
       clearInterval(keepAlive);
 
       if (enteredCodePhase) {
@@ -3209,7 +3237,7 @@ async function startServer() {
           creditsUsed: 0,
           billing: initialBillingSummary,
           media: mediaResult,
-          modelUsed: mediaResult.modelId || 'gemini::gemini-4-hydrogen',
+          modelUsed: mediaResult.modelId || 'free-media',
           modelName: prepared.requestedModelLabel,
           provider: mediaResult.gateway,
           startedAt: job.startedAt,

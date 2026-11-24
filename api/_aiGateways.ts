@@ -158,9 +158,18 @@ export const BACKEND_GEMINI_FAILOVER_CHAIN: ReadonlyArray<{
   { upstreamModelId: 'gemini-2.5-flash-lite', label: 'AI Craft 2.5 Lite' },
 ];
 
+/** Display labels for the free-mesh selector ids (mesh is the only engine). */
+export const FREE_MESH_MODEL_LABELS: Record<string, string> = {
+  'mesh::auto': 'Free AI Mesh · Auto (fastest lane)',
+  'mesh::fast': 'Free AI Mesh · Fast chat',
+  'mesh::coder': 'Free AI Mesh · Code specialist',
+  'mesh::reasoning': 'Free AI Mesh · Deep reasoning',
+  'mesh::creative': 'Free AI Mesh · Creative writing',
+};
+
 /**
- * Visible AI Craft builder lineup (single unified flagship AI shown to users).
- * All other Gemini models & keys run automatically in the backend failover matrix.
+ * Legacy Gemini lineup entry — kept only for label/compat lookups of stored
+ * ids. The mesh (see api/_freeAiMesh.ts) is the actual engine.
  */
 export const GEMINI_BUILDER_MODELS: UnifiedAiModel[] = [
   {
@@ -623,15 +632,23 @@ export function buildGatewayExecutionPlan(params: {
   requestedMediaKind: 'image' | 'music' | 'video' | null;
   requestedModelLabel: string;
 } {
+  const requested = (params.requestedModel || '').trim();
+  // The mesh is the only engine: empty id and mesh::* selector ids both
+  // resolve to free-mesh labels. Legacy gemini::* ids keep their old names.
+  if (!requested || requested.startsWith('mesh::')) {
+    const label = FREE_MESH_MODEL_LABELS[requested] || 'Free AI Mesh · Auto';
+    return { pollinationsCandidates: [], requestedMediaKind: null, requestedModelLabel: label };
+  }
+
   const parsed = parseGatewayModelIdentifier(params.requestedModel);
   const matched =
     GEMINI_BUILDER_MODELS.find(
       (m) => m.id === params.requestedModel || m.upstreamModelId === parsed.upstreamModelId
-    ) ?? GEMINI_BUILDER_MODELS[0];
+    ) ?? null;
 
   return {
     pollinationsCandidates: [],
     requestedMediaKind: null,
-    requestedModelLabel: matched.name,
+    requestedModelLabel: matched ? matched.name : 'Free AI Mesh · Auto',
   };
 }

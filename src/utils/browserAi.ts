@@ -5,17 +5,21 @@ export interface BrowserVisualHints {
   height?: number;
 }
 
-export const DEFAULT_GEMINI_BUILDER_MODEL_ID = 'gemini::gemini-4-hydrogen';
+export const DEFAULT_GEMINI_BUILDER_MODEL_ID = 'mesh::auto';
 
-export const VALID_GEMINI_MODEL_IDS = ['gemini::gemini-4-hydrogen'] as const;
+export const VALID_GEMINI_MODEL_IDS = [
+  'mesh::auto',
+  'mesh::fast',
+  'mesh::coder',
+  'mesh::reasoning',
+  'mesh::creative',
+] as const;
 
 export function normalizeBuilderModelId(rawId?: string | null): string {
   const trimmed = (rawId || '').trim();
   if (!trimmed) return DEFAULT_GEMINI_BUILDER_MODEL_ID;
-  const bare = trimmed.replace(/^gemini::/i, '').trim();
-  const matched = VALID_GEMINI_MODEL_IDS.find(
-    (id) => id === trimmed || id === `gemini::${bare}`
-  );
+  const matched = VALID_GEMINI_MODEL_IDS.find((id) => id === trimmed);
+  // Legacy stored ids (e.g. gemini::gemini-4-hydrogen) map to the free mesh.
   return matched || DEFAULT_GEMINI_BUILDER_MODEL_ID;
 }
 

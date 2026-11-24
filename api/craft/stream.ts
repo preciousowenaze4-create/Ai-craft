@@ -257,10 +257,10 @@ export async function POST(request: Request): Promise<Response> {
         sendEvent({
           type: 'meta',
           kind: prepared.naturalMediaIntent ? 'media' : 'chat',
-          modelId: requestedModel || 'gemini::gemini-4-hydrogen',
-          modelName: prepared.requestedModelLabel || 'AI Craft Pro (4 Hydrogen)',
-          provider: 'aicraft',
-          gateway: 'gemini',
+          modelId: requestedModel || 'mesh::auto',
+          modelName: prepared.requestedModelLabel || 'Free AI Mesh · Auto',
+          provider: 'free-mesh',
+          gateway: 'mesh',
           isFallback: false,
         });
 
@@ -298,8 +298,8 @@ export async function POST(request: Request): Promise<Response> {
             creditsUsed: 0,
             billing: creditCheck.billing,
             media: mediaResult,
-            modelUsed: mediaResult.modelId || 'gemini::gemini-4-hydrogen',
-            modelName: prepared.requestedModelLabel || 'Gemini Studio',
+            modelUsed: mediaResult.modelId || 'free-media',
+            modelName: prepared.requestedModelLabel || 'Free AI Studio',
             provider: mediaResult.gateway,
           });
           closeStream();
@@ -318,9 +318,10 @@ export async function POST(request: Request): Promise<Response> {
         let lastPreviewBytesSent = 0;
         let emittedReasoningPhase = false;
 
-        let activeModelUsed = requestedModel || 'gemini::gemini-4-hydrogen';
-        let activeModelName = prepared.requestedModelLabel || 'AI Craft Pro (4 Hydrogen)';
-        let activeProvider = 'aicraft';
+        let activeModelUsed = requestedModel || 'mesh::auto';
+        let activeModelName = prepared.requestedModelLabel || 'Free AI Mesh · Auto';
+        let activeProvider = 'free-mesh';
+        let parallelMergedRaw: string | null = null;
 
         let lastReasoningUpdateAt = 0;
         let reasoningBuffer = '';
@@ -333,6 +334,22 @@ export async function POST(request: Request): Promise<Response> {
           historyMessages: prepared.historyMessages,
           userPrompt: prepared.userPrompt,
           attachmentDataUrl,
+          allowParallelAgents:
+            prepared.initialRoute === 'build' &&
+            !prepared.isPatchMode &&
+            previousHtml.trim().length === 0 &&
+            !/\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(message),
+          onAgentsSnapshot: (agents) => {
+            sendEvent({ type: 'agents', agents });
+          },
+          onReplaceRawOutput: (raw, previewHtml) => {
+            parallelMergedRaw = raw;
+            sendEvent({
+              type: 'previewReplace',
+              previewHtml,
+              bytesBuilt: previewHtml.length,
+            });
+          },
           onModelMeta: (meta) => {
             activeModelUsed = meta.modelId;
             activeModelName = meta.modelName;
@@ -484,6 +501,9 @@ export async function POST(request: Request): Promise<Response> {
           });
         }
 
+        if (parallelMergedRaw) {
+          rawAccumulated = parallelMergedRaw;
+        }
         const finalized = finalizeRealtimeOutput({
           rawOutput: rawAccumulated,
           message,
@@ -582,7 +602,7 @@ export async function POST(request: Request): Promise<Response> {
             creditsUsed: 0,
             billing: creditCheck.billing,
             media: mediaResult,
-            modelUsed: mediaResult.modelId || 'gemini::gemini-4-hydrogen',
+            modelUsed: mediaResult.modelId || 'free-media',
             modelName: prepared.requestedModelLabel,
             provider: mediaResult.gateway,
           });

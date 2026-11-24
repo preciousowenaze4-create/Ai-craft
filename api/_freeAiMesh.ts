@@ -429,6 +429,11 @@ export function resetMeshDailyUsage(): void {
   dailyUsage.clear();
 }
 
+/** Fresh full builds fan out to 3 parallel agents unless opted out. */
+export function isMeshParallelBuildsEnabled(): boolean {
+  return readEnvFlag('MESH_PARALLEL_BUILDS', true);
+}
+
 interface MeshWalkBudget {
   firstByteMs: number;
   idleMs: number;
@@ -540,6 +545,85 @@ export function getFreeAiMeshStatus(): {
       dailyLimitPerModel: dailyLimitPerModel(),
     },
   };
+}
+
+export interface FreeMeshModelOption {
+  id: string;
+  name: string;
+  provider: string;
+  contextLength: number;
+  isFree: boolean;
+  gateway?: 'auto' | 'gemini' | 'web-search' | 'browser';
+  tierLabel?: string;
+  capabilities?: string[];
+  category?: 'router' | 'code' | 'image' | 'music' | 'video' | 'chat';
+}
+
+/**
+ * Selector entries for the model picker — the mesh auto-routes to the
+ * fastest healthy free lane regardless of which entry is picked, so these
+ * are preference profiles, not hard bindings. Zero API keys, zero config.
+ */
+export function getFreeMeshModelOptions(): FreeMeshModelOption[] {
+  const pool = getFreeAiMeshStatus().modelPool;
+  const resetLabel = 'Daily reset 00:00 UTC';
+  return [
+    {
+      id: 'mesh::auto',
+      name: 'Free AI Mesh · Auto (fastest lane)',
+      provider: 'free-mesh',
+      contextLength: 262144,
+      isFree: true,
+      gateway: 'auto',
+      tierLabel: `Auto · ${pool.catalogSize}+ free models`,
+      capabilities: ['Chat', 'Code', 'Vision'],
+      category: 'code',
+    },
+    {
+      id: 'mesh::fast',
+      name: 'Free AI Mesh · Fast chat',
+      provider: 'free-mesh',
+      contextLength: 131072,
+      isFree: true,
+      gateway: 'auto',
+      tierLabel: `Racing lanes · ${resetLabel}`,
+      capabilities: ['Chat'],
+      category: 'chat',
+    },
+    {
+      id: 'mesh::coder',
+      name: 'Free AI Mesh · Code specialist',
+      provider: 'free-mesh',
+      contextLength: 262144,
+      isFree: true,
+      gateway: 'auto',
+      tierLabel: `Builder lanes · ${resetLabel}`,
+      capabilities: ['Code'],
+      category: 'code',
+    },
+    {
+      id: 'mesh::reasoning',
+      name: 'Free AI Mesh · Deep reasoning',
+      provider: 'free-mesh',
+      contextLength: 262144,
+      isFree: true,
+      gateway: 'auto',
+      tierLabel: `Reasoning lanes · ${resetLabel}`,
+      capabilities: ['Chat', 'Code'],
+      category: 'chat',
+    },
+    {
+      id: 'mesh::creative',
+      name: 'Free AI Mesh · Creative writing',
+      provider: 'free-mesh',
+      contextLength: 131072,
+      isFree: true,
+      gateway: 'auto',
+      tierLabel: `Creative lanes · ${resetLabel}`,
+      capabilities: ['Chat'],
+      category: 'chat',
+    },
+  ];
 }
 
 interface MeshErrorInfo {

@@ -123,8 +123,26 @@ const server = http.createServer((req, res) => {
           ? lastUser.content.map((p) => p?.text || '').join(' ')
           : '';
     const wantsBuild = /\b(build|todo|app|website|create)\b/i.test(lastUserText);
-    const replyText =
+    let replyText =
       mode === 'streaming-html' || (mode === 'streaming' && wantsBuild) ? HTML_APP : REPLY;
+
+    // 3-agent parallel builds append MESH_ROLE=<role> to the system prompt.
+    // Stamp each role's output so tests can prove all three agents ran and
+    // their contributions were merged into the final HTML.
+    const systemMsg = messages.find((m) => m && m.role === 'system');
+    const systemText =
+      typeof systemMsg?.content === 'string' ? systemMsg.content : '';
+    const roleMatch = /MESH_ROLE=(architect|designer|engineer)/.exec(systemText);
+    if (roleMatch && replyText === HTML_APP) {
+      const role = roleMatch[1];
+      if (role === 'designer') {
+        replyText = replyText.replace('</style>', `  /* mesh-${role}-mark */\n</style>`);
+      } else if (role === 'engineer') {
+        replyText = replyText.replace('</script>', `// mesh-${role}-mark\n</script>`);
+      } else {
+        replyText = replyText.replace('</html>', `<!-- mesh-${role}-mark -->\n</html>`);
+      }
+    }
     if (parsed.stream) {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
