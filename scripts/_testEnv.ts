@@ -54,6 +54,8 @@ const AI_ENV_VARS = [
   'POLLINATIONS_BASE_URL',
   'POLLINATIONS_API_KEY',
   'POLLINATIONS_MODELS',
+  'MESH_DAILY_LIMIT_PER_MODEL',
+  'MESH_PARALLEL_BUILDS',
 ];
 
 export function scrubAiEnv(): void {

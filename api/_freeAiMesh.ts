@@ -1,29 +1,39 @@
 /**
- * AI Craft — Free AI Mesh
+ * AI Craft — Free AI Mesh (the ONLY chat/build engine — zero API keys needed)
  *
  * One ordered multi-provider failover layer over every free AI endpoint we know:
  *
  *   1. Self-hosted GPU (SELF_HOSTED_LLM_* — OpenAI-compatible / Ollama / TGI)
  *   2. Generic OpenAI-compatible (OPENAI_COMPATIBLE_BASE_URL / KEY / MODEL)
  *   3. Groq, Cerebras, OpenRouter (:free models), Mistral, HuggingFace router,
- *      GitHub Models, Together, DeepInfra — key-gated free tiers
- *   4. Pollinations — keyless text fallback (opt-out via POLLINATIONS_ENABLED=false)
+ *      GitHub Models, Together, DeepInfra — free tiers (activate when their key
+ *      or an ambient token happens to exist; never required)
+ *   4. Pollinations — keyless text lane, on by default with zero configuration
  *
- * Gemini runs first inside `_realtimeEngine` when keys exist; this mesh is the
- * failover lane after Gemini passes fail, and the primary lane when no Gemini
- * key is configured at all. Providers cooperate through the shared cooldown
- * registry in `_aiGateways` (keys `mesh:<provider>:<fp>:<model>`): a provider
- * that rate-limits is skipped instantly by every later request — no sleep, no
- * thundering herd, zero added latency for the healthy lane.
+ * The old Gemini-first path was removed: chat and build always run through
+ * this mesh. Providers cooperate through the shared cooldown registry in
+ * `_aiGateways` (keys `mesh:<provider>:<fp>:<model>`): a provider that
+ * rate-limits is skipped instantly by every later request.
+ *
+ * Daily quotas: every (provider, model) pair gets `MESH_DAILY_LIMIT_PER_MODEL`
+ * requests per UTC day (default 400). Quota keys are date-stamped, so limits
+ * reset automatically at 00:00 UTC and an exhausted model is skipped while the
+ * rest of the pool keeps serving — "if one hits limit, another continues".
+ *
+ * Speed:
+ *  - chat walks race the top-3 candidates concurrently — first response with
+ *    content wins (tight budgets: 6s first byte, 20s idle, 30s walk).
+ *  - build walks stream one lane live (10s first byte, 45s idle, 65s walk);
+ *    fresh builds additionally fan out to 3 parallel agents (architect +
+ *    designer + engineer) inside `_realtimeEngine`.
  *
  * Design rules:
  *  - Never throws for "no provider configured" silently — callers gate on
  *    `isFreeAiMeshAvailable()`; `streamFreeAiMesh` throws typed friendly errors.
- *  - `completeFreeAiMesh` (non-streaming, repair/design) never throws — null on
- *    failure, so optional sub-passes degrade instead of breaking the turn.
- *  - First-byte timeout 12s, stream idle timeout 45s, per-walk deadline 65s.
+ *  - `completeFreeAiMesh` (non-streaming, repair/design/agents) never throws —
+ *    null on failure, so optional sub-passes degrade instead of breaking.
  *  - Partial output already streamed ⇒ rethrow immediately (caller finalizes
- *    partial HTML exactly like the Gemini path does).
+ *    partial HTML exactly like the previous path did).
  */
 
 import {
@@ -31,6 +41,12 @@ import {
   isGatewayCandidateCoolingDown,
   markGatewayCandidateCooldown,
 } from './_aiGateways.js';
+import {
+  FREE_MODEL_CATALOG,
+  nextDailyResetAt,
+  staticCatalogSize,
+  utcQuotaDay,
+} from './_freeAiCatalog.js';
 
 // ---------------------------------------------------------------------------
 // Types & typed errors
@@ -55,7 +71,7 @@ export class FreeAiMeshUnavailableError extends Error {
   readonly code = 'mesh_unavailable' as const;
   constructor() {
     super(
-      'No free AI engine is configured on this server. Add GEMINI_API_KEY or any free provider key (GROQ_API_KEY, OPENROUTER_API_KEY, CEREBRAS_API_KEY, …), or keep the keyless Pollinations fallback enabled.'
+      'No free AI engine is reachable right now. The keyless Pollinations lane is enabled by default — please retry in a few seconds.'
     );
     this.name = 'FreeAiMeshUnavailableError';
   }
@@ -101,6 +117,14 @@ function readEnvCsv(name: string): string[] {
     .filter(Boolean);
 }
 
+function readEnvNumber(name: string, defaultValue: number): number {
+  const raw = (process.env[name] || '').trim();
+  if (!raw) return defaultValue;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return defaultValue;
+  return Math.floor(parsed);
+}
+
 /** Normalize a base URL to a full OpenAI-style chat-completions endpoint. */
 function toChatCompletionsUrl(rawBase: string): string {
   const base = rawBase.trim().replace(/\/+$/, '');
@@ -128,7 +152,7 @@ interface MeshProviderDef {
   resolve(): ResolvedMeshProvider | null;
 }
 
-const POLLINATIONS_STATIC_MODELS = ['openai', 'openai-fast', 'qwen-coder', 'deepseek', 'mistral'];
+const POLLINATIONS_FALLBACK_MODELS = FREE_MODEL_CATALOG.pollinations;
 
 let pollinationsModelsCache: { models: string[]; at: number } | null = null;
 let pollinationsRefreshInFlight = false;
@@ -156,7 +180,7 @@ function schedulePollinationsModelsRefresh(baseUrl: string): void {
         if (/nsfw|porn|xxx|hentai|uncensored|erotic/.test(lower)) continue;
         if (/^(true|1)$/i.test(String((entry as { nsfw?: unknown }).nsfw ?? ''))) continue;
         names.push(name);
-        if (names.length >= 12) break;
+        if (names.length >= 40) break;
       }
       if (names.length > 0) {
         pollinationsModelsCache = { models: names, at: Date.now() };
@@ -177,13 +201,13 @@ function resolvePollinationsModels(baseUrl: string): string[] {
   if (!cacheFresh) {
     // Non-blocking: serve the static list now, refresh in background for next time.
     schedulePollinationsModelsRefresh(baseUrl);
-    return POLLINATIONS_STATIC_MODELS;
+    return POLLINATIONS_FALLBACK_MODELS;
   }
   const cached = pollinationsModelsCache!.models;
   // Prefer well-known stable names first, then the rest of the live list.
-  const preferred = POLLINATIONS_STATIC_MODELS.filter((m) => cached.includes(m));
+  const preferred = POLLINATIONS_FALLBACK_MODELS.filter((m) => cached.includes(m));
   const rest = cached.filter((m) => !preferred.includes(m));
-  return [...preferred, ...rest].slice(0, 8);
+  return [...preferred, ...rest].slice(0, 24);
 }
 
 const MESH_PROVIDERS: MeshProviderDef[] = [
@@ -223,12 +247,7 @@ const MESH_PROVIDERS: MeshProviderDef[] = [
       return {
         baseUrl: 'https://api.groq.com/openai/v1/chat/completions',
         apiKey,
-        models: [
-          'llama-3.3-70b-versatile',
-          'llama-3.1-8b-instant',
-          'qwen/qwen3-32b',
-          'meta-llama/llama-4-scout-17b-16e-instruct',
-        ],
+        models: FREE_MODEL_CATALOG.groq,
       };
     },
   },
@@ -242,7 +261,7 @@ const MESH_PROVIDERS: MeshProviderDef[] = [
       return {
         baseUrl: 'https://api.cerebras.ai/v1/chat/completions',
         apiKey,
-        models: ['llama-3.3-70b', 'qwen-3-32b', 'llama3.1-8b'],
+        models: FREE_MODEL_CATALOG.cerebras,
       };
     },
   },
@@ -258,16 +277,7 @@ const MESH_PROVIDERS: MeshProviderDef[] = [
       return {
         baseUrl: 'https://openrouter.ai/api/v1/chat/completions',
         apiKey,
-        models:
-          override.length > 0
-            ? override
-            : [
-                'deepseek/deepseek-chat-v3-0324:free',
-                'meta-llama/llama-3.3-70b-instruct:free',
-                'qwen/qwen3-235b-a22b:free',
-                'google/gemma-3-27b-it:free',
-                'mistralai/mistral-small-3.1-24b-instruct:free',
-              ],
+        models: override.length > 0 ? override : FREE_MODEL_CATALOG.openrouter,
         headers: appUrl
           ? { 'HTTP-Referer': appUrl, 'X-Title': 'AI Craft' }
           : { 'X-Title': 'AI Craft' },
@@ -284,7 +294,7 @@ const MESH_PROVIDERS: MeshProviderDef[] = [
       return {
         baseUrl: 'https://api.mistral.ai/v1/chat/completions',
         apiKey,
-        models: ['mistral-small-latest', 'open-mistral-nemo', 'mistral-large-latest'],
+        models: FREE_MODEL_CATALOG.mistral,
       };
     },
   },
@@ -299,14 +309,7 @@ const MESH_PROVIDERS: MeshProviderDef[] = [
       return {
         baseUrl: 'https://router.huggingface.co/v1/chat/completions',
         apiKey,
-        models:
-          override.length > 0
-            ? override
-            : [
-                'meta-llama/Llama-3.3-70B-Instruct:fast',
-                'Qwen/Qwen3-30B-A3B:fast',
-                'mistralai/Mistral-7B-Instruct-v0.3:fast',
-              ],
+        models: override.length > 0 ? override : FREE_MODEL_CATALOG.huggingface,
       };
     },
   },
@@ -321,15 +324,7 @@ const MESH_PROVIDERS: MeshProviderDef[] = [
       return {
         baseUrl: 'https://models.github.ai/inference/chat/completions',
         apiKey,
-        models:
-          override.length > 0
-            ? override
-            : [
-                'openai/gpt-4o-mini',
-                'openai/gpt-4.1-mini',
-                'deepseek/DeepSeek-V3',
-                'meta-llama/Llama-3.3-70B-Instruct',
-              ],
+        models: override.length > 0 ? override : FREE_MODEL_CATALOG.github,
       };
     },
   },
@@ -344,14 +339,7 @@ const MESH_PROVIDERS: MeshProviderDef[] = [
       return {
         baseUrl: 'https://api.together.xyz/v1/chat/completions',
         apiKey,
-        models:
-          override.length > 0
-            ? override
-            : [
-                'meta-llama/Llama-3.3-70B-Instruct-Turbo-Free',
-                'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo',
-                'Qwen/Qwen2.5-72B-Instruct-Turbo',
-              ],
+        models: override.length > 0 ? override : FREE_MODEL_CATALOG.together,
       };
     },
   },
@@ -366,14 +354,7 @@ const MESH_PROVIDERS: MeshProviderDef[] = [
       return {
         baseUrl: 'https://api.deepinfra.com/v1/openai/chat/completions',
         apiKey,
-        models:
-          override.length > 0
-            ? override
-            : [
-                'meta-llama/Llama-3.3-70B-Instruct',
-                'deepseek-ai/DeepSeek-V3',
-                'Qwen/Qwen2.5-72B-Instruct',
-              ],
+        models: override.length > 0 ? override : FREE_MODEL_CATALOG.deepinfra,
       };
     },
   },
@@ -410,8 +391,58 @@ interface MeshCandidate {
   cooldownKey: string;
 }
 
-const MAX_MODELS_PER_PROVIDER = 3;
+const MAX_MODELS_PER_PROVIDER = 5;
 const MAX_ATTEMPTS_PER_WALK = 12;
+
+// ---------------------------------------------------------------------------
+// Daily quotas (reset automatically at 00:00 UTC) + walk budgets
+// ---------------------------------------------------------------------------
+
+/** Successful responses per (provider, model) per UTC day. */
+const dailyUsage = new Map<string, number>();
+
+function dailyQuotaKey(providerId: string, model: string): string {
+  return `${providerId}|${model}|${utcQuotaDay()}`;
+}
+
+function dailyLimitPerModel(): number {
+  return readEnvNumber('MESH_DAILY_LIMIT_PER_MODEL', 400);
+}
+
+function isDailyQuotaExhausted(providerId: string, model: string): boolean {
+  const used = dailyUsage.get(dailyQuotaKey(providerId, model)) ?? 0;
+  return used >= dailyLimitPerModel();
+}
+
+function recordDailyUsage(providerId: string, model: string): void {
+  const key = dailyQuotaKey(providerId, model);
+  dailyUsage.set(key, (dailyUsage.get(key) ?? 0) + 1);
+}
+
+/** Test/diagnostics hook: current quota-day usage counts. */
+export function getMeshDailyUsage(): Record<string, number> {
+  return Object.fromEntries(dailyUsage);
+}
+
+/** Test hook: clear quota counters (quota day itself rolls over at 00:00 UTC). */
+export function resetMeshDailyUsage(): void {
+  dailyUsage.clear();
+}
+
+interface MeshWalkBudget {
+  firstByteMs: number;
+  idleMs: number;
+  walkMs: number;
+  maxAttempts: number;
+}
+
+/** Chat = fast (raced); build = roomier (single live stream / agents). */
+function budgetFor(taskKind: 'chat' | 'build'): MeshWalkBudget {
+  if (taskKind === 'chat') {
+    return { firstByteMs: 6_000, idleMs: 20_000, walkMs: 30_000, maxAttempts: 8 };
+  }
+  return { firstByteMs: 10_000, idleMs: 45_000, walkMs: 65_000, maxAttempts: 12 };
+}
 
 function buildMeshCandidates(): MeshCandidate[] {
   const out: MeshCandidate[] = [];
@@ -425,6 +456,8 @@ function buildMeshCandidates(): MeshCandidate[] {
     }
     if (!resolved) continue;
     for (const model of resolved.models.slice(0, MAX_MODELS_PER_PROVIDER)) {
+      // Daily quota exhausted → this AI rests until 00:00 UTC; walk the rest.
+      if (isDailyQuotaExhausted(def.id, model)) continue;
       const cooldownKey = buildCandidateCooldownKey(
         `mesh:${def.id}`,
         resolved.apiKey || def.id,
@@ -461,6 +494,15 @@ export function getFreeAiMeshStatus(): {
   hasKeyless: boolean;
   pollinationsEnabled: boolean;
   pollinationsConfigured: boolean;
+  modelPool: {
+    /** Candidates usable right now (configured, not cooling, not quota-capped). */
+    activeModels: number;
+    /** Total free models cataloged across every known provider. */
+    catalogSize: number;
+    /** When every daily quota resets (next 00:00 UTC). */
+    dailyResetsAt: string;
+    dailyLimitPerModel: number;
+  };
 } {
   const providers: MeshProviderStatus[] = [];
   for (const def of MESH_PROVIDERS) {
@@ -485,6 +527,18 @@ export function getFreeAiMeshStatus(): {
     hasKeyless: providers.some((p) => p.configured && p.keyless),
     pollinationsEnabled: readEnvFlag('POLLINATIONS_ENABLED', true),
     pollinationsConfigured: Boolean(providers.find((p) => p.id === 'pollinations')?.configured),
+    modelPool: {
+      activeModels: (() => {
+        try {
+          return buildMeshCandidates().length;
+        } catch {
+          return 0;
+        }
+      })(),
+      catalogSize: staticCatalogSize(),
+      dailyResetsAt: nextDailyResetAt(),
+      dailyLimitPerModel: dailyLimitPerModel(),
+    },
   };
 }
 
@@ -613,6 +667,7 @@ interface MeshAttemptParams {
   attachmentDataUrl?: string | null;
   signal?: AbortController;
   firstByteTimeoutMs: number;
+  idleTimeoutMs?: number;
 }
 
 class MeshHttpError extends Error {
@@ -773,6 +828,7 @@ async function streamOneMeshCandidate(
     let buffer = '';
     let raw = '';
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const idleMs = params.idleTimeoutMs ?? 45_000;
     const resetIdle = () => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
@@ -781,7 +837,7 @@ async function streamOneMeshCandidate(
         } catch {
           // ignore
         }
-      }, 45_000);
+      }, idleMs);
     };
     resetIdle();
     const isEventStream = contentType.includes('event-stream');
@@ -907,16 +963,133 @@ function linkSignal(
 }
 
 /**
+ * Run ONE candidate attempt: emit meta → stream → classify.
+ * On failure the lane is already cooldown-marked and the error rethrown.
+ * If content was already forwarded to the client the error is rethrown
+ * WITHOUT cooldown (partial-output semantics — caller finalizes partial HTML).
+ */
+async function runMeshStreamAttempt(params: {
+  candidate: MeshCandidate;
+  walk: MeshWalkParams;
+  budget: MeshWalkBudget;
+  onForwardChunk: (chunk: string) => void;
+}): Promise<MeshStreamResult> {
+  const { candidate, walk, budget } = params;
+  const modelId = `mesh::${candidate.providerId}::${candidate.model}`;
+  const modelName = `${candidate.providerLabel} · ${candidate.model}`;
+  walk.onModelMeta?.({ modelId, modelName, provider: candidate.providerId });
+
+  const controller = new AbortController();
+  const unlink = linkSignal(walk.signal, controller);
+  let emitted = false;
+  try {
+    const raw = await streamOneMeshCandidate(
+      candidate,
+      {
+        taskKind: walk.taskKind,
+        systemPrompt: walk.systemPrompt,
+        historyMessages: walk.historyMessages,
+        userPrompt: walk.userPrompt,
+        attachmentDataUrl: walk.attachmentDataUrl,
+        signal: controller,
+        firstByteTimeoutMs: budget.firstByteMs,
+        idleTimeoutMs: budget.idleMs,
+      },
+      (chunk) => {
+        emitted = true;
+        params.onForwardChunk(chunk);
+      },
+      walk.onReasoningChunk
+    );
+    if (raw.trim()) {
+      recordDailyUsage(candidate.providerId, candidate.model);
+      return { rawOutput: raw, modelUsed: modelId, modelName, provider: candidate.providerId };
+    }
+    markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
+    throw new MeshHttpError('empty response', null);
+  } catch (err) {
+    // Content already reached the caller — surface immediately so the engine
+    // can finalize partial HTML exactly like the previous path did.
+    if (emitted) throw err;
+    if (walk.signal?.aborted) throw new Error('Request cancelled.');
+    const info = normalizeMeshError(err);
+    const { ms, hard } = cooldownForMeshError(info);
+    markGatewayCandidateCooldown(candidate.cooldownKey, ms, hard);
+    throw err;
+  } finally {
+    unlink();
+  }
+}
+
+type MeshRaceOutcome =
+  | { kind: 'success'; result: MeshStreamResult }
+  /** The candidate that streamed to the client died mid-output — rethrow. */
+  | { kind: 'leader-failed'; err: unknown }
+  /** Nobody produced content — details feed the aggregate friendly error. */
+  | { kind: 'all-failed'; details: string[] };
+
+/**
+ * Race the top-N candidates concurrently (chat speed path). The first
+ * candidate to emit a content chunk becomes the leader and is the only one
+ * whose chunks reach the client; the others keep running for redundancy and
+ * simply get ignored if they finish. If the leader dies after streaming,
+ * its error is rethrown (partial-output semantics). If nobody streams,
+ * the caller falls through to the remaining candidates sequentially.
+ */
+async function raceMeshAttempts(params: {
+  candidates: MeshCandidate[];
+  walk: MeshWalkParams;
+  budget: MeshWalkBudget;
+}): Promise<MeshRaceOutcome> {
+  const { candidates, walk, budget } = params;
+  let leaderIdx: number | null = null;
+
+  const settled = await Promise.all(
+    candidates.map((candidate, idx) =>
+      runMeshStreamAttempt({
+        candidate,
+        walk,
+        budget,
+        onForwardChunk: (chunk) => {
+          if (leaderIdx === null) leaderIdx = idx;
+          if (leaderIdx === idx) walk.onContentChunk?.(chunk);
+          // A non-leader's chunks are suppressed — the client only ever sees
+          // one coherent stream.
+        },
+      })
+        .then((result) => ({ idx, ok: true as const, result }))
+        .catch((err: unknown) => ({ idx, ok: false as const, err }))
+    )
+  );
+
+  if (leaderIdx !== null) {
+    const leader = settled[leaderIdx];
+    if (leader?.ok) return { kind: 'success', result: leader.result };
+    if (leader && !leader.ok) return { kind: 'leader-failed', err: leader.err };
+  }
+  const details = settled.map((entry) => {
+    if (entry.ok) return `${candidates[entry.idx].providerId}: empty response`;
+    const info = normalizeMeshError(entry.err);
+    return `${candidates[entry.idx].providerId}: ${info.message}`;
+  });
+  return { kind: 'all-failed', details };
+}
+
+/**
  * Streaming failover walk across the whole mesh.
- * Returns the first successful candidate's full output.
+ *  - chat: races the top-3 candidates, then falls back sequentially.
+ *  - build: streams one lane live in order (the parallel 3-agent fan-out for
+ *    fresh builds lives in `_realtimeEngine` and calls this for the architect).
+ * Returns the winning candidate's full output.
  * Throws FreeAiMeshUnavailableError / FreeAiMeshAllFailedError / rethrows
  * partial-output or cancellation errors immediately.
  */
 export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStreamResult> {
+  const budget = budgetFor(params.taskKind);
   const candidates = buildMeshCandidates();
   if (candidates.length === 0) {
     // Distinguish "nothing configured" from "everything configured but cooling
-    // down after recent errors" so the user gets an actionable message.
+    // down / quota-capped" so the user gets an actionable message.
     if (getFreeAiMeshStatus().hasAny) {
       throw new FreeAiMeshAllFailedError([
         'all configured engines are cooling down after recent errors',
@@ -925,59 +1098,42 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
     throw new FreeAiMeshUnavailableError();
   }
 
-  const deadlineAt = Date.now() + 65_000;
+  const deadlineAt = Date.now() + budget.walkMs;
   const details: string[] = [];
-  let emittedAny = false;
   let attempts = 0;
+  let nextIndex = 0;
 
-  for (const candidate of candidates) {
+  // Fast path: chat races the top candidates so the quickest free AI answers.
+  if (params.taskKind === 'chat' && candidates.length > 1) {
+    const raceCount = Math.min(3, candidates.length);
+    attempts += raceCount;
+    nextIndex = raceCount;
+    const raced = await raceMeshAttempts({
+      candidates: candidates.slice(0, raceCount),
+      walk: params,
+      budget,
+    });
+    if (raced.kind === 'success') return raced.result;
+    if (raced.kind === 'leader-failed') throw raced.err;
+    details.push(...raced.details);
+  }
+
+  for (let i = nextIndex; i < candidates.length; i += 1) {
+    const candidate = candidates[i];
     if (params.signal?.aborted) throw new Error('Request cancelled.');
-    if (Date.now() > deadlineAt || attempts >= MAX_ATTEMPTS_PER_WALK) break;
+    if (Date.now() > deadlineAt || attempts >= budget.maxAttempts) break;
     attempts += 1;
-
-    const modelId = `mesh::${candidate.providerId}::${candidate.model}`;
-    const modelName = `${candidate.providerLabel} · ${candidate.model}`;
-    params.onModelMeta?.({ modelId, modelName, provider: candidate.providerId });
-
-    const controller = new AbortController();
-    const unlink = linkSignal(params.signal, controller);
     try {
-      const raw = await streamOneMeshCandidate(
+      return await runMeshStreamAttempt({
         candidate,
-        {
-          taskKind: params.taskKind,
-          systemPrompt: params.systemPrompt,
-          historyMessages: params.historyMessages,
-          userPrompt: params.userPrompt,
-          attachmentDataUrl: params.attachmentDataUrl,
-          signal: controller,
-          firstByteTimeoutMs: 12_000,
-        },
-        (chunk) => {
-          emittedAny = true;
-          params.onContentChunk?.(chunk);
-        },
-        params.onReasoningChunk
-      );
-      if (raw.trim()) {
-        return { rawOutput: raw, modelUsed: modelId, modelName, provider: candidate.providerId };
-      }
-      details.push(`${candidate.providerId}: empty response`);
-      markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
+        walk: params,
+        budget,
+        onForwardChunk: (chunk) => params.onContentChunk?.(chunk),
+      });
     } catch (err) {
-      // Content already reached the caller — surface immediately so the engine
-      // can finalize partial HTML exactly like the Gemini path does.
-      if (emittedAny) throw err;
-      if (params.signal?.aborted || controller.signal.aborted) {
-        if (params.signal?.aborted) throw new Error('Request cancelled.');
-        // Our own first-byte/idle timeout — treat as a normal lane failure.
-      }
+      if (params.signal?.aborted) throw new Error('Request cancelled.');
       const info = normalizeMeshError(err);
       details.push(`${candidate.providerId}: ${info.message}`);
-      const { ms, hard } = cooldownForMeshError(info);
-      markGatewayCandidateCooldown(candidate.cooldownKey, ms, hard);
-    } finally {
-      unlink();
     }
   }
 
@@ -1019,7 +1175,10 @@ export async function completeFreeAiMesh(params: {
         signal: controller,
         firstByteTimeoutMs: Math.max(3_000, Math.min(params.timeoutMs ?? 25_000, 25_000)),
       });
-      if (out.trim()) return out;
+      if (out.trim()) {
+        recordDailyUsage(candidate.providerId, candidate.model);
+        return out;
+      }
       markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
     } catch (err) {
       if (params.signal?.aborted) return null;
