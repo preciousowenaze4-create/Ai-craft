@@ -87,7 +87,34 @@ const HTML_APP = `<!DOCTYPE html>
 </body>
 </html>`;
 
+// Concurrency/counters for the mesh single-flight tests:
+//   GET    /__stats        → { count, active, peak }
+//   POST   /__stats/reset  → zero them
+const stats = { count: 0, active: 0, peak: 0 };
+
 const server = http.createServer((req, res) => {
+  if (req.method === 'GET' && req.url === '/__stats') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(stats));
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/__stats/reset') {
+    stats.count = 0;
+    stats.active = 0;
+    stats.peak = 0;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{}');
+    return;
+  }
+  stats.count += 1;
+  stats.active += 1;
+  if (stats.active > stats.peak) stats.peak = stats.active;
+  let closed = false;
+  res.on('close', () => {
+    if (closed) return;
+    closed = true;
+    stats.active -= 1;
+  });
   let body = '';
   req.on('data', (chunk) => {
     body += chunk;
