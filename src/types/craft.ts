@@ -138,6 +138,9 @@ export interface ProjectDeploymentConfig {
   themeColor?: string;
   logo?: Record<string, string>;
   livePublishing?: boolean;
+  seoTitle?: string;
+  seoDescription?: string;
+  allowRemix?: boolean;
   version: number;
   deployedAt: string | null;
   environment: 'production' | 'preview';

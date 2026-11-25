@@ -10,8 +10,12 @@ import {
   ExternalLink,
   Eye,
   EyeOff,
+  FileArchive,
   FileCode2,
   FolderTree,
+  GitFork,
+  Github,
+  Globe,
   KeyRound,
   Lightbulb,
   Loader2,
@@ -39,6 +43,10 @@ import {
   applyFileEditToHtml,
   extractEditableCodeFiles,
 } from '../utils/codeFileEditor';
+import {
+  buildProjectExportFiles,
+  downloadProjectZip,
+} from '../utils/projectExporter';
 
 function slugifyProjectTitle(title: string): string {
   return (
@@ -1334,8 +1342,8 @@ export function ProjectDatabaseModal({
                   </div>
                   <span className="text-[11px] text-[#71717A] truncate pl-4">
                     {hasSupabaseConfigured
-                      ? 'Connected to Supabase Secret + Live App DB'
-                      : 'Live App DB synced with Preview'}
+                      ? 'Connected to Supabase Secret + Hosted App DB'
+                      : 'Live Preview DB · Auto-persists to Hosted API when published'}
                   </span>
                 </div>
 
@@ -1734,6 +1742,13 @@ export function ProjectDatabaseModal({
 /* 3. Per-Project Deployment Panel                                            */
 /* -------------------------------------------------------------------------- */
 
+export interface DeploySubmitOptions {
+  slug: string;
+  seoTitle?: string;
+  seoDescription?: string;
+  allowRemix?: boolean;
+}
+
 interface ProjectDeployModalProps {
   open: boolean;
   projectTitle: string;
@@ -1745,7 +1760,7 @@ interface ProjectDeployModalProps {
   databaseConfig: ProjectDatabaseConfig;
   deployment: ProjectDeploymentConfig;
   onClose: () => void;
-  onDeploy: (slug: string) => Promise<boolean> | void;
+  onDeploy: (opts: DeploySubmitOptions) => Promise<boolean> | void;
   onOpenPreview: () => void;
   onOpenCode: () => void;
   onShare: () => Promise<string>;
@@ -1770,21 +1785,66 @@ export function ProjectDeployModal({
   const [slugInput, setSlugInput] = useState(
     deployment.slug || slugifyProjectTitle(projectTitle)
   );
+  const [seoTitleInput, setSeoTitleInput] = useState(
+    deployment.seoTitle || projectTitle
+  );
+  const [seoDescriptionInput, setSeoDescriptionInput] = useState(
+    deployment.seoDescription || `${projectTitle} — Built with AI Craft`
+  );
+  const [allowRemix, setAllowRemix] = useState(Boolean(deployment.allowRemix));
   const [includeSecretsInExport, setIncludeSecretsInExport] = useState(false);
   const [statusNote, setStatusNote] = useState<string | null>(null);
   const [copiedLiveUrl, setCopiedLiveUrl] = useState(false);
 
+  const [githubOpen, setGithubOpen] = useState(false);
+  const [githubToken, setGithubToken] = useState('');
+  const [githubRepoName, setGithubRepoName] = useState(
+    deployment.slug || slugifyProjectTitle(projectTitle)
+  );
+  const [githubPrivate, setGithubPrivate] = useState(false);
+  const [githubPushing, setGithubPushing] = useState(false);
+  const [githubResultUrl, setGithubResultUrl] = useState<string | null>(null);
+  const [githubError, setGithubError] = useState<string | null>(null);
+
   useEffect(() => {
-    setSlugInput(deployment.slug || slugifyProjectTitle(projectTitle));
-  }, [deployment.slug, projectTitle, open]);
+    if (!open) return;
+    const baseSlug = deployment.slug || slugifyProjectTitle(projectTitle);
+    setSlugInput(baseSlug);
+    setSeoTitleInput(deployment.seoTitle || projectTitle);
+    setSeoDescriptionInput(
+      deployment.seoDescription || `${projectTitle} — Built with AI Craft`
+    );
+    setAllowRemix(Boolean(deployment.allowRemix));
+    setGithubRepoName(baseSlug);
+    setGithubError(null);
+    const savedGhSecret = secrets.find(
+      (s) =>
+        s.key.toUpperCase() === 'GITHUB_TOKEN' ||
+        s.key.toUpperCase() === 'GH_TOKEN'
+    );
+    if (savedGhSecret?.value) {
+      setGithubToken((prev) => prev || savedGhSecret.value);
+    }
+  }, [
+    deployment.slug,
+    deployment.seoTitle,
+    deployment.seoDescription,
+    deployment.allowRemix,
+    projectTitle,
+    secrets,
+    open,
+  ]);
 
   useEffect(() => {
     if (!statusNote) return;
-    const t = window.setTimeout(() => setStatusNote(null), 2800);
+    const t = window.setTimeout(() => setStatusNote(null), 3200);
     return () => window.clearTimeout(t);
   }, [statusNote]);
 
   const cleanedSlug = slugifyProjectTitle(slugInput);
+  const resolvedSeoTitle = seoTitleInput.trim() || projectTitle;
+  const resolvedSeoDesc =
+    seoDescriptionInput.trim() || `${projectTitle} — Built with AI Craft`;
   const codeKb = latestPreviewHtml
     ? `${(latestPreviewHtml.length / 1024).toFixed(1)} KB`
     : '0 KB';
@@ -1794,7 +1854,12 @@ export function ProjectDeployModal({
       setStatusNote('Build your app in chat first before deploying.');
       return;
     }
-    const result = await onDeploy(cleanedSlug);
+    const result = await onDeploy({
+      slug: cleanedSlug,
+      seoTitle: resolvedSeoTitle,
+      seoDescription: resolvedSeoDesc,
+      allowRemix,
+    });
     if (result === false) {
       setStatusNote('Unable to publish live link right now. Please try again.');
       return;
@@ -1826,6 +1891,71 @@ export function ProjectDeployModal({
     setStatusNote(`Downloaded ${cleanedSlug}.html`);
   };
 
+  const handleDownloadZip = () => {
+    if (!latestPreviewHtml) return;
+    const { fileCount, filename } = downloadProjectZip({
+      projectTitle: resolvedSeoTitle,
+      slug: cleanedSlug,
+      mode,
+      html: latestPreviewHtml,
+      databaseConfig,
+      secrets,
+      includeSecrets: includeSecretsInExport,
+    });
+    setStatusNote(`Downloaded ${filename} (${fileCount} project files)`);
+  };
+
+  const handlePushToGithub = async () => {
+    if (!latestPreviewHtml) return;
+    const cleanToken = githubToken.trim();
+    const cleanRepo = githubRepoName.trim() || cleanedSlug;
+    if (!cleanToken) {
+      setGithubError('Enter a GitHub Personal Access Token (repo scope).');
+      return;
+    }
+    setGithubPushing(true);
+    setGithubError(null);
+    setGithubResultUrl(null);
+    try {
+      const files = buildProjectExportFiles({
+        projectTitle: resolvedSeoTitle,
+        slug: cleanedSlug,
+        mode,
+        html: latestPreviewHtml,
+        databaseConfig,
+        secrets,
+        includeSecrets: includeSecretsInExport,
+      });
+      const res = await fetch('/api/export/github', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: cleanToken,
+          repoName: cleanRepo,
+          description: resolvedSeoDesc,
+          isPrivate: githubPrivate,
+          files,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        repoUrl?: string;
+        filesPushed?: number;
+        error?: string;
+      };
+      if (!res.ok || !data.ok) {
+        setGithubError(data.error || 'GitHub export failed.');
+        return;
+      }
+      setGithubResultUrl(data.repoUrl || null);
+      setStatusNote(`Pushed ${data.filesPushed ?? files.length} files to GitHub`);
+    } catch {
+      setGithubError('Network error while connecting to GitHub.');
+    } finally {
+      setGithubPushing(false);
+    }
+  };
+
   const handleShareClick = async () => {
     const msg = await onShare();
     setStatusNote(msg);
@@ -1848,8 +1978,8 @@ export function ProjectDeployModal({
       open={open}
       onClose={onClose}
       mode={mode}
-      title="Deploy"
-      subtitle={`Launch & Export · ${projectTitle}`}
+      title="Deploy & Export"
+      subtitle={`Publish, OG Metadata & Code Export · ${projectTitle}`}
       icon={<Rocket className="w-[18px] h-[18px] text-[#6D4AFF]" />}
     >
       <div className="flex flex-col gap-4">
@@ -1882,7 +2012,7 @@ export function ProjectDeployModal({
               </span>
             </div>
             <div>
-              <span className="text-[#71717A] block">Database Tables</span>
+              <span className="text-[#71717A] block">Hosted App Database</span>
               <span className="font-semibold text-[#0B0B0F] tabular-nums">
                 {databaseConfig.tables.length} schema{' '}
                 {databaseConfig.tables.length === 1 ? 'table' : 'tables'}
@@ -1959,26 +2089,99 @@ export function ProjectDeployModal({
           </div>
         )}
 
-        {/* App Slug Input */}
-        <div>
-          <label className="block text-[12px] font-medium text-[#52525B] mb-1.5">
-            Public App Slug
-          </label>
-          <input
-            type="text"
-            value={slugInput}
-            onChange={(e) => setSlugInput(e.target.value)}
-            placeholder="my-app-slug"
-            className="w-full h-11 px-3.5 rounded-xl border border-black/[0.12] bg-[#FAFAFC] font-mono text-[13px] text-[#0B0B0F] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
-          />
-          <p className="text-[11.5px] text-[#71717A] mt-1.5 font-mono truncate">
-            Shareable route: /p/{cleanedSlug}
-          </p>
-          {deployment.deployedAt && (
-            <p className="text-[11.5px] text-[#71717A] mt-0.5">
-              Last deployed {new Date(deployment.deployedAt).toLocaleString()}
+        {/* App Slug & SEO Share Card Metadata */}
+        <div className="flex flex-col gap-3 p-3.5 rounded-2xl border border-black/[0.08] bg-white">
+          <div>
+            <label className="block text-[12px] font-medium text-[#52525B] mb-1">
+              Public App Slug
+            </label>
+            <input
+              type="text"
+              value={slugInput}
+              onChange={(e) => setSlugInput(e.target.value)}
+              placeholder="my-app-slug"
+              className="w-full h-10 px-3 rounded-xl border border-black/[0.12] bg-[#FAFAFC] font-mono text-[12.5px] text-[#0B0B0F] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
+            />
+            <p className="text-[11px] text-[#71717A] mt-1 font-mono truncate">
+              Route: /p/{cleanedSlug}
+              {deployment.deployedAt
+                ? ` · Last deployed ${new Date(deployment.deployedAt).toLocaleDateString()}`
+                : ''}
             </p>
-          )}
+          </div>
+
+          <div>
+            <label className="block text-[12px] font-medium text-[#52525B] mb-1">
+              Social Share / OG Title
+            </label>
+            <input
+              type="text"
+              value={seoTitleInput}
+              onChange={(e) => setSeoTitleInput(e.target.value)}
+              placeholder={projectTitle}
+              maxLength={80}
+              className="w-full h-10 px-3 rounded-xl border border-black/[0.12] bg-[#FAFAFC] text-[13px] text-[#0B0B0F] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
+            />
+          </div>
+
+          <div>
+            <label className="block text-[12px] font-medium text-[#52525B] mb-1">
+              Social Share Description
+            </label>
+            <textarea
+              rows={2}
+              value={seoDescriptionInput}
+              onChange={(e) => setSeoDescriptionInput(e.target.value)}
+              placeholder="Describe what your app does for link previews..."
+              maxLength={180}
+              className="w-full px-3 py-2 rounded-xl border border-black/[0.12] bg-[#FAFAFC] text-[12.5px] text-[#0B0B0F] resize-none focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
+            />
+          </div>
+
+          {/* Live Social Share Card Preview */}
+          <div className="rounded-xl border border-black/[0.08] bg-[#FAFAFC] p-3 flex items-center gap-3">
+            {deployment.logoUrl ? (
+              <img
+                src={deployment.logoUrl}
+                alt="Share icon"
+                className="w-11 h-11 rounded-xl object-cover border border-black/10 shrink-0"
+              />
+            ) : (
+              <div className="w-11 h-11 rounded-xl bg-[#0B0B0F] text-white flex items-center justify-center shrink-0">
+                <Globe className="w-5 h-5" />
+              </div>
+            )}
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] font-mono uppercase tracking-wider text-[#71717A] truncate">
+                OG Preview · /p/{cleanedSlug}
+              </p>
+              <p className="text-[13px] font-semibold text-[#0B0B0F] truncate">
+                {resolvedSeoTitle}
+              </p>
+              <p className="text-[11.5px] text-[#52525B] line-clamp-2">
+                {resolvedSeoDesc}
+              </p>
+            </div>
+          </div>
+
+          {/* Community Remix Toggle */}
+          <label className="flex items-start gap-2.5 pt-1 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={allowRemix}
+              onChange={(e) => setAllowRemix(e.target.checked)}
+              className="mt-0.5 w-4 h-4 rounded accent-[#6D4AFF]"
+            />
+            <span className="text-[12px] text-[#3F3F46] leading-snug">
+              <span className="font-semibold text-[#0B0B0F] inline-flex items-center gap-1">
+                <GitFork className="w-3.5 h-3.5 text-[#6D4AFF]" />
+                Allow Community Remix
+              </span>
+              <span className="block text-[11px] text-[#71717A] mt-0.5">
+                Lists this build in the Remix Gallery and adds a fork badge on /p/{cleanedSlug}.
+              </span>
+            </span>
+          </label>
         </div>
 
         {statusNote && (
@@ -2020,7 +2223,7 @@ export function ProjectDeployModal({
               onClose();
               onOpenPreview();
             }}
-            className="h-11 px-3 rounded-xl border border-black/[0.1] bg-white hover:bg-black/[0.03] disabled:opacity-45 text-[13px] font-medium text-[#0B0B0F] flex items-center justify-center gap-1.5"
+            className="h-10 px-3 rounded-xl border border-black/[0.1] bg-white hover:bg-black/[0.03] disabled:opacity-45 text-[12.5px] font-medium text-[#0B0B0F] flex items-center justify-center gap-1.5"
           >
             <ExternalLink className="w-4 h-4" />
             <span>Open Preview</span>
@@ -2033,7 +2236,7 @@ export function ProjectDeployModal({
               onClose();
               onOpenCode();
             }}
-            className="h-11 px-3 rounded-xl border border-black/[0.1] bg-white hover:bg-black/[0.03] disabled:opacity-45 text-[13px] font-medium text-[#0B0B0F] flex items-center justify-center gap-1.5"
+            className="h-10 px-3 rounded-xl border border-black/[0.1] bg-white hover:bg-black/[0.03] disabled:opacity-45 text-[12.5px] font-medium text-[#0B0B0F] flex items-center justify-center gap-1.5"
           >
             <Code2 className="w-4 h-4" />
             <span>View Code</span>
@@ -2042,8 +2245,32 @@ export function ProjectDeployModal({
           <button
             type="button"
             disabled={!hasBuiltApp}
+            onClick={handleDownloadZip}
+            className="h-10 px-3 rounded-xl border border-black/[0.1] bg-white hover:bg-black/[0.03] disabled:opacity-45 text-[12.5px] font-medium text-[#0B0B0F] flex items-center justify-center gap-1.5"
+          >
+            <FileArchive className="w-4 h-4 text-[#6D4AFF]" />
+            <span>Export ZIP</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={!hasBuiltApp}
+            onClick={() => setGithubOpen((v) => !v)}
+            className={`h-10 px-3 rounded-xl border text-[12.5px] font-medium flex items-center justify-center gap-1.5 disabled:opacity-45 ${
+              githubOpen
+                ? 'border-[#0B0B0F] bg-[#0B0B0F] text-white'
+                : 'border-black/[0.1] bg-white hover:bg-black/[0.03] text-[#0B0B0F]'
+            }`}
+          >
+            <Github className="w-4 h-4" />
+            <span>Push to GitHub</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={!hasBuiltApp}
             onClick={handleDownloadHtml}
-            className="h-11 px-3 rounded-xl border border-black/[0.1] bg-white hover:bg-black/[0.03] disabled:opacity-45 text-[13px] font-medium text-[#0B0B0F] flex items-center justify-center gap-1.5"
+            className="h-10 px-3 rounded-xl border border-black/[0.1] bg-white hover:bg-black/[0.03] disabled:opacity-45 text-[12.5px] font-medium text-[#0B0B0F] flex items-center justify-center gap-1.5"
           >
             <Download className="w-4 h-4" />
             <span>Export HTML</span>
@@ -2052,12 +2279,84 @@ export function ProjectDeployModal({
           <button
             type="button"
             onClick={() => void handleShareClick()}
-            className="h-11 px-3 rounded-xl border border-black/[0.1] bg-white hover:bg-black/[0.03] text-[13px] font-medium text-[#0B0B0F] flex items-center justify-center gap-1.5"
+            className="h-10 px-3 rounded-xl border border-black/[0.1] bg-white hover:bg-black/[0.03] text-[12.5px] font-medium text-[#0B0B0F] flex items-center justify-center gap-1.5"
           >
             <Share2 className="w-4 h-4" />
             <span>Share App</span>
           </button>
         </div>
+
+        {/* Expandable Push to GitHub Panel */}
+        {githubOpen && hasBuiltApp && (
+          <div className="p-3.5 rounded-2xl border border-black/[0.1] bg-[#FAFAFC] flex flex-col gap-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-[12.5px] font-semibold text-[#0B0B0F] inline-flex items-center gap-1.5">
+                <Github className="w-4 h-4" />
+                Push Multi-File Repo to GitHub
+              </span>
+              <span className="text-[11px] text-[#71717A]">
+                index.html + CSS + JS + SQL
+              </span>
+            </div>
+
+            <input
+              type="text"
+              value={githubRepoName}
+              onChange={(e) => setGithubRepoName(e.target.value)}
+              placeholder="my-app-repo or owner/repo"
+              className="w-full h-9 px-3 rounded-xl border border-black/[0.12] bg-white font-mono text-[12px] text-[#0B0B0F] focus:outline-none focus:border-[#6D4AFF]"
+            />
+
+            <input
+              type="password"
+              value={githubToken}
+              onChange={(e) => setGithubToken(e.target.value)}
+              placeholder="GitHub Personal Access Token (repo scope)"
+              autoComplete="off"
+              className="w-full h-9 px-3 rounded-xl border border-black/[0.12] bg-white font-mono text-[12px] text-[#0B0B0F] focus:outline-none focus:border-[#6D4AFF]"
+            />
+
+            <label className="flex items-center gap-2 text-[12px] text-[#3F3F46] cursor-pointer">
+              <input
+                type="checkbox"
+                checked={githubPrivate}
+                onChange={(e) => setGithubPrivate(e.target.checked)}
+                className="w-3.5 h-3.5 rounded accent-[#6D4AFF]"
+              />
+              <span>Create private repository</span>
+            </label>
+
+            {githubError && (
+              <p className="text-[11.5px] text-red-600 font-medium">{githubError}</p>
+            )}
+
+            {githubResultUrl && (
+              <a
+                href={githubResultUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-[12px] font-medium flex items-center justify-between gap-2"
+              >
+                <span className="truncate">Open pushed repository</span>
+                <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+              </a>
+            )}
+
+            <button
+              type="button"
+              disabled={githubPushing}
+              onClick={() => void handlePushToGithub()}
+              className="w-full h-9 rounded-xl bg-[#0B0B0F] hover:bg-black/85 disabled:opacity-60 text-white text-[12.5px] font-semibold inline-flex items-center justify-center gap-1.5"
+            >
+              {githubPushing ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Github className="w-3.5 h-3.5" />
+              )}
+              <span>{githubPushing ? 'Pushing files...' : 'Push Repository Now'}</span>
+            </button>
+          </div>
+        )}
 
         {hasBuiltApp && secrets.length > 0 && (
           <label className="flex items-center gap-2.5 text-[12px] text-[#52525B] cursor-pointer pt-1">
@@ -2067,7 +2366,7 @@ export function ProjectDeployModal({
               onChange={(e) => setIncludeSecretsInExport(e.target.checked)}
               className="w-4 h-4 rounded accent-[#6D4AFF]"
             />
-            <span>Include saved project secrets inside exported HTML bundle</span>
+            <span>Include saved project secrets inside exported bundle</span>
           </label>
         )}
       </div>

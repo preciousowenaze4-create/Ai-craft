@@ -45,6 +45,7 @@ import {
   filterPublicSafeEnv,
   getAppLogoConfig,
   isAppLogoOrPwaEnabled,
+  listPublishedApps,
   loadPublishedApp,
   renderAppIconPng,
   renderAppIconSvg,
@@ -53,6 +54,13 @@ import {
   savePublishedApp,
   type AppLogoConfig,
 } from './api/_appsStore.js';
+import {
+  clearAppTableRows,
+  insertAppTableRow,
+  listAppTableRows,
+  removeAppTableRow,
+  updateAppTableRow,
+} from './api/_appDataStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1667,6 +1675,261 @@ async function startServer() {
     return false;
   };
 
+  app.get('/api/apps/gallery', async (_req, res) => {
+    const records = await listPublishedApps({ remixOnly: true, limit: 24 });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      ok: true,
+      apps: records.map((r) => {
+        const logo = getAppLogoConfig(r);
+        return {
+          appId: r.appId,
+          title: r.title,
+          slug: r.slug,
+          mode: r.mode,
+          seoTitle: r.seoTitle || r.title,
+          seoDescription: r.seoDescription || `${r.title} — Built with AI Craft`,
+          themeColor: logo.themeColor,
+          logoUrl: `/p/${r.appId}/icon-180.png?v=${r.version}`,
+          liveUrl: `/p/${r.appId}`,
+          tables: r.tables || [],
+          version: r.version,
+          updatedAt: r.updatedAt,
+        };
+      }),
+    });
+  });
+
+  app.get('/api/apps/:id/remix', async (req, res) => {
+    const cleanId = sanitizeAppId(req.params.id || '');
+    const record = await loadPublishedApp(cleanId);
+    if (!record || !record.html) {
+      res.status(404).json({ ok: false, error: 'Published app not found.' });
+      return;
+    }
+    if (!record.allowRemix) {
+      res.status(403).json({ ok: false, error: 'This app does not have community remixing enabled.' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      ok: true,
+      app: {
+        appId: record.appId,
+        title: record.title,
+        mode: record.mode,
+        html: record.html,
+        tables: record.tables || [],
+        seoTitle: record.seoTitle,
+        seoDescription: record.seoDescription,
+      },
+    });
+  });
+
+  app.get('/api/app-data/:appId/:table', async (req, res) => {
+    const rows = await listAppTableRows(req.params.appId || '', req.params.table || 'items');
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, rows });
+  });
+
+  app.post('/api/app-data/:appId/:table', async (req, res) => {
+    const payload =
+      req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+        ? (req.body as Record<string, unknown>)
+        : {};
+    const row = await insertAppTableRow(
+      req.params.appId || '',
+      req.params.table || 'items',
+      payload
+    );
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, row });
+  });
+
+  app.patch('/api/app-data/:appId/:table/:rowId', async (req, res) => {
+    const patch =
+      req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+        ? (req.body as Record<string, unknown>)
+        : {};
+    const row = await updateAppTableRow(
+      req.params.appId || '',
+      req.params.table || 'items',
+      req.params.rowId || '',
+      patch
+    );
+    if (!row) {
+      res.status(404).json({ ok: false, error: 'Record not found.' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, row });
+  });
+
+  app.delete('/api/app-data/:appId/:table/:rowId', async (req, res) => {
+    await removeAppTableRow(
+      req.params.appId || '',
+      req.params.table || 'items',
+      req.params.rowId || ''
+    );
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true });
+  });
+
+  app.delete('/api/app-data/:appId/:table', async (req, res) => {
+    await clearAppTableRows(req.params.appId || '', req.params.table || 'items');
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true });
+  });
+
+  app.post('/api/export/github', async (req, res) => {
+    const body = (req.body || {}) as {
+      token?: string;
+      repoName?: string;
+      description?: string;
+      isPrivate?: boolean;
+      branch?: string;
+      files?: Array<{ path: string; content: string }>;
+    };
+    const token = typeof body.token === 'string' ? body.token.trim() : '';
+    const rawRepo = typeof body.repoName === 'string' ? body.repoName.trim() : '';
+    const files = Array.isArray(body.files)
+      ? body.files.filter(
+          (f) =>
+            f &&
+            typeof f.path === 'string' &&
+            f.path.trim() &&
+            typeof f.content === 'string'
+        )
+      : [];
+
+    if (!token) {
+      res.status(400).json({ ok: false, error: 'GitHub Personal Access Token is required.' });
+      return;
+    }
+    if (!rawRepo) {
+      res.status(400).json({ ok: false, error: 'Repository name is required.' });
+      return;
+    }
+    if (files.length === 0) {
+      res.status(400).json({ ok: false, error: 'No project files to export.' });
+      return;
+    }
+
+    const ghHeaders = {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'AI-Craft-Exporter',
+      'X-GitHub-Api-Version': '2022-11-28',
+    };
+
+    try {
+      const userResp = await fetch('https://api.github.com/user', { headers: ghHeaders });
+      if (!userResp.ok) {
+        const errBody = (await userResp.json().catch(() => ({}))) as { message?: string };
+        res.status(401).json({
+          ok: false,
+          error: errBody.message || 'Invalid GitHub token or missing repo permissions.',
+        });
+        return;
+      }
+      const userData = (await userResp.json()) as { login?: string };
+      const login = userData.login || '';
+      if (!login) {
+        res.status(401).json({ ok: false, error: 'Unable to resolve GitHub account.' });
+        return;
+      }
+
+      const hasOwner = rawRepo.includes('/');
+      const [repoOwner, repoSlugRaw] = hasOwner ? rawRepo.split('/', 2) : [login, rawRepo];
+      const repoSlug = sanitizeAppId(repoSlugRaw || 'aicraft-app');
+      const fullRepo = `${repoOwner}/${repoSlug}`;
+      const branch =
+        typeof body.branch === 'string' && body.branch.trim() ? body.branch.trim() : 'main';
+
+      // Check if repository exists; create it under user account if missing
+      const checkResp = await fetch(`https://api.github.com/repos/${fullRepo}`, {
+        headers: ghHeaders,
+      });
+      if (checkResp.status === 404) {
+        const createResp = await fetch('https://api.github.com/user/repos', {
+          method: 'POST',
+          headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: repoSlug,
+            description:
+              typeof body.description === 'string' && body.description.trim()
+                ? body.description.trim()
+                : 'Built with AI Craft',
+            private: Boolean(body.isPrivate),
+            auto_init: true,
+          }),
+        });
+        if (!createResp.ok) {
+          const createErr = (await createResp.json().catch(() => ({}))) as { message?: string };
+          res.status(createResp.status).json({
+            ok: false,
+            error: createErr.message || `Could not create repository ${fullRepo}.`,
+          });
+          return;
+        }
+        // Wait briefly for GitHub's initial commit to propagate
+        await new Promise((r) => setTimeout(r, 900));
+      } else if (!checkResp.ok) {
+        const repoErr = (await checkResp.json().catch(() => ({}))) as { message?: string };
+        res.status(checkResp.status).json({
+          ok: false,
+          error: repoErr.message || `Cannot access repository ${fullRepo}.`,
+        });
+        return;
+      }
+
+      // Push files sequentially via Contents API (handles both new and existing files)
+      for (const file of files.slice(0, 24)) {
+        const cleanPath = file.path.replace(/^\/+/, '');
+        const encodedPath = cleanPath.split('/').map(encodeURIComponent).join('/');
+        const apiUrl = `https://api.github.com/repos/${fullRepo}/contents/${encodedPath}`;
+        let existingSha: string | undefined;
+        const getFileResp = await fetch(`${apiUrl}?ref=${encodeURIComponent(branch)}`, {
+          headers: ghHeaders,
+        });
+        if (getFileResp.ok) {
+          const fileMeta = (await getFileResp.json().catch(() => ({}))) as { sha?: string };
+          existingSha = fileMeta.sha;
+        }
+        const putResp = await fetch(apiUrl, {
+          method: 'PUT',
+          headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: `Export ${cleanPath} from AI Craft`,
+            content: Buffer.from(file.content, 'utf8').toString('base64'),
+            branch,
+            ...(existingSha ? { sha: existingSha } : {}),
+          }),
+        });
+        if (!putResp.ok) {
+          const putErr = (await putResp.json().catch(() => ({}))) as { message?: string };
+          res.status(putResp.status).json({
+            ok: false,
+            error: putErr.message || `Failed to push ${cleanPath} to ${fullRepo}.`,
+          });
+          return;
+        }
+      }
+
+      res.json({
+        ok: true,
+        repoUrl: `https://github.com/${fullRepo}`,
+        fullRepo,
+        filesCount: files.length,
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'GitHub export failed.',
+      });
+    }
+  });
+
   app.get('/api/apps', async (req, res) => {
     const rawId = typeof req.query.id === 'string' ? req.query.id : '';
     const cleanId = sanitizeAppId(rawId);
@@ -1705,6 +1968,9 @@ async function startServer() {
         slug: record.slug,
         mode: record.mode,
         version: record.version,
+        seoTitle: record.seoTitle,
+        seoDescription: record.seoDescription,
+        allowRemix: Boolean(record.allowRemix),
         path: `${routePrefix}/${record.appId}`,
         ...(hasLogoOrPwa && logo
           ? {
@@ -1793,6 +2059,9 @@ async function startServer() {
       publicEnv?: Record<string, string>;
       tables?: string[];
       logo?: Partial<AppLogoConfig>;
+      seoTitle?: string;
+      seoDescription?: string;
+      allowRemix?: boolean;
       version?: number;
     };
     const html = typeof body.html === 'string' ? body.html.trim() : '';
@@ -1873,6 +2142,18 @@ async function startServer() {
       publicEnv: filterPublicSafeEnv(body.publicEnv),
       tables: Array.isArray(body.tables) ? body.tables.filter((t) => typeof t === 'string') : [],
       logo: body.logo && typeof body.logo === 'object' ? body.logo : undefined,
+      seoTitle:
+        typeof body.seoTitle === 'string' && body.seoTitle.trim()
+          ? body.seoTitle.trim().slice(0, 90)
+          : resolvedExisting?.seoTitle,
+      seoDescription:
+        typeof body.seoDescription === 'string' && body.seoDescription.trim()
+          ? body.seoDescription.trim().slice(0, 200)
+          : resolvedExisting?.seoDescription,
+      allowRemix:
+        typeof body.allowRemix === 'boolean'
+          ? body.allowRemix
+          : Boolean(resolvedExisting?.allowRemix),
       version: nextVersion,
       updatedAt: new Date().toISOString(),
     });
@@ -1886,6 +2167,9 @@ async function startServer() {
       appId: record.appId,
       slug: record.slug,
       path: `/p/${record.appId}`,
+      seoTitle: record.seoTitle,
+      seoDescription: record.seoDescription,
+      allowRemix: Boolean(record.allowRemix),
       ...(hasLogoOrPwa && logo
         ? {
             logoUrl: `/p/${record.appId}/icon-180.png?v=${record.version}`,

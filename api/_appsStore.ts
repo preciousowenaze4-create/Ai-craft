@@ -29,6 +29,9 @@ export interface PublishedAppRecord {
   publicEnv?: Record<string, string>;
   tables?: string[];
   logo?: Partial<AppLogoConfig>;
+  seoTitle?: string;
+  seoDescription?: string;
+  allowRemix?: boolean;
   version: number;
   updatedAt: string;
 }
@@ -483,6 +486,7 @@ export function buildStandaloneAppHtml(
   function cleanTable(t) {
     return String(t || 'items').trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'items';
   }
+  var appDataEndpoint = '/api/app-data/' + encodeURIComponent(${JSON.stringify(record.appId)});
   function readTable(table) {
     try {
       var raw = window.localStorage.getItem(dbPrefix + cleanTable(table));
@@ -511,35 +515,89 @@ export function buildStandaloneAppHtml(
   });
   var dbApi = {
     meta: dbMeta,
-    list: function(table) { return Promise.resolve(readTable(table)); },
+    list: function(table) {
+      var t = cleanTable(table);
+      return fetch(appDataEndpoint + '/' + encodeURIComponent(t))
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(payload) {
+          if (payload && Array.isArray(payload.rows)) {
+            writeTable(t, payload.rows);
+            return payload.rows;
+          }
+          return readTable(t);
+        })
+        .catch(function() { return readTable(t); });
+    },
     insert: function(table, row) {
-      var rows = readTable(table);
+      var t = cleanTable(table);
+      var rows = readTable(t);
       var item = Object.assign({ id: 'rec_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), created_at: new Date().toISOString() }, row || {});
       rows.unshift(item);
-      writeTable(table, rows);
-      notifyDbSubscribers(table);
-      return Promise.resolve(item);
+      writeTable(t, rows);
+      notifyDbSubscribers(t);
+      return fetch(appDataEndpoint + '/' + encodeURIComponent(t), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(item)
+      })
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(payload) {
+          if (payload && payload.row) {
+            var synced = [payload.row].concat(readTable(t).filter(function(r) { return r && r.id !== payload.row.id && r.id !== item.id; }));
+            writeTable(t, synced);
+            notifyDbSubscribers(t);
+            return payload.row;
+          }
+          return item;
+        })
+        .catch(function() { return item; });
     },
     update: function(table, id, patch) {
+      var t = cleanTable(table);
       var updated = null;
-      var rows = readTable(table).map(function(r) {
+      var rows = readTable(t).map(function(r) {
         if (r && r.id === id) { updated = Object.assign({}, r, patch || {}); return updated; }
         return r;
       });
-      writeTable(table, rows);
-      notifyDbSubscribers(table);
-      return Promise.resolve(updated);
+      writeTable(t, rows);
+      notifyDbSubscribers(t);
+      return fetch(appDataEndpoint + '/' + encodeURIComponent(t) + '/' + encodeURIComponent(String(id || '')), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch || {})
+      })
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(payload) {
+          if (payload && payload.row) {
+            var synced = readTable(t).map(function(r) { return r && r.id === id ? payload.row : r; });
+            writeTable(t, synced);
+            notifyDbSubscribers(t);
+            return payload.row;
+          }
+          return updated;
+        })
+        .catch(function() { return updated; });
     },
     remove: function(table, id) {
-      var rows = readTable(table).filter(function(r) { return !r || r.id !== id; });
-      writeTable(table, rows);
-      notifyDbSubscribers(table);
-      return Promise.resolve(true);
+      var t = cleanTable(table);
+      var rows = readTable(t).filter(function(r) { return !r || r.id !== id; });
+      writeTable(t, rows);
+      notifyDbSubscribers(t);
+      return fetch(appDataEndpoint + '/' + encodeURIComponent(t) + '/' + encodeURIComponent(String(id || '')), {
+        method: 'DELETE'
+      })
+        .then(function() { return true; })
+        .catch(function() { return true; });
     },
     clear: function(table) {
-      writeTable(table, []);
-      notifyDbSubscribers(table);
-      return Promise.resolve(true);
+      var t = cleanTable(table);
+      writeTable(t, []);
+      notifyDbSubscribers(t);
+      return fetch(appDataEndpoint + '/' + encodeURIComponent(t), {
+        method: 'DELETE'
+      })
+        .then(function() { return true; })
+        .catch(function() { return true; });
     },
     subscribe: function(table, listener) {
       var t = cleanTable(table);
@@ -547,6 +605,9 @@ export function buildStandaloneAppHtml(
       if (!dbSubscribers[t]) dbSubscribers[t] = [];
       dbSubscribers[t].push(listener);
       try { listener(readTable(t)); } catch (e) {}
+      dbApi.list(t).then(function(rows) {
+        try { listener(rows); } catch (e) {}
+      });
       return function unsubscribe() {
         dbSubscribers[t] = (dbSubscribers[t] || []).filter(function(fn) { return fn !== listener; });
       };
@@ -689,12 +750,46 @@ export function buildStandaloneAppHtml(
 })();
 </script>`;
 
-  const safeTitle = record.title.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  if (record.allowRemix) {
+    // Inject subtle remix badge helper on load when community remixing is enabled
+    const remixBadgeScript = `<script>
+(function(){
+  if (window.__AICRAFT_REMIX_BADGE__) return;
+  window.__AICRAFT_REMIX_BADGE__ = true;
+  window.addEventListener('DOMContentLoaded', function() {
+    if (!document.body || document.getElementById('aicraft-remix-pill')) return;
+    var a = document.createElement('a');
+    a.id = 'aicraft-remix-pill';
+    a.href = '/?remix=' + encodeURIComponent(${JSON.stringify(record.appId)});
+    a.textContent = 'Remix in AI Craft';
+    a.style.cssText = 'position:fixed;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));z-index:99990;padding:7px 12px;border-radius:999px;background:rgba(11,11,15,0.86);color:#fff;font:600 11.5px/1 system-ui,-apple-system,sans-serif;text-decoration:none;backdrop-filter:blur(8px);box-shadow:0 6px 20px rgba(0,0,0,0.22);border:1px solid rgba(255,255,255,0.16);';
+    document.body.appendChild(a);
+  });
+})();
+</script>`;
+    if (/<\/body>/i.test(html)) {
+      html = html.replace(/<\/body>/i, `${remixBadgeScript}\n</body>`);
+    } else {
+      html += remixBadgeScript;
+    }
+  }
+
+  const safeTitle = (record.seoTitle?.trim() || record.title).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const safeDesc = (record.seoDescription?.trim() || `${record.title} — Built with AI Craft`).replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const safeOgTitle = safeTitle.replace(/"/g, '&quot;');
   const safeShortName = logo.shortName.replace(/"/g, '&quot;').replace(/</g, '&lt;');
   const statusBarStyle = logo.isDark ? 'black-translucent' : 'default';
 
   const headAdditions: string[] = [
     '<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />',
+    `<meta name="description" content="${safeDesc}" />`,
+    `<meta property="og:title" content="${safeOgTitle}" />`,
+    `<meta property="og:description" content="${safeDesc}" />`,
+    `<meta property="og:type" content="website" />`,
+    `<meta property="og:image" content="${basePath}/icon-512.png?v=${v}" />`,
+    `<meta name="twitter:card" content="summary_large_image" />`,
+    `<meta name="twitter:title" content="${safeOgTitle}" />`,
+    `<meta name="twitter:description" content="${safeDesc}" />`,
   ];
 
   if (pwaAndLogoEnabled) {
@@ -849,6 +944,63 @@ export async function loadPublishedApp(
   }
 
   return null;
+}
+
+export async function listPublishedApps(opts?: {
+  remixOnly?: boolean;
+  limit?: number;
+}): Promise<PublishedAppRecord[]> {
+  const remixOnly = opts?.remixOnly ?? true;
+  const limit = Math.max(1, Math.min(48, opts?.limit ?? 24));
+  const byId = new Map<string, PublishedAppRecord>();
+
+  for (const rec of memoryApps.values()) {
+    if (rec && rec.html) byId.set(rec.appId, rec);
+  }
+
+  try {
+    if (fs.existsSync(LOCAL_APPS_DIR)) {
+      const files = fs.readdirSync(LOCAL_APPS_DIR).filter((f) => f.endsWith('.json'));
+      for (const file of files.slice(0, 80)) {
+        try {
+          const raw = fs.readFileSync(path.join(LOCAL_APPS_DIR, file), 'utf8');
+          const parsed = raw ? (JSON.parse(raw) as PublishedAppRecord) : null;
+          if (parsed && parsed.appId && parsed.html && !byId.has(parsed.appId)) {
+            byId.set(parsed.appId, parsed);
+          }
+        } catch {
+          // ignore corrupted file
+        }
+      }
+    }
+  } catch {
+    // ignore fs read errors
+  }
+
+  try {
+    const adminClient = createSupabaseServiceClient();
+    if (adminClient && (await ensurePublishedBucket())) {
+      const { data: list } = await adminClient.storage
+        .from(WORKSPACE_BUCKET)
+        .list('published', { limit: 40, sortBy: { column: 'updated_at', order: 'desc' } });
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          if (!item.name || !item.name.endsWith('.json')) continue;
+          const appId = item.name.replace(/\.json$/i, '');
+          if (byId.has(appId)) continue;
+          const loaded = await loadPublishedApp(appId);
+          if (loaded) byId.set(loaded.appId, loaded);
+        }
+      }
+    }
+  } catch {
+    // ignore storage listing error
+  }
+
+  return Array.from(byId.values())
+    .filter((rec) => !remixOnly || Boolean(rec.allowRemix))
+    .sort((a, b) => Date.parse(b.updatedAt || '') - Date.parse(a.updatedAt || ''))
+    .slice(0, limit);
 }
 
 export function buildNotFoundAppHtml(appId: string): string {

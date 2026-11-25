@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ArrowRight, Bell, CheckCircle2, Plus, X } from 'lucide-react';
+import { ArrowRight, Bell, CheckCircle2, Plus, Sparkles, X } from 'lucide-react';
 import {
   AuthScreen,
   AuthViewMode,
@@ -21,9 +21,12 @@ import {
   ProPlanOption,
   ProUpgradeModal,
 } from './components/ProUpgradeModal';
+import { DeploySubmitOptions } from './components/ProjectConfigDrawers';
 import { PromptComposer } from './components/PromptComposer';
 import { SwipeableProjectRow } from './components/SwipeableProjectRow';
+import { TemplatesGalleryModal } from './components/TemplatesGalleryModal';
 import { TopBar } from './components/TopBar';
+import { StarterTemplate } from './data/starterTemplates';
 import { unlockSpeechSynthesis } from './hooks/useSpeechNarration';
 import {
   analyzeAttachmentVisualHints,
@@ -433,6 +436,7 @@ export default function App() {
     loadSavedBoolean(STORAGE_AUTOREAD_KEY, true)
   );
   const [showProUpgrade, setShowProUpgrade] = useState(false);
+  const [showTemplatesModal, setShowTemplatesModal] = useState(false);
   const [dynamicColorEnabled, setDynamicColorEnabled] = useState(true);
   const [projects, setProjects] = useState<CraftProject[]>(() => loadSavedProjects());
   const [projectViews, setProjectViews] = useState<Record<string, WorkspaceView>>(() =>
@@ -1188,6 +1192,9 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
         logo?: Record<string, string> | null;
         forceBump?: boolean;
         secrets?: ProjectSecret[];
+        seoTitle?: string;
+        seoDescription?: string;
+        allowRemix?: boolean;
       }
     ): Promise<boolean> => {
       const trimmedHtml = html.trim();
@@ -1210,6 +1217,14 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
         overrides?.logo === null
           ? undefined
           : (overrides?.logo ?? proj.deployment?.logo);
+      const resolvedSeoTitle =
+        overrides?.seoTitle ?? proj.deployment?.seoTitle ?? resolvedTitle;
+      const resolvedSeoDescription =
+        overrides?.seoDescription ??
+        proj.deployment?.seoDescription ??
+        `${resolvedTitle} — Built with AI Craft`;
+      const resolvedAllowRemix =
+        overrides?.allowRemix ?? Boolean(proj.deployment?.allowRemix);
       const nextVersion = Math.max(1, (proj.deployment?.version ?? 0) + 1);
       const configuredOrigin = (
         import.meta.env.VITE_PUBLIC_APP_ORIGIN as string | undefined
@@ -1231,6 +1246,9 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
               logoUrl: p.deployment?.logoUrl,
               themeColor: p.deployment?.themeColor,
               logo: nextLogo,
+              seoTitle: resolvedSeoTitle,
+              seoDescription: resolvedSeoDescription,
+              allowRemix: resolvedAllowRemix,
               livePublishing: true,
               version: p.deployment?.version ?? 0,
               deployedAt: p.deployment?.deployedAt ?? null,
@@ -1264,6 +1282,9 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
             publicEnv,
             tables: (proj.databaseConfig?.tables ?? []).map((t) => t.name),
             logo: nextLogo,
+            seoTitle: resolvedSeoTitle,
+            seoDescription: resolvedSeoDescription,
+            allowRemix: resolvedAllowRemix,
             version: overrides?.forceBump ? nextVersion : nextVersion,
           }),
         });
@@ -1323,6 +1344,9 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                   logoUrl,
                   themeColor,
                   logo: nextLogo,
+                  seoTitle: resolvedSeoTitle,
+                  seoDescription: resolvedSeoDescription,
+                  allowRemix: resolvedAllowRemix,
                   livePublishing: false,
                   version,
                   deployedAt,
@@ -2875,6 +2899,197 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
     );
   };
 
+  const handleUseTemplatePrompt = (
+    template: StarterTemplate,
+    launchImmediately: boolean
+  ) => {
+    setMode(template.mode);
+    if (!launchImmediately) {
+      setPrompt(template.prompt);
+      setViewMode('home');
+      setActiveTab('create');
+      setInlineNotice(`Loaded "${template.title}" prompt — customize & send`);
+      return;
+    }
+
+    if (!checkCanConsumeCredit()) return;
+    unlockSpeechSynthesis();
+    if (notificationsEnabled && getNotificationPermissionState() === 'default') {
+      void requestAppNotificationPermission();
+    }
+
+    const now = Date.now();
+    const projectId = `proj-${now}-${Math.random().toString(36).slice(2, 6)}`;
+    const turnId = `turn-${now}-${Math.random().toString(36).slice(2, 6)}`;
+    const currentModel = models.find((m) => m.id === selectedModel);
+    const chosenModelId = currentModel?.id || selectedModel || undefined;
+
+    const newTurn: BuilderTurn = {
+      id: turnId,
+      startedAt: now,
+      kind: 'build',
+      userMessage: template.prompt,
+      attachmentName: null,
+      attachmentDataUrl: null,
+      phase: 'understanding',
+      phaseLabel: 'Thinking...',
+      thoughtSeconds: 1,
+      activeAction: 'Thinking',
+      activeFile: '',
+      files: [],
+      bytesBuilt: 0,
+      aiText: '',
+      modelId: chosenModelId,
+      modelName: currentModel?.name,
+      modelProvider: currentModel?.provider,
+    };
+
+    const newProject: CraftProject = {
+      id: projectId,
+      title: template.title,
+      mode: template.mode,
+      createdAt: new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+      turns: [newTurn],
+    };
+
+    setProjects((prev) => [newProject, ...prev]);
+    setActiveProjectId(projectId);
+    setPrompt('');
+    setViewMode('builder');
+
+    void runBuilderStream(
+      projectId,
+      turnId,
+      template.prompt,
+      template.mode,
+      chosenModelId,
+      [],
+      {
+        reactEnabled: template.mode === 'web',
+        backendEnabled: true,
+        webSearchEnabled: true,
+        attachmentName: null,
+        clientCreditsRemaining: credits,
+        needsTitle: false,
+      },
+      '',
+      now
+    );
+  };
+
+  const handleRemixApp = useCallback(async (appId: string) => {
+    try {
+      const res = await fetch(`/api/apps/${encodeURIComponent(appId)}/remix`);
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        app?: {
+          appId: string;
+          title: string;
+          mode: BuildMode;
+          html: string;
+          tables?: string[];
+          seoTitle?: string;
+          seoDescription?: string;
+        };
+      };
+      if (!res.ok || !data.ok || !data.app?.html) {
+        setInlineNotice(data.error || 'Could not load app to remix.');
+        return;
+      }
+
+      const now = Date.now();
+      const newProjectId = `proj-${now}-${Math.random().toString(36).slice(2, 6)}`;
+      const turnId = `turn-${now}-${Math.random().toString(36).slice(2, 6)}`;
+      const remixTitle = `${data.app.title} Remix`;
+      const forkedTables: ProjectDatabaseTable[] = (data.app.tables || []).map(
+        (tblName) => ({
+          id: `tbl-${now}-${tblName}`,
+          name: tblName,
+          columns: [
+            { name: 'id', type: 'text', required: true },
+            { name: 'created_at', type: 'timestamp' },
+          ],
+        })
+      );
+
+      const remixedProject: CraftProject = {
+        id: newProjectId,
+        title: remixTitle,
+        mode: data.app.mode === 'web' ? 'web' : 'mobile',
+        createdAt: new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+        databaseConfig: {
+          enabled: true,
+          providerLabel: 'Cloud & Local App Store',
+          tables: forkedTables,
+        },
+        deployment: {
+          status: 'draft',
+          slug: slugifyAppTitle(remixTitle),
+          seoTitle: remixTitle,
+          seoDescription:
+            data.app.seoDescription || `Remixed from ${data.app.title} on AI Craft`,
+          allowRemix: false,
+          version: 0,
+          deployedAt: null,
+          environment: 'production',
+        },
+        turns: [
+          {
+            id: turnId,
+            startedAt: now,
+            kind: 'build',
+            userMessage: `Remix "${data.app.title}"`,
+            attachmentName: null,
+            attachmentDataUrl: null,
+            phase: 'complete',
+            phaseLabel: 'Remixed',
+            thoughtSeconds: 1,
+            activeAction: 'Ready',
+            activeFile: 'index.html',
+            files: ['index.html'],
+            bytesBuilt: data.app.html.length,
+            aiText: `Remixed **${data.app.title}** into your workspace! Inspect or customize any element in Preview, or ask me in chat to add features or redesign anything.`,
+            previewHtml: data.app.html,
+          },
+        ],
+      };
+
+      setProjects((prev) => [remixedProject, ...prev]);
+      setActiveProjectId(newProjectId);
+      setMode(remixedProject.mode);
+      setProjectViews((prev) => ({
+        ...prev,
+        [newProjectId]: 'preview',
+      }));
+      setViewMode('builder');
+      setInlineNotice(`Remixed "${data.app.title}" into your workspace`);
+    } catch {
+      setInlineNotice('Network error while remixing community app.');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!authUser) return;
+    const params = new URLSearchParams(window.location.search);
+    const remixTarget = params.get('remix')?.trim();
+    if (!remixTarget) return;
+    params.delete('remix');
+    const nextSearch = params.toString();
+    window.history.replaceState(
+      {},
+      '',
+      nextSearch ? `${window.location.pathname}?${nextSearch}` : window.location.pathname
+    );
+    void handleRemixApp(remixTarget);
+  }, [authUser, handleRemixApp]);
+
   const handleFollowUp = (message: string, options: ComposerOptions) => {
     if (!activeProject || isProjectWorking(activeProject)) return;
     if (!checkCanConsumeCredit()) return;
@@ -3630,7 +3845,8 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
               }
               setInlineNotice('Code changes saved to Preview');
             }}
-            onDeployProject={async (slug) => {
+            onDeployProject={async (opts: DeploySubmitOptions) => {
+              const { slug, seoTitle, seoDescription, allowRemix } = opts;
               const latestHtml =
                 [...activeProject.turns]
                   .reverse()
@@ -3639,6 +3855,9 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                 const ok = await publishProjectLive(activeProject.id, latestHtml, {
                   slug,
                   customAppId: slug,
+                  seoTitle,
+                  seoDescription,
+                  allowRemix,
                   forceBump: true,
                 });
                 if (ok) {
@@ -3662,6 +3881,9 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                       slug,
                       appId: proj.deployment?.appId,
                       liveUrl: proj.deployment?.liveUrl,
+                      seoTitle,
+                      seoDescription,
+                      allowRemix,
                       version: prevVersion + 1,
                       deployedAt: nowIso,
                       environment: 'production',
@@ -3786,7 +4008,17 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                   </p>
                 ) : null}
 
-                <ModeSwitcher mode={mode} onChange={handleModeChange} />
+                <div className="flex items-center justify-center gap-2">
+                  <ModeSwitcher mode={mode} onChange={handleModeChange} />
+                  <button
+                    type="button"
+                    onClick={() => setShowTemplatesModal(true)}
+                    className="inline-flex items-center gap-1.5 px-3.5 min-h-[44px] rounded-full border border-[#22222A]/85 bg-white text-[#14141B] text-[13px] font-medium shadow-[0_2px_10px_rgba(0,0,0,0.03)] hover:bg-[#FAFAFC] active:scale-95 transition-all"
+                  >
+                    <Sparkles className="w-3.5 h-3.5 text-[#6D4AFF]" />
+                    <span>Templates</span>
+                  </button>
+                </div>
 
                 <PromptComposer
                   mode={mode}
@@ -3831,14 +4063,24 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                       </p>
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('create')}
-                    className="shrink-0 inline-flex items-center gap-1.5 px-3.5 min-h-[36px] rounded-full bg-[#0B0B0F] text-white text-xs font-medium hover:bg-black/85 active:scale-95 transition-all"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>New</span>
-                  </button>
+                  <div className="shrink-0 flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowTemplatesModal(true)}
+                      className="inline-flex items-center gap-1.5 px-3 min-h-[36px] rounded-full border border-black/[0.1] bg-white text-[#0B0B0F] text-xs font-medium hover:bg-[#FAFAFC] active:scale-95 transition-all"
+                    >
+                      <Sparkles className="w-3.5 h-3.5 text-[#6D4AFF]" />
+                      <span>Templates</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('create')}
+                      className="inline-flex items-center gap-1.5 px-3.5 min-h-[36px] rounded-full bg-[#0B0B0F] text-white text-xs font-medium hover:bg-black/85 active:scale-95 transition-all"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>New</span>
+                    </button>
+                  </div>
                 </div>
 
                 {projects.length === 0 ? (
@@ -4035,6 +4277,12 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
 
       {headOverlayElement}
       {proModalElement}
+      <TemplatesGalleryModal
+        open={showTemplatesModal}
+        onClose={() => setShowTemplatesModal(false)}
+        onUseTemplatePrompt={handleUseTemplatePrompt}
+        onRemixApp={handleRemixApp}
+      />
     </>
   );
 }

@@ -20,6 +20,7 @@ import {
   MessageSquare,
   Monitor,
   MoreVertical,
+  MousePointerClick,
   Music,
   Paperclip,
   Pencil,
@@ -31,7 +32,10 @@ import {
   ShieldAlert,
   Smartphone,
   Square,
+  Tablet,
+  Terminal,
   Volume2,
+  Wand2,
   X,
 } from 'lucide-react';
 import { useSpeechNarration } from '../hooks/useSpeechNarration';
@@ -56,15 +60,85 @@ import {
   extractEditableCodeFiles,
 } from '../utils/codeFileEditor';
 import { buildProjectSecretHints } from '../utils/secretHints';
+import {
+  applyVisualPatchToHtml,
+  VisualElementSelection,
+} from '../utils/visualHtmlEditor';
 import { LivingBotanicalWallpaper } from './LivingBotanicalWallpaper';
 import { ModelSelectorPopover } from './ModelSelectorPopover';
 import {
+  DeploySubmitOptions,
   ProjectDatabaseModal,
   ProjectDeployModal,
   ProjectSecretsModal,
 } from './ProjectConfigDrawers';
 import { ProviderLogo } from './ProviderLogo';
 import { VoiceInputButton } from './VoiceInputButton';
+
+type PreviewDevicePreset = 'iphone' | 'android' | 'tablet' | 'desktop';
+
+interface PreviewConsoleEntry {
+  id: string;
+  level: 'log' | 'warn' | 'error';
+  message: string;
+  time: string;
+}
+
+const PREVIEW_DEVICE_SPECS: Record<
+  PreviewDevicePreset,
+  { label: string; dimensions: string; maxWidthClass: string; radiusClass: string }
+> = {
+  iphone: {
+    label: 'iPhone',
+    dimensions: '390×844',
+    maxWidthClass: 'max-w-[390px]',
+    radiusClass: 'rounded-3xl',
+  },
+  android: {
+    label: 'Android',
+    dimensions: '412×915',
+    maxWidthClass: 'max-w-[412px]',
+    radiusClass: 'rounded-[26px]',
+  },
+  tablet: {
+    label: 'Tablet',
+    dimensions: '768×1024',
+    maxWidthClass: 'max-w-[768px]',
+    radiusClass: 'rounded-2xl',
+  },
+  desktop: {
+    label: 'Desktop',
+    dimensions: 'Responsive',
+    maxWidthClass: 'max-w-[1120px]',
+    radiusClass: 'rounded-2xl',
+  },
+};
+
+function cssColorToHex(raw: string, fallback = '#0B0B0F'): string {
+  const val = (raw || '').trim();
+  if (/^#[0-9a-f]{6}$/i.test(val)) return val;
+  if (/^#[0-9a-f]{3}$/i.test(val)) {
+    return (
+      '#' +
+      val
+        .slice(1)
+        .split('')
+        .map((c) => c + c)
+        .join('')
+    );
+  }
+  const rgbMatch = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(val);
+  if (rgbMatch) {
+    if (val.includes('rgba') && /,\s*0(?:\.0+)?\s*\)$/.test(val)) {
+      return '';
+    }
+    const r = Math.min(255, Number(rgbMatch[1])).toString(16).padStart(2, '0');
+    const g = Math.min(255, Number(rgbMatch[2])).toString(16).padStart(2, '0');
+    const b = Math.min(255, Number(rgbMatch[3])).toString(16).padStart(2, '0');
+    return `#${r}${g}${b}`;
+  }
+  return fallback;
+}
 
 function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
   const cleaned = raw
@@ -134,7 +208,7 @@ interface BuilderWorkspaceProps {
   onUpdateSecrets: (next: ProjectSecret[]) => Promise<SecretSaveResult> | SecretSaveResult | void;
   onUpdateDatabase: (next: ProjectDatabaseConfig) => void;
   onUpdatePreviewHtml?: (nextHtml: string) => Promise<void> | void;
-  onDeployProject: (slug: string) => Promise<boolean> | void;
+  onDeployProject: (opts: DeploySubmitOptions) => Promise<boolean> | void;
   onBack: () => void;
   onSendFollowUp: (message: string, options: ComposerOptions) => void;
   onContinueTurn: (turn: BuilderTurn) => void;
@@ -212,7 +286,40 @@ export function BuilderWorkspace({
   const [codeSaveNotice, setCodeSaveNotice] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [previewSurfaceBg, setPreviewSurfaceBg] = useState<string>('#ffffff');
-  const [previewDevice, setPreviewDevice] = useState<'phone' | 'full'>('phone');
+  const [previewDevice, setPreviewDevice] = useState<PreviewDevicePreset>(
+    mode === 'mobile' ? 'iphone' : 'desktop'
+  );
+  const [visualInspectMode, setVisualInspectMode] = useState(false);
+  const [selectedVisualElement, setSelectedVisualElement] =
+    useState<VisualElementSelection | null>(null);
+  const [visualTextDraft, setVisualTextDraft] = useState('');
+  const [visualColorDraft, setVisualColorDraft] = useState('');
+  const [visualBgDraft, setVisualBgDraft] = useState('');
+  const [visualFontSizeDraft, setVisualFontSizeDraft] = useState('');
+  const [visualRadiusDraft, setVisualRadiusDraft] = useState('');
+  const [visualAiPrompt, setVisualAiPrompt] = useState('');
+  const [visualEditError, setVisualEditError] = useState<string | null>(null);
+  const [previewConsoleOpen, setPreviewConsoleOpen] = useState(false);
+  const [previewLogs, setPreviewLogs] = useState<PreviewConsoleEntry[]>([]);
+
+  useEffect(() => {
+    setPreviewDevice(mode === 'mobile' ? 'iphone' : 'desktop');
+    setVisualInspectMode(false);
+    setSelectedVisualElement(null);
+    setVisualEditError(null);
+    setPreviewLogs([]);
+  }, [projectId, mode]);
+
+  useEffect(() => {
+    try {
+      previewIframeRef.current?.contentWindow?.postMessage(
+        { type: 'aicraft:setInspect', enabled: visualInspectMode },
+        '*'
+      );
+    } catch {
+      // ignore iframe postMessage error
+    }
+  }, [visualInspectMode, previewKey]);
 
   const hasWorkingTurn = useMemo(
     () => turns.some((t) => t.phase === 'understanding' || t.phase === 'building'),
@@ -847,6 +954,126 @@ export function BuilderWorkspace({
   installSafeStorage('localStorage', kvCache, true);
   installSafeStorage('sessionStorage', sessionKvCache, false);
 
+  // Forward console output to AI Craft live console drawer
+  (function installConsoleBridge() {
+    var levels = ['log', 'warn', 'error'];
+    for (var i = 0; i < levels.length; i += 1) {
+      (function(lvl) {
+        var orig = console[lvl];
+        console[lvl] = function() {
+          try {
+            var parts = [];
+            for (var a = 0; a < arguments.length; a += 1) {
+              var item = arguments[a];
+              if (item instanceof Error) parts.push(item.message || String(item));
+              else if (typeof item === 'object' && item !== null) {
+                try { parts.push(JSON.stringify(item)); } catch (e) { parts.push(String(item)); }
+              } else parts.push(String(item));
+            }
+            window.parent.postMessage({ type: 'aicraft:console', level: lvl, message: parts.join(' ').slice(0, 600) }, '*');
+          } catch (e) {}
+          if (typeof orig === 'function') return orig.apply(console, arguments);
+        };
+      })(levels[i]);
+    }
+  })();
+
+  // Visual element inspector toggleable from parent Preview toolbar
+  (function installVisualInspector() {
+    var inspectActive = false;
+    var overlay = null;
+    var badge = null;
+    function ensureOverlay() {
+      if (overlay || !document.body) return;
+      overlay = document.createElement('div');
+      overlay.setAttribute('data-aicraft-inspector', '1');
+      overlay.style.cssText = 'position:fixed;pointer-events:none;z-index:99997;border:2px solid #6D4AFF;background:rgba(109,74,255,0.1);border-radius:4px;display:none;transition:all 60ms ease-out;';
+      badge = document.createElement('div');
+      badge.style.cssText = 'position:absolute;top:-22px;left:-2px;background:#6D4AFF;color:#fff;font-family:ui-monospace,monospace;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;white-space:nowrap;';
+      overlay.appendChild(badge);
+      document.body.appendChild(overlay);
+    }
+    function hideOverlay() {
+      if (overlay) overlay.style.display = 'none';
+    }
+    function buildSelector(el) {
+      if (!el || el.nodeType !== 1) return '';
+      if (el.id && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(el.id)) {
+        try {
+          if (document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) {
+            return '#' + CSS.escape(el.id);
+          }
+        } catch (e) {}
+      }
+      var parts = [];
+      var cur = el;
+      while (cur && cur.nodeType === 1 && cur !== document.documentElement) {
+        var tag = cur.tagName.toLowerCase();
+        if (cur.id && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(cur.id)) {
+          parts.unshift('#' + cur.id);
+          break;
+        }
+        var sibIndex = 1;
+        var sib = cur.previousElementSibling;
+        while (sib) {
+          if (sib.tagName === cur.tagName) sibIndex += 1;
+          sib = sib.previousElementSibling;
+        }
+        parts.unshift(tag + ':nth-of-type(' + sibIndex + ')');
+        if (cur === document.body) break;
+        cur = cur.parentElement;
+      }
+      return parts.join(' > ');
+    }
+    window.addEventListener('message', function(ev) {
+      if (ev.data && ev.data.type === 'aicraft:setInspect') {
+        inspectActive = Boolean(ev.data.enabled);
+        if (!inspectActive) hideOverlay();
+        if (document.documentElement) {
+          document.documentElement.style.cursor = inspectActive ? 'crosshair' : '';
+        }
+      }
+    });
+    document.addEventListener('mousemove', function(ev) {
+      if (!inspectActive) return;
+      var t = ev.target;
+      if (!t || t.nodeType !== 1 || (overlay && overlay.contains(t))) return;
+      ensureOverlay();
+      if (!overlay) return;
+      var rect = t.getBoundingClientRect();
+      overlay.style.display = 'block';
+      overlay.style.top = rect.top + 'px';
+      overlay.style.left = rect.left + 'px';
+      overlay.style.width = rect.width + 'px';
+      overlay.style.height = rect.height + 'px';
+      if (badge) badge.textContent = '<' + t.tagName.toLowerCase() + '>';
+    }, true);
+    document.addEventListener('click', function(ev) {
+      if (!inspectActive) return;
+      var t = ev.target;
+      if (!t || t.nodeType !== 1) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      var cs = window.getComputedStyle(t);
+      var selector = buildSelector(t);
+      var canEditText = t.children.length === 0;
+      window.parent.postMessage({
+        type: 'aicraft:elementSelected',
+        selection: {
+          selector: selector,
+          tagName: t.tagName.toLowerCase(),
+          text: canEditText ? String(t.textContent || '').trim() : '',
+          canEditText: canEditText,
+          color: cs.color || '',
+          backgroundColor: cs.backgroundColor || '',
+          fontSize: cs.fontSize || '',
+          borderRadius: cs.borderRadius || '',
+          outerHtmlSnippet: String(t.outerHTML || '').slice(0, 360)
+        }
+      }, '*');
+    }, true);
+  })();
+
   // Guard unprevented internal form submissions inside srcDoc so forms never reload/blank the preview
   window.addEventListener('submit', function(ev) {
     if (ev.defaultPrevented) return;
@@ -1074,11 +1301,18 @@ export function BuilderWorkspace({
     }, 350);
   }
   window.addEventListener('error', function(errEvent) {
-    showRuntimeFixBar((errEvent && errEvent.message) || '');
+    var m = (errEvent && errEvent.message) || '';
+    if (m) {
+      window.parent.postMessage({ type: 'aicraft:console', level: 'error', message: m }, '*');
+    }
+    showRuntimeFixBar(m);
   });
   window.addEventListener('unhandledrejection', function(rejEvent) {
     var r = rejEvent && rejEvent.reason;
     var text = r && r.message ? r.message : (typeof r === 'string' ? r : '');
+    if (text) {
+      window.parent.postMessage({ type: 'aicraft:console', level: 'error', message: 'Unhandled Promise: ' + text }, '*');
+    }
     showRuntimeFixBar(text);
   });
   function ask(prompt) {
@@ -1297,9 +1531,45 @@ export function BuilderWorkspace({
             prompt?: string;
             query?: string;
             instruction?: string;
+            level?: 'log' | 'warn' | 'error';
+            message?: string;
+            selection?: VisualElementSelection;
           }
         | undefined;
       if (!data?.type) return;
+
+      if (data.type === 'aicraft:console' && data.message) {
+        const lvl =
+          data.level === 'error' || data.level === 'warn' ? data.level : 'log';
+        const nowTime = new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        });
+        setPreviewLogs((prev) => [
+          ...prev.slice(-119),
+          {
+            id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            level: lvl,
+            message: String(data.message).slice(0, 600),
+            time: nowTime,
+          },
+        ]);
+        return;
+      }
+
+      if (data.type === 'aicraft:elementSelected' && data.selection?.selector) {
+        const sel = data.selection;
+        setSelectedVisualElement(sel);
+        setVisualTextDraft(sel.text || '');
+        setVisualColorDraft(cssColorToHex(sel.color, '#0B0B0F'));
+        setVisualBgDraft(cssColorToHex(sel.backgroundColor, ''));
+        setVisualFontSizeDraft(sel.fontSize || '');
+        setVisualRadiusDraft(sel.borderRadius || '');
+        setVisualAiPrompt('');
+        setVisualEditError(null);
+        return;
+      }
 
       if (data.type === 'aicraft:kv' && data.op) {
         const kvPrefix = `aicraft_kv_${projectId}_`;
@@ -1808,80 +2078,437 @@ export function BuilderWorkspace({
     }
   };
 
-  // Preview Mode: framed app preview (never edge-to-edge full-screen on
-  // mobile) with a top bar + a thumb-reachable bottom toolbar — every main
-  // action sits in the lower half of the screen where a hand can reach it.
+  // Preview Mode: framed app preview with device presets, click-to-edit visual inspector,
+  // live console with 1-click "Fix with AI", and thumb-reachable bottom toolbar.
   if (activeView === 'preview') {
-    const previewFrameClass =
-      previewDevice === 'phone'
-        ? 'max-w-[430px] rounded-3xl'
-        : 'max-w-[1100px] rounded-2xl';
+    const deviceSpec = PREVIEW_DEVICE_SPECS[previewDevice];
+    const consoleErrorCount = previewLogs.filter((l) => l.level === 'error').length;
+
+    const triggerPreviewAiInstruction = (instruction: string) => {
+      if (!instruction.trim() || isRestricted || isStreaming) return;
+      onSetView('chat');
+      onSendFollowUp(instruction.trim(), buildFollowUpOptions());
+    };
+
+    const handleApplyVisualPatch = async () => {
+      if (!selectedVisualElement || !onUpdatePreviewHtml) return;
+      setVisualEditError(null);
+      const res = applyVisualPatchToHtml(
+        latestPreviewHtml,
+        selectedVisualElement.selector,
+        {
+          text: selectedVisualElement.canEditText ? visualTextDraft : undefined,
+          color: visualColorDraft || undefined,
+          backgroundColor: visualBgDraft || undefined,
+          fontSize: visualFontSizeDraft || undefined,
+          borderRadius: visualRadiusDraft || undefined,
+        }
+      );
+      if (res.ok === false) {
+        setVisualEditError(res.error);
+        return;
+      }
+      await onUpdatePreviewHtml(res.html);
+      setSelectedVisualElement(null);
+    };
+
     return (
       <div className="relative h-dvh w-full flex flex-col overflow-hidden bg-[#F4F4F5]">
-        {/* Top bar — back + title + view controls (always visible) */}
+        {/* Top bar — back + title + device frame presets + Inspect/Console/Refresh */}
         <header className="shrink-0 w-full bg-white/95 backdrop-blur border-b border-black/[0.07] pt-safe">
-          <div className="w-full max-w-[1100px] mx-auto px-2.5 py-2 flex items-center gap-2">
+          <div className="w-full max-w-[1180px] mx-auto px-2.5 py-2 flex items-center gap-2">
             <button
               type="button"
               onClick={() => onSetView('chat')}
               aria-label="Back to chat"
-              className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#0B0B0F] hover:bg-black/[0.05] active:scale-95 transition-all shrink-0"
+              className="min-w-[38px] min-h-[38px] rounded-full flex items-center justify-center text-[#0B0B0F] hover:bg-black/[0.05] active:scale-95 transition-all shrink-0"
             >
               <ChevronLeft className="w-6 h-6 stroke-[2]" />
             </button>
             <div className="min-w-0 flex-1">
-              <h1 className="font-display font-bold text-[15px] tracking-[-0.02em] text-[#0B0B0F] truncate">
+              <h1 className="font-display font-bold text-[14.5px] tracking-[-0.02em] text-[#0B0B0F] truncate">
                 {projectTitle}
               </h1>
               <p className="text-[11px] text-[#71717A] truncate">
-                {isStreaming ? 'Building your app…' : hasBuiltApp ? 'Live preview' : 'Nothing built yet'}
+                {isStreaming
+                  ? 'Building your app…'
+                  : visualInspectMode
+                    ? 'Inspect active · Tap any element to edit'
+                    : hasBuiltApp
+                      ? `${deviceSpec.label} · ${deviceSpec.dimensions}`
+                      : 'Nothing built yet'}
               </p>
             </div>
+
+            {/* Device Frame Presets */}
+            <div
+              role="group"
+              aria-label="Device frame presets"
+              className="hidden sm:inline-flex items-center gap-0.5 p-1 rounded-xl bg-black/[0.04] border border-black/[0.06] shrink-0"
+            >
+              {(
+                [
+                  { id: 'iphone', Icon: Smartphone, label: 'iPhone (390×844)' },
+                  { id: 'android', Icon: Smartphone, label: 'Android (412×915)' },
+                  { id: 'tablet', Icon: Tablet, label: 'Tablet (768×1024)' },
+                  { id: 'desktop', Icon: Monitor, label: 'Desktop (Responsive)' },
+                ] as const
+              ).map(({ id, Icon, label }) => {
+                const active = previewDevice === id;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => setPreviewDevice(id)}
+                    title={label}
+                    aria-label={label}
+                    className={`h-7 px-2 rounded-lg text-[11px] font-medium inline-flex items-center gap-1 transition-all ${
+                      active
+                        ? 'bg-white text-[#0B0B0F] shadow-xs'
+                        : 'text-[#52525B] hover:text-[#0B0B0F]'
+                    }`}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                    <span className="hidden md:inline capitalize">{id}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Mobile compact device cycle button */}
             <button
               type="button"
-              onClick={() => setPreviewDevice((d) => (d === 'phone' ? 'full' : 'phone'))}
-              aria-label={previewDevice === 'phone' ? 'Fit to width' : 'Phone size'}
-              title={previewDevice === 'phone' ? 'Fit to width' : 'Phone size'}
-              className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#52525B] hover:bg-black/[0.05] active:scale-95 transition-all shrink-0"
+              onClick={() => {
+                const order: PreviewDevicePreset[] = ['iphone', 'android', 'tablet', 'desktop'];
+                setPreviewDevice((d) => order[(order.indexOf(d) + 1) % order.length]);
+              }}
+              aria-label="Switch device frame size"
+              title={`Device: ${deviceSpec.label} (${deviceSpec.dimensions})`}
+              className="sm:hidden min-w-[36px] min-h-[36px] rounded-full flex items-center justify-center text-[#52525B] hover:bg-black/[0.05] shrink-0"
             >
-              {previewDevice === 'phone' ? (
-                <Monitor className="w-5 h-5" />
+              {previewDevice === 'desktop' ? (
+                <Monitor className="w-4 h-4" />
+              ) : previewDevice === 'tablet' ? (
+                <Tablet className="w-4 h-4" />
               ) : (
-                <Smartphone className="w-5 h-5" />
+                <Smartphone className="w-4 h-4" />
               )}
             </button>
+
+            {/* Visual Inspector Toggle */}
+            <button
+              type="button"
+              disabled={!hasBuiltApp}
+              onClick={() => {
+                setVisualInspectMode((v) => !v);
+                if (visualInspectMode) setSelectedVisualElement(null);
+              }}
+              aria-label="Toggle click-to-edit visual inspector"
+              title="Click-to-Edit Visual Inspector"
+              className={`h-9 px-2.5 rounded-full flex items-center justify-center gap-1 text-[11.5px] font-semibold transition-all shrink-0 disabled:opacity-40 ${
+                visualInspectMode
+                  ? 'bg-[#6D4AFF] text-white shadow-xs'
+                  : 'text-[#52525B] hover:bg-black/[0.05]'
+              }`}
+            >
+              <MousePointerClick className="w-4 h-4" />
+              <span className="hidden md:inline">Inspect</span>
+            </button>
+
+            {/* Live Console Toggle */}
+            <button
+              type="button"
+              onClick={() => setPreviewConsoleOpen((v) => !v)}
+              aria-label="Toggle live runtime console"
+              title="Live Runtime Console"
+              className={`relative h-9 px-2.5 rounded-full flex items-center justify-center gap-1 text-[11.5px] font-semibold transition-all shrink-0 ${
+                previewConsoleOpen
+                  ? 'bg-[#0B0B0F] text-white'
+                  : 'text-[#52525B] hover:bg-black/[0.05]'
+              }`}
+            >
+              <Terminal className="w-4 h-4" />
+              <span className="hidden md:inline">Console</span>
+              {consoleErrorCount > 0 && (
+                <span className="ml-0.5 px-1.5 py-0.2 rounded-full bg-red-500 text-white text-[10px] font-bold tabular-nums">
+                  {consoleErrorCount}
+                </span>
+              )}
+            </button>
+
             <button
               type="button"
               onClick={() => setPreviewKey((k) => k + 1)}
               aria-label="Refresh preview"
               title="Refresh preview"
-              className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#52525B] hover:bg-black/[0.05] active:scale-95 transition-all shrink-0"
+              className="min-w-[36px] min-h-[36px] rounded-full flex items-center justify-center text-[#52525B] hover:bg-black/[0.05] active:scale-95 transition-all shrink-0"
             >
-              <RotateCw className="w-5 h-5" />
+              <RotateCw className="w-4 h-4" />
             </button>
           </div>
         </header>
 
-        {/* Framed preview — NOT full-screen; phone frame keeps controls reachable */}
-        <div className="flex-1 min-h-0 flex items-stretch justify-center overflow-hidden px-3 py-3">
-          <div
-            className={`relative w-full overflow-hidden border border-black/10 bg-white shadow-[0_10px_36px_rgba(0,0,0,0.14)] ${previewFrameClass}`}
-            style={{ backgroundColor: hasBuiltApp ? previewSurfaceBg : '#070B14' }}
-          >
-            {hasBuiltApp ? (
-              <iframe
-                ref={previewIframeRef}
-                key={`${projectId}-${previewKey}-${secretsFingerprint}`}
-                title={`${projectTitle} Preview`}
-                src={previewObjectUrl ?? undefined}
-                sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads"
-                className="w-full h-full border-0 block bg-transparent"
-              />
-            ) : (
-              <LivingBotanicalWallpaper isBuilding={isStreaming} />
-            )}
+        {/* Framed preview + optional Visual Inspector side/bottom drawer */}
+        <div className="flex-1 min-h-0 flex flex-col lg:flex-row items-stretch justify-center overflow-hidden px-3 py-3 gap-3">
+          <div className="flex-1 min-h-0 flex items-stretch justify-center overflow-hidden">
+            <div
+              className={`relative w-full overflow-hidden border border-black/10 bg-white shadow-[0_10px_36px_rgba(0,0,0,0.14)] transition-all duration-200 ${deviceSpec.maxWidthClass} ${deviceSpec.radiusClass}`}
+              style={{ backgroundColor: hasBuiltApp ? previewSurfaceBg : '#070B14' }}
+            >
+              {hasBuiltApp ? (
+                <iframe
+                  ref={previewIframeRef}
+                  key={`${projectId}-${previewKey}-${secretsFingerprint}`}
+                  title={`${projectTitle} Preview`}
+                  src={previewObjectUrl ?? undefined}
+                  onLoad={() => {
+                    try {
+                      previewIframeRef.current?.contentWindow?.postMessage(
+                        { type: 'aicraft:setInspect', enabled: visualInspectMode },
+                        '*'
+                      );
+                    } catch {
+                      // ignore iframe message error
+                    }
+                  }}
+                  sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads"
+                  className="w-full h-full border-0 block bg-transparent"
+                />
+              ) : (
+                <LivingBotanicalWallpaper isBuilding={isStreaming} />
+              )}
+            </div>
           </div>
+
+          {/* Click-to-Edit Visual Inspector Drawer */}
+          {selectedVisualElement && hasBuiltApp && (
+            <aside
+              aria-label="Visual Element Inspector"
+              className="shrink-0 w-full lg:w-[320px] max-h-[42dvh] lg:max-h-full overflow-y-auto rounded-2xl border border-black/[0.1] bg-white shadow-[0_10px_30px_rgba(11,11,15,0.12)] p-3.5 flex flex-col gap-3"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <span className="inline-flex items-center gap-1 text-[11px] font-mono font-bold text-[#6D4AFF]">
+                    &lt;{selectedVisualElement.tagName}&gt;
+                  </span>
+                  <p className="text-[11px] font-mono text-[#71717A] truncate">
+                    {selectedVisualElement.selector}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedVisualElement(null)}
+                  aria-label="Close element inspector"
+                  className="w-7 h-7 rounded-full flex items-center justify-center text-[#52525B] hover:bg-black/[0.05]"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {selectedVisualElement.canEditText && (
+                <div>
+                  <label className="block text-[11px] font-medium text-[#52525B] mb-1">
+                    Element Text
+                  </label>
+                  <input
+                    type="text"
+                    value={visualTextDraft}
+                    onChange={(e) => setVisualTextDraft(e.target.value)}
+                    className="w-full h-8 px-2.5 rounded-lg border border-black/[0.12] bg-[#FAFAFC] text-[12.5px] text-[#0B0B0F] focus:outline-none focus:border-[#6D4AFF]"
+                  />
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-[11px] font-medium text-[#52525B] mb-1">
+                    Text Color
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="color"
+                      value={visualColorDraft || '#0B0B0F'}
+                      onChange={(e) => setVisualColorDraft(e.target.value)}
+                      className="w-8 h-8 rounded border border-black/10 p-0.5 cursor-pointer bg-white"
+                    />
+                    <input
+                      type="text"
+                      value={visualColorDraft}
+                      onChange={(e) => setVisualColorDraft(e.target.value)}
+                      className="min-w-0 flex-1 h-8 px-2 rounded-lg border border-black/[0.12] bg-[#FAFAFC] font-mono text-[11px]"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-medium text-[#52525B] mb-1">
+                    Background
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="color"
+                      value={visualBgDraft || '#FFFFFF'}
+                      onChange={(e) => setVisualBgDraft(e.target.value)}
+                      className="w-8 h-8 rounded border border-black/10 p-0.5 cursor-pointer bg-white"
+                    />
+                    <input
+                      type="text"
+                      value={visualBgDraft}
+                      onChange={(e) => setVisualBgDraft(e.target.value)}
+                      placeholder="transparent"
+                      className="min-w-0 flex-1 h-8 px-2 rounded-lg border border-black/[0.12] bg-[#FAFAFC] font-mono text-[11px]"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-medium text-[#52525B] mb-1">
+                    Font Size
+                  </label>
+                  <input
+                    type="text"
+                    value={visualFontSizeDraft}
+                    onChange={(e) => setVisualFontSizeDraft(e.target.value)}
+                    placeholder="16px"
+                    className="w-full h-8 px-2 rounded-lg border border-black/[0.12] bg-[#FAFAFC] font-mono text-[11.5px]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-medium text-[#52525B] mb-1">
+                    Border Radius
+                  </label>
+                  <input
+                    type="text"
+                    value={visualRadiusDraft}
+                    onChange={(e) => setVisualRadiusDraft(e.target.value)}
+                    placeholder="12px"
+                    className="w-full h-8 px-2 rounded-lg border border-black/[0.12] bg-[#FAFAFC] font-mono text-[11.5px]"
+                  />
+                </div>
+              </div>
+
+              {visualEditError && (
+                <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
+                  {visualEditError}
+                </p>
+              )}
+
+              <button
+                type="button"
+                disabled={isStreaming || !onUpdatePreviewHtml}
+                onClick={() => void handleApplyVisualPatch()}
+                className="w-full h-9 rounded-xl bg-[#0B0B0F] hover:bg-black/85 disabled:opacity-50 text-white text-[12px] font-semibold inline-flex items-center justify-center gap-1.5"
+              >
+                <Save className="w-3.5 h-3.5" />
+                <span>Apply Direct Edit</span>
+              </button>
+
+              <div className="pt-2 border-t border-black/[0.06] flex flex-col gap-1.5">
+                <label className="text-[11px] font-semibold text-[#52525B]">
+                  Or describe a smart AI edit for this element
+                </label>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={visualAiPrompt}
+                    onChange={(e) => setVisualAiPrompt(e.target.value)}
+                    placeholder="e.g. Make it pop with a gradient pill"
+                    className="flex-1 min-w-0 h-8 px-2.5 rounded-lg border border-black/[0.12] bg-[#FAFAFC] text-[12px] focus:outline-none focus:border-[#6D4AFF]"
+                  />
+                  <button
+                    type="button"
+                    disabled={!visualAiPrompt.trim() || isStreaming || isRestricted}
+                    onClick={() => {
+                      const instruction = `Update the <${selectedVisualElement.tagName}> element matching "${selectedVisualElement.selector}" (HTML snippet: ${selectedVisualElement.outerHtmlSnippet.slice(0, 180)}): ${visualAiPrompt.trim()}`;
+                      setVisualInspectMode(false);
+                      setSelectedVisualElement(null);
+                      triggerPreviewAiInstruction(instruction);
+                    }}
+                    className="h-8 px-2.5 rounded-lg bg-[#6D4AFF] hover:bg-[#5B35F5] disabled:opacity-50 text-white text-[11.5px] font-semibold inline-flex items-center gap-1 shrink-0"
+                  >
+                    <Wand2 className="w-3 h-3" />
+                    <span>AI</span>
+                  </button>
+                </div>
+              </div>
+            </aside>
+          )}
         </div>
+
+        {/* Collapsible Live Runtime Console Drawer */}
+        {previewConsoleOpen && (
+          <div className="shrink-0 w-full max-w-[1180px] mx-auto px-3 pb-2">
+            <div className="rounded-2xl bg-[#111118] text-[#E4E4E7] border border-white/10 shadow-lg overflow-hidden">
+              <div className="px-3.5 py-2 bg-[#1A1A24] border-b border-white/10 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-[11.5px] font-mono">
+                  <Terminal className="w-3.5 h-3.5 text-[#8B5CF6]" />
+                  <span className="font-semibold text-white">Live Console</span>
+                  <span className="text-[#A1A1AA]">({previewLogs.length})</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {previewLogs.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setPreviewLogs([])}
+                      className="text-[11px] text-[#A1A1AA] hover:text-white px-2 py-0.5 rounded bg-white/5"
+                    >
+                      Clear
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setPreviewConsoleOpen(false)}
+                    aria-label="Close console"
+                    className="text-[#A1A1AA] hover:text-white p-0.5"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+              <div className="max-h-[140px] overflow-y-auto p-2.5 font-mono text-[11.5px] flex flex-col gap-1">
+                {previewLogs.length === 0 ? (
+                  <p className="text-[#71717A] px-1 py-2">
+                    No console messages or errors captured yet.
+                  </p>
+                ) : (
+                  previewLogs.map((entry) => (
+                    <div
+                      key={entry.id}
+                      className={`px-2 py-1 rounded-lg flex items-start justify-between gap-2 ${
+                        entry.level === 'error'
+                          ? 'bg-red-500/15 text-red-200'
+                          : entry.level === 'warn'
+                            ? 'bg-amber-500/15 text-amber-200'
+                            : 'text-[#D4D4D8]'
+                      }`}
+                    >
+                      <span className="text-[#71717A] shrink-0 text-[10.5px]">
+                        {entry.time}
+                      </span>
+                      <span className="flex-1 break-words">{entry.message}</span>
+                      {entry.level === 'error' && (
+                        <button
+                          type="button"
+                          disabled={isStreaming || isRestricted}
+                          onClick={() =>
+                            triggerPreviewAiInstruction(
+                              `Fix this runtime error cleanly so every button, tab, form, and screen works without errors: ${entry.message}`
+                            )
+                          }
+                          className="shrink-0 px-2 py-0.5 rounded bg-[#6D4AFF] hover:bg-[#5B35F5] text-white text-[10.5px] font-sans font-semibold inline-flex items-center gap-1"
+                        >
+                          <Wand2 className="w-3 h-3" />
+                          <span>Fix with AI</span>
+                        </button>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Bottom toolbar — thumb zone: every key action within easy reach */}
         <footer className="shrink-0 w-full bg-white/95 backdrop-blur border-t border-black/[0.07] pb-safe">
@@ -3116,7 +3743,7 @@ export function BuilderWorkspace({
         databaseConfig={databaseConfig}
         deployment={deployment}
         onClose={() => setActiveDrawer(null)}
-        onDeploy={(slug) => onDeployProject(slug)}
+        onDeploy={(opts) => onDeployProject(opts)}
         onOpenPreview={() => onSetView('preview')}
         onOpenCode={() => onSetView('code')}
         onShare={handleShare}
