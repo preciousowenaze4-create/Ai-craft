@@ -204,7 +204,7 @@ export function filterPublicSafeEnv(
   for (const [key, val] of Object.entries(env)) {
     if (!key || typeof val !== 'string' || !val) continue;
     const isPrivate =
-      /(?:secret|service_role|private|password|passwd|webhook|signing|admin|oauth_client_secret|openrouter|gemini_api_key|openai_api_key|hugging_?face|hf_token|ngrok_api_key)/i.test(
+      /(?:secret|service_role|private|password|passwd|webhook|signing|admin|oauth_client_secret|agent_?router|openrouter|gemini_api_key|openai_api_key|hugging_?face|hf_token|ngrok_api_key)/i.test(
         key
       ) || /^sk_(?:live|test)_/i.test(val);
     if (!isPrivate) {

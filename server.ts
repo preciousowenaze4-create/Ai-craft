@@ -76,7 +76,12 @@ import {
   generateMediaAsset,
   type GeneratedMediaResult,
 } from './api/_mediaService.js';
-import { getFreeAiMeshStatus, getFreeMeshModelOptions } from './api/_freeAiMesh.js';
+import {
+  getFreeAiMeshStatus,
+  getFreeMeshModelOptions,
+  isAgentRouterConfigured,
+  refreshAgentRouterModelsIfConfigured,
+} from './api/_freeAiMesh.js';
 import { cleanEnvKey } from './api/_openrouterModels.js';
 import {
   ModerationActionType,
@@ -198,20 +203,52 @@ function createBackendSupabaseClient(useImplicitFlow = false) {
   });
 }
 
+function isLocalHostHeader(host: string): boolean {
+  const hostname = host.split(':')[0]?.toLowerCase() || '';
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0';
+}
+
 function getAppBaseUrl(req?: express.Request): string {
-  const envUrl = cleanEnvKey(process.env.APP_URL, ['MY_APP_URL']);
-  if (envUrl) return envUrl.replace(/\/+$/, '');
   if (req) {
+    const forwardedHost = String(req.headers['x-forwarded-host'] || '')
+      .split(',')[0]
+      ?.trim();
+    const forwardedProto =
+      String(req.headers['x-forwarded-proto'] || '')
+        .split(',')[0]
+        ?.trim() || 'https';
+    if (forwardedHost && !isLocalHostHeader(forwardedHost)) {
+      return `${forwardedProto}://${forwardedHost}`.replace(/\/+$/, '');
+    }
+
+    const hostHeader = String(req.get('host') || '').trim();
+    if (hostHeader && !isLocalHostHeader(hostHeader)) {
+      const proto =
+        String(req.headers['x-forwarded-proto'] || '')
+          .split(',')[0]
+          ?.trim() ||
+        req.protocol ||
+        'https';
+      return `${proto}://${hostHeader}`.replace(/\/+$/, '');
+    }
+  }
+
+  const envUrl = cleanEnvKey(process.env.APP_URL, ['MY_APP_URL']);
+  if (envUrl && /^https?:\/\//i.test(envUrl)) {
+    return envUrl.replace(/\/+$/, '');
+  }
+
+  if (req) {
+    const host =
+      String(req.headers['x-forwarded-host'] || '')
+        .split(',')[0]
+        ?.trim() || req.get('host');
     const proto =
       String(req.headers['x-forwarded-proto'] || '')
         .split(',')[0]
         ?.trim() ||
       req.protocol ||
       'http';
-    const host =
-      String(req.headers['x-forwarded-host'] || '')
-        .split(',')[0]
-        ?.trim() || req.get('host');
     if (host) return `${proto}://${host}`.replace(/\/+$/, '');
   }
   return `http://localhost:${PORT}`;
@@ -541,10 +578,12 @@ async function startServer() {
   app.get('/api/health', (_req, res) => {
     const sbConfig = getSupabaseConfig();
     const mesh = getFreeAiMeshStatus();
+    const agentRouterConfigured = isAgentRouterConfigured();
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       ok: true,
       geminiConfigured: Boolean(getServerGeminiApiKey()),
+      agentRouterConfigured,
       serverFreeAiReady: mesh.hasAny,
       freeAiMesh: {
         hasAny: mesh.hasAny,
@@ -564,10 +603,15 @@ async function startServer() {
   app.get('/api/auth/config', (req, res) => {
     const sbConfig = getSupabaseConfig();
     const callbackUrl = `${getAppBaseUrl(req)}/api/auth/callback`;
+    const missingVars: string[] = [];
+    if (!sbConfig.url) missingVars.push('SUPABASE_URL');
+    if (!sbConfig.anonKey) missingVars.push('SUPABASE_ANON_KEY');
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
       callbackUrl,
+      missingVars,
+      providers: ['google', 'apple', 'github', 'email'],
     });
   });
 
@@ -1313,7 +1357,10 @@ async function startServer() {
           var noTokenMsg = 'Authorization code received. Please enable Implicit OAuth flow in Supabase or use Email sign-in.';
           titleEl.textContent = 'Authorization code received';
           statusEl.textContent = noTokenMsg;
-          if (!window.opener) {
+          if (window.opener) {
+            window.opener.postMessage({ type: 'OAUTH_AUTH_ERROR', message: noTokenMsg }, '*');
+            setTimeout(function () { window.close(); }, 1600);
+          } else {
             setTimeout(function () {
               window.location.replace('/?auth_error=' + encodeURIComponent(noTokenMsg));
             }, 900);
@@ -2383,12 +2430,31 @@ async function startServer() {
     }
   });
 
-  app.get('/api/models', (_req, res) => {
+  app.get('/api/models', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
+    if (req.query.refresh === '1') {
+      await refreshAgentRouterModelsIfConfigured().catch(() => {});
+    }
     const mesh = getFreeAiMeshStatus();
+    const agentRouterConfigured = isAgentRouterConfigured();
+    const agentRouterStatus = mesh.providers.find((p) => p.id === 'agentrouter');
     res.json({
       models: getFreeMeshModelOptions(),
       gateways: [
+        ...(agentRouterConfigured
+          ? [
+              {
+                id: 'agentrouter',
+                label: 'AgentRouter · Primary Brain',
+                baseUrl:
+                  (process.env.AGENTROUTER_BASE_URL || 'https://co.agentrouter.org/v1').trim(),
+                configured: true,
+                keyCount: 1,
+                modelCount: agentRouterStatus?.modelCount || 0,
+                defaultModel: 'agentrouter::auto',
+              },
+            ]
+          : []),
         {
           id: 'free-mesh',
           label: 'Free AI Mesh',
@@ -2396,10 +2462,11 @@ async function startServer() {
           configured: mesh.hasAny,
           keyCount: 0,
           modelCount: mesh.modelPool.activeModels,
-          defaultModel: 'mesh::auto',
+          defaultModel: agentRouterConfigured ? 'agentrouter::auto' : 'mesh::auto',
         },
       ],
       geminiConfigured: false,
+      agentRouterConfigured,
       serverFreeAiReady: mesh.hasAny,
       pollinationsConfigured: mesh.pollinationsConfigured,
       puterConfigured: false,
@@ -2411,7 +2478,7 @@ async function startServer() {
         modelPool: mesh.modelPool,
       },
       modelPool: mesh.modelPool,
-      freeOnly: true,
+      freeOnly: !agentRouterConfigured,
     });
   });
 
@@ -3180,13 +3247,20 @@ async function startServer() {
         },
       });
 
+      const agentRouterPrimary =
+        isAgentRouterConfigured() &&
+        (!requestedModel || requestedModel.startsWith('agentrouter::'));
+
       sendEvent({
         type: 'meta',
         kind: prepared.naturalMediaIntent ? 'media' : 'chat',
-        modelId: requestedModel || 'mesh::auto',
-        modelName: prepared.requestedModelLabel || 'Free AI Mesh · Auto',
-        provider: 'free-mesh',
-        gateway: 'mesh',
+        modelId:
+          requestedModel || (agentRouterPrimary ? 'agentrouter::auto' : 'mesh::auto'),
+        modelName:
+          prepared.requestedModelLabel ||
+          (agentRouterPrimary ? 'AgentRouter · Auto' : 'Free AI Mesh · Auto'),
+        provider: agentRouterPrimary ? 'agentrouter' : 'free-mesh',
+        gateway: agentRouterPrimary ? 'agentrouter' : 'mesh',
         isFallback: false,
       });
 
@@ -3243,9 +3317,12 @@ async function startServer() {
       let lastPreviewBytesSent = 0;
       let emittedReasoningPhase = false;
 
-      let activeModelUsed = requestedModel || 'mesh::auto';
-      let activeModelName = prepared.requestedModelLabel || 'Free AI Mesh · Auto';
-      let activeProvider = 'free-mesh';
+      let activeModelUsed =
+        requestedModel || (agentRouterPrimary ? 'agentrouter::auto' : 'mesh::auto');
+      let activeModelName =
+        prepared.requestedModelLabel ||
+        (agentRouterPrimary ? 'AgentRouter · Auto' : 'Free AI Mesh · Auto');
+      let activeProvider = agentRouterPrimary ? 'agentrouter' : 'free-mesh';
       let parallelMergedRaw: string | null = null;
 
       let lastReasoningUpdateAt = 0;

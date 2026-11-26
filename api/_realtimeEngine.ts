@@ -41,6 +41,7 @@ import {
 import { recordGeminiApiUsage } from './_geminiUsage.js';
 import {
   completeFreeAiMesh,
+  isAgentRouterConfigured,
   isFreeAiMeshAvailable,
   isMeshParallelBuildsEnabled,
   streamFreeAiMesh,
@@ -476,8 +477,13 @@ export async function prepareRealtimePrompt(
 
   const systemPrompt = buildCraftSystemPrompt({
     mediaKind,
-    requestedModel: input.requestedModel || 'mesh::auto',
-    requestedModelLabel: executionPlan.requestedModelLabel,
+    requestedModel:
+      input.requestedModel ||
+      (isAgentRouterConfigured() ? 'agentrouter::auto' : 'mesh::auto'),
+    requestedModelLabel:
+      !input.requestedModel && isAgentRouterConfigured()
+        ? 'AgentRouter · Auto (Primary Brain)'
+        : executionPlan.requestedModelLabel,
     initialRoute,
     shouldGenerateTitle,
     timeContext,
@@ -939,6 +945,7 @@ async function runParallelBuildAgents(
   const runSideAgent = (role: 'designer' | 'engineer') =>
     completeFreeAiMesh({
       taskKind: 'build',
+      requestedModel: params.requestedModel,
       systemPrompt: withMeshRoleDirective(params.systemPrompt, role),
       historyMessages: params.historyMessages,
       userPrompt: params.userPrompt,
@@ -980,6 +987,7 @@ async function runParallelBuildAgents(
   const runArchitectLane = () =>
     streamFreeAiMesh({
       taskKind: 'build',
+      requestedModel: params.requestedModel,
       systemPrompt: withMeshRoleDirective(params.systemPrompt, 'architect'),
       historyMessages: params.historyMessages,
       userPrompt: params.userPrompt,
@@ -1046,6 +1054,7 @@ export async function streamServerFreeAiRealTime(
   const runFreeAiMeshLane = () =>
     streamFreeAiMesh({
       taskKind,
+      requestedModel: params.requestedModel,
       systemPrompt: params.systemPrompt,
       historyMessages: params.historyMessages,
       userPrompt: params.userPrompt,

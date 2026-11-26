@@ -302,7 +302,7 @@ export function ProfileSection({
       </div>
 
       {profileTab === 'account' ? (
-        <div className="flex-1 min-h-0 flex flex-col justify-between gap-1.5 overflow-hidden">
+        <div className="flex-1 min-h-0 flex flex-col justify-between gap-1.5 overflow-y-auto overscroll-contain">
           {/* Centered Profile Identity Card (Picture straight in middle, edit badge straight at bottom-middle) */}
           <div className="rounded-[16px] border border-black/[0.08] bg-white px-3 pt-2.5 pb-2 shadow-[0_4px_16px_rgba(15,15,30,0.03)] shrink-0">
             <div className="flex flex-col items-center text-center">
@@ -381,6 +381,21 @@ export function ProfileSection({
                 <p className="text-[11px] text-[#71717A] truncate max-w-full mt-0.5">
                   {profile.email}
                 </p>
+                {authUser?.provider && (
+                  <span className="mt-1 inline-flex items-center gap-1 px-2 py-[1px] rounded-full bg-[#F4F4F6] text-[10px] font-medium text-[#52525B]">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                    <span>
+                      Supabase ·{' '}
+                      {authUser.provider === 'google'
+                        ? 'Google'
+                        : authUser.provider === 'apple'
+                          ? 'Apple'
+                          : authUser.provider === 'github'
+                            ? 'GitHub'
+                            : 'Email'}
+                    </span>
+                  </span>
+                )}
               </div>
             </div>
 

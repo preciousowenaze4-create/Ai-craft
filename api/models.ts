@@ -1,14 +1,38 @@
 import { hasServerFreeAiKey } from './_aiGateways.js';
-import { getFreeAiMeshStatus, getFreeMeshModelOptions } from './_freeAiMesh.js';
+import {
+  getFreeAiMeshStatus,
+  getFreeMeshModelOptions,
+  isAgentRouterConfigured,
+  refreshAgentRouterModelsIfConfigured,
+} from './_freeAiMesh.js';
 
 export async function GET(request: Request): Promise<Response> {
   try {
+    const reqUrl = new URL(request.url, 'http://localhost');
+    if (reqUrl.searchParams.get('refresh') === '1' && isAgentRouterConfigured()) {
+      await refreshAgentRouterModelsIfConfigured().catch(() => []);
+    }
     const mesh = getFreeAiMeshStatus();
+    const agentRouterConfigured = isAgentRouterConfigured();
 
     return Response.json(
       {
         models: getFreeMeshModelOptions(),
         gateways: [
+          ...(agentRouterConfigured
+            ? [
+                {
+                  id: 'agentrouter',
+                  label: 'AgentRouter',
+                  baseUrl: (process.env.AGENTROUTER_BASE_URL || 'https://co.agentrouter.org/v1').trim(),
+                  configured: true,
+                  keyCount: 1,
+                  modelCount:
+                    mesh.providers.find((p) => p.id === 'agentrouter')?.modelCount || 11,
+                  defaultModel: 'agentrouter::auto',
+                },
+              ]
+            : []),
           {
             id: 'free-mesh',
             label: 'Free AI Mesh',
@@ -19,6 +43,7 @@ export async function GET(request: Request): Promise<Response> {
             defaultModel: 'mesh::auto',
           },
         ],
+        agentRouterConfigured,
         geminiConfigured: false,
         serverFreeAiReady: mesh.hasAny,
         pollinationsConfigured: mesh.pollinationsConfigured,
@@ -31,7 +56,7 @@ export async function GET(request: Request): Promise<Response> {
           modelPool: mesh.modelPool,
         },
         modelPool: mesh.modelPool,
-        freeOnly: true,
+        freeOnly: !agentRouterConfigured,
       },
       {
         headers: {
@@ -44,6 +69,7 @@ export async function GET(request: Request): Promise<Response> {
     return Response.json(
       {
         models: getFreeMeshModelOptions(),
+        agentRouterConfigured: isAgentRouterConfigured(),
         geminiConfigured: hasServerFreeAiKey(),
         serverFreeAiReady: mesh.hasAny,
         pollinationsConfigured: mesh.pollinationsConfigured,
@@ -56,7 +82,7 @@ export async function GET(request: Request): Promise<Response> {
           modelPool: mesh.modelPool,
         },
         modelPool: mesh.modelPool,
-        freeOnly: true,
+        freeOnly: !isAgentRouterConfigured(),
       },
       {
         status: 200,

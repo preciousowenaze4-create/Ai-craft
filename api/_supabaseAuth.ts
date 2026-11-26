@@ -119,24 +119,39 @@ export function createUserScopedSupabaseClient(accessToken: string) {
   });
 }
 
+function isLocalHostHeader(host: string): boolean {
+  const hostname = host.split(':')[0]?.toLowerCase() || '';
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0';
+}
+
 export function getRequestBaseUrl(request: Request): string {
-  const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
-
-  if (!isVercel) {
-    const envUrl = cleanEnvKey(process.env.APP_URL, ['MY_APP_URL']);
-    if (envUrl) return envUrl.replace(/\/+$/, '');
-  }
-
   const forwardedHost = request.headers.get('x-forwarded-host')?.split(',')[0]?.trim();
   const forwardedProto =
     request.headers.get('x-forwarded-proto')?.split(',')[0]?.trim() || 'https';
-  if (forwardedHost) {
+  if (forwardedHost && !isLocalHostHeader(forwardedHost)) {
     return `${forwardedProto}://${forwardedHost}`.replace(/\/+$/, '');
   }
 
   const hostHeader = request.headers.get('host')?.split(',')[0]?.trim();
+  if (hostHeader && !isLocalHostHeader(hostHeader)) {
+    const proto =
+      request.headers.get('x-forwarded-proto')?.split(',')[0]?.trim() || 'https';
+    return `${proto}://${hostHeader}`.replace(/\/+$/, '');
+  }
+
+  const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+  if (!isVercel) {
+    const envUrl = cleanEnvKey(process.env.APP_URL, ['MY_APP_URL']);
+    if (envUrl && /^https?:\/\//i.test(envUrl)) {
+      return envUrl.replace(/\/+$/, '');
+    }
+  }
+
+  if (forwardedHost) {
+    return `${forwardedProto}://${forwardedHost}`.replace(/\/+$/, '');
+  }
   if (hostHeader) {
-    const proto = hostHeader.includes('localhost') ? 'http' : 'https';
+    const proto = isLocalHostHeader(hostHeader) ? 'http' : 'https';
     return `${proto}://${hostHeader}`.replace(/\/+$/, '');
   }
 

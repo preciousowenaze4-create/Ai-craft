@@ -18,6 +18,7 @@ export const VALID_GEMINI_MODEL_IDS = [
 export function normalizeBuilderModelId(rawId?: string | null): string {
   const trimmed = (rawId || '').trim();
   if (!trimmed) return DEFAULT_GEMINI_BUILDER_MODEL_ID;
+  if (trimmed.startsWith('agentrouter::')) return trimmed;
   const matched = VALID_GEMINI_MODEL_IDS.find((id) => id === trimmed);
   // Legacy stored ids (e.g. gemini::gemini-4-hydrogen) map to the free mesh.
   return matched || DEFAULT_GEMINI_BUILDER_MODEL_ID;

@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Eye, EyeOff, Loader2, Mail } from 'lucide-react';
+import {
+  Check,
+  Copy,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  Loader2,
+  Mail,
+  ShieldCheck,
+} from 'lucide-react';
 import { AuthUser } from '../types/craft';
 
 export type AuthViewMode = 'welcome' | 'signin' | 'signup' | 'forgot' | 'recovery';
@@ -122,6 +131,17 @@ export function AuthScreen({
   >(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
+  const [authConfig, setAuthConfig] = useState<{
+    supabaseConfigured: boolean;
+    callbackUrl: string;
+    missingVars?: string[];
+  } | null>(null);
+  const [copiedCallback, setCopiedCallback] = useState(false);
+  const [blockedOAuth, setBlockedOAuth] = useState<{
+    provider: 'google' | 'apple' | 'github';
+    label: string;
+    url: string;
+  } | null>(null);
 
   const popupPollRef = useRef<number | null>(null);
   const oauthUrlCacheRef = useRef<Partial<Record<'google' | 'apple' | 'github', string>>>({});
@@ -151,21 +171,47 @@ export function AuthScreen({
 
   useEffect(() => {
     let cancelled = false;
-    const providers: Array<'google' | 'apple' | 'github'> = ['google', 'apple', 'github'];
-    void Promise.all(
-      providers.map(async (provider) => {
-        try {
-          const res = await fetch(`/api/auth/oauth/url?provider=${provider}`);
-          if (!res.ok) return;
-          const data = await safeParseJson<{ url?: string }>(res);
-          if (!cancelled && data?.url) {
-            oauthUrlCacheRef.current[provider] = data.url;
+    void (async () => {
+      try {
+        const cfgRes = await fetch('/api/auth/config');
+        if (cfgRes.ok) {
+          const cfg = await safeParseJson<{
+            supabaseConfigured?: boolean;
+            callbackUrl?: string;
+            missingVars?: string[];
+          }>(cfgRes);
+          if (!cancelled && cfg) {
+            setAuthConfig({
+              supabaseConfigured: Boolean(cfg.supabaseConfigured),
+              callbackUrl:
+                cfg.callbackUrl || `${window.location.origin}/api/auth/callback`,
+              missingVars: Array.isArray(cfg.missingVars) ? cfg.missingVars : [],
+            });
+            if (!cfg.supabaseConfigured) {
+              return;
+            }
           }
-        } catch {
-          // ignore prefetch error; handleOAuthClick will fetch on demand
         }
-      })
-    );
+      } catch {
+        // ignore config check error
+      }
+
+      const providers: Array<'google' | 'apple' | 'github'> = ['google', 'apple', 'github'];
+      await Promise.all(
+        providers.map(async (provider) => {
+          try {
+            const res = await fetch(`/api/auth/oauth/url?provider=${provider}`);
+            if (!res.ok) return;
+            const data = await safeParseJson<{ url?: string }>(res);
+            if (!cancelled && data?.url) {
+              oauthUrlCacheRef.current[provider] = data.url;
+            }
+          } catch {
+            // ignore prefetch error; handleOAuthClick will fetch on demand
+          }
+        })
+      );
+    })();
     return () => {
       cancelled = true;
     };
@@ -181,12 +227,11 @@ export function AuthScreen({
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
       const origin = event.origin || '';
-      if (
-        origin &&
-        origin !== window.location.origin &&
-        !origin.endsWith('.run.app') &&
-        !origin.includes('localhost')
-      ) {
+      const allowedOrigin =
+        origin === window.location.origin ||
+        /^https:\/\/[a-z0-9.-]+\.run\.app$/i.test(origin) ||
+        /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
+      if (!origin || !allowedOrigin) {
         return;
       }
 
@@ -242,14 +287,83 @@ export function AuthScreen({
   const switchView = (next: AuthViewMode) => {
     setErrorMessage(null);
     setInfoMessage(null);
+    setBlockedOAuth(null);
     setShowPassword(false);
     setView(next);
+  };
+
+  const handleCopyCallbackUrl = async () => {
+    const url =
+      authConfig?.callbackUrl || `${window.location.origin}/api/auth/callback`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopiedCallback(true);
+      window.setTimeout(() => setCopiedCallback(false), 1800);
+    } catch {
+      // ignore clipboard permissions error
+    }
+  };
+
+  const startSessionPolling = (
+    provider: 'google' | 'apple' | 'github',
+    popup: Window | null
+  ) => {
+    stopPopupPolling();
+    popupPollRef.current = window.setInterval(() => {
+      try {
+        const raw = window.localStorage.getItem(STORAGE_SB_SESSION_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as StoredSupabaseSession;
+          if (parsed?.accessToken) {
+            stopPopupPolling();
+            void (async () => {
+              try {
+                const meRes = await fetch('/api/auth/me', {
+                  headers: {
+                    Authorization: `Bearer ${parsed.accessToken}`,
+                    ...(parsed.refreshToken
+                      ? { 'x-refresh-token': parsed.refreshToken }
+                      : {}),
+                  },
+                });
+                const meData = await safeParseJson<{
+                  authenticated?: boolean;
+                  user?: AuthUser | null;
+                  accessToken?: string;
+                  refreshToken?: string;
+                }>(meRes);
+                if (meData?.authenticated && meData.user) {
+                  setLoadingProvider(null);
+                  setBlockedOAuth(null);
+                  onAuthenticated(meData.user, {
+                    accessToken: meData.accessToken || parsed.accessToken,
+                    refreshToken: meData.refreshToken || parsed.refreshToken,
+                  });
+                  return;
+                }
+              } catch {
+                // wait for next tick or postMessage
+              }
+            })();
+            return;
+          }
+        }
+      } catch {
+        // ignore localStorage read errors
+      }
+
+      if (popup && popup.closed) {
+        stopPopupPolling();
+        setLoadingProvider((current) => (current === provider ? null : current));
+      }
+    }, 650);
   };
 
   const handleOAuthClick = async (provider: 'google' | 'apple' | 'github') => {
     if (loadingProvider) return;
     setErrorMessage(null);
     setInfoMessage(null);
+    setBlockedOAuth(null);
     setLoadingProvider(provider);
 
     const providerLabel =
@@ -283,7 +397,7 @@ export function AuthScreen({
             setLoadingProvider(null);
             setErrorMessage(
               data?.error ||
-                `Unable to start ${providerLabel} sign-in. Check your backend environment variables.`
+                `Unable to start ${providerLabel} sign-in via Supabase. Check SUPABASE_URL & SUPABASE_ANON_KEY.`
             );
             return;
           }
@@ -311,8 +425,35 @@ export function AuthScreen({
     );
 
     if (!popup) {
-      setLoadingProvider(null);
-      setErrorMessage('Please allow popups for this site to continue with sign-in.');
+      try {
+        let targetUrl = cachedUrl;
+        if (!targetUrl) {
+          const response = await fetch(
+            `/api/auth/oauth/url?provider=${encodeURIComponent(provider)}`
+          );
+          const data = await safeParseJson<{ url?: string; error?: string }>(response);
+          if (!response.ok || !data?.url) {
+            setLoadingProvider(null);
+            setErrorMessage(
+              data?.error ||
+                `Unable to start ${providerLabel} sign-in via Supabase. Check SUPABASE_URL & SUPABASE_ANON_KEY.`
+            );
+            return;
+          }
+          targetUrl = data.url;
+          oauthUrlCacheRef.current[provider] = targetUrl;
+        }
+        setLoadingProvider(null);
+        setBlockedOAuth({ provider, label: providerLabel, url: targetUrl });
+        startSessionPolling(provider, null);
+      } catch (err) {
+        setLoadingProvider(null);
+        setErrorMessage(
+          err instanceof Error
+            ? err.message
+            : 'Popup was blocked. Please allow popups and retry.'
+        );
+      }
       return;
     }
 
@@ -328,7 +469,7 @@ export function AuthScreen({
           setLoadingProvider(null);
           setErrorMessage(
             data?.error ||
-              `Unable to start ${providerLabel} sign-in. Check your backend environment variables.`
+              `Unable to start ${providerLabel} sign-in via Supabase. Check SUPABASE_URL & SUPABASE_ANON_KEY.`
           );
           return;
         }
@@ -337,54 +478,7 @@ export function AuthScreen({
         popup.location.href = data.url;
       }
 
-      stopPopupPolling();
-      popupPollRef.current = window.setInterval(() => {
-        try {
-          const raw = window.localStorage.getItem(STORAGE_SB_SESSION_KEY);
-          if (raw) {
-            const parsed = JSON.parse(raw) as StoredSupabaseSession;
-            if (parsed?.accessToken) {
-              stopPopupPolling();
-              void (async () => {
-                try {
-                  const meRes = await fetch('/api/auth/me', {
-                    headers: {
-                      Authorization: `Bearer ${parsed.accessToken}`,
-                      ...(parsed.refreshToken
-                        ? { 'x-refresh-token': parsed.refreshToken }
-                        : {}),
-                    },
-                  });
-                  const meData = await safeParseJson<{
-                    authenticated?: boolean;
-                    user?: AuthUser | null;
-                    accessToken?: string;
-                    refreshToken?: string;
-                  }>(meRes);
-                  if (meData?.authenticated && meData.user) {
-                    setLoadingProvider(null);
-                    onAuthenticated(meData.user, {
-                      accessToken: meData.accessToken || parsed.accessToken,
-                      refreshToken: meData.refreshToken || parsed.refreshToken,
-                    });
-                    return;
-                  }
-                } catch {
-                  // wait for next tick or postMessage
-                }
-              })();
-              return;
-            }
-          }
-        } catch {
-          // ignore localStorage read errors
-        }
-
-        if (popup.closed) {
-          stopPopupPolling();
-          setLoadingProvider((current) => (current === provider ? null : current));
-        }
-      }, 650);
+      startSessionPolling(provider, popup);
     } catch (err) {
       popup.close();
       setLoadingProvider(null);
@@ -630,9 +724,9 @@ export function AuthScreen({
   };
 
   return (
-    <div className="fixed inset-0 h-dvh w-full bg-white overflow-hidden overscroll-none select-none sm:select-auto flex flex-col">
+    <div className="fixed inset-0 h-dvh w-full bg-white overflow-y-auto overscroll-y-contain select-none sm:select-auto flex flex-col">
       {/* Subtle scattered code symbol layer on pure white background */}
-      <div aria-hidden="true" className="pointer-events-none absolute inset-0 overflow-hidden">
+      <div aria-hidden="true" className="pointer-events-none fixed inset-0 overflow-hidden">
         {CODE_GLYPHS.map((glyph, idx) => (
           <span
             key={idx}
@@ -650,7 +744,7 @@ export function AuthScreen({
         ))}
       </div>
 
-      <div className="relative z-10 flex-1 min-h-0 w-full max-w-[420px] mx-auto px-6 pt-safe pb-safe flex flex-col">
+      <div className="relative z-10 flex-1 min-h-full w-full max-w-[420px] mx-auto px-6 pt-safe pb-safe flex flex-col">
         <AnimatePresence mode="wait" initial={false}>
           {view === 'welcome' && (
             <motion.div
@@ -659,22 +753,25 @@ export function AuthScreen({
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
               transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-              className="flex-1 min-h-0 flex flex-col justify-between pb-0 pt-10"
+              className="flex-1 min-h-full flex flex-col justify-between gap-6 py-7"
             >
               {/* Centered App Logo & Title */}
-              <div className="flex-1 flex flex-col items-center justify-center pb-4">
+              <div className="flex-1 flex flex-col items-center justify-center py-2">
                 <img
                   src="/logo-mark.png"
                   alt="AI Craft logo"
-                  className="w-[74px] h-[74px] object-contain mb-5 select-none"
+                  className="w-[70px] h-[70px] object-contain mb-4 select-none"
                 />
                 <h1 className="font-display font-bold text-[27px] tracking-[-0.025em] text-[#0B0B0F] text-center leading-tight">
                   Welcome to AI Craft
                 </h1>
+                <p className="mt-1.5 text-[14px] text-[#71717A] text-center">
+                  Sign in with Google or Email via Supabase
+                </p>
               </div>
 
-              {/* Action Stack: Round Social Row (Google, Apple, GitHub), OR, Email */}
-              <div className="shrink-0 w-full flex flex-col gap-3 translate-y-1">
+              {/* Prominent Google Login + Apple/GitHub + Email */}
+              <div className="shrink-0 w-full flex flex-col gap-3">
                 {errorMessage && (
                   <p
                     role="alert"
@@ -684,35 +781,51 @@ export function AuthScreen({
                   </p>
                 )}
 
-                <div className="flex items-center justify-center gap-6 py-1">
-                  <button
-                    type="button"
-                    disabled={loadingProvider !== null}
-                    onClick={() => void handleOAuthClick('google')}
-                    aria-label="Continue with Google"
-                    title="Continue with Google"
-                    className="w-[64px] h-[64px] rounded-full bg-[#F5F5F7] hover:bg-[#ECECEF] active:scale-[0.95] border border-black/[0.08] shadow-[0_2px_10px_rgba(15,15,30,0.04)] flex items-center justify-center transition-all disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0D5BFF]"
-                  >
-                    {loadingProvider === 'google' ? (
-                      <Loader2 className="w-6 h-6 animate-spin text-[#0D5BFF]" />
-                    ) : (
-                      <GoogleIcon />
-                    )}
-                  </button>
+                {blockedOAuth && (
+                  <div className="rounded-xl bg-[#EEF4FF] border border-[#0D5BFF]/25 p-3 flex flex-col items-center gap-2 text-center">
+                    <p className="text-[12.5px] font-medium text-[#1E3A8A]">
+                      Browser blocked the sign-in popup. Open {blockedOAuth.label} login in a new tab:
+                    </p>
+                    <a
+                      href={blockedOAuth.url}
+                      target="_blank"
+                      rel="opener noreferrer"
+                      className="inline-flex items-center justify-center gap-1.5 px-4 h-9 rounded-full bg-[#0D5BFF] text-white text-[13px] font-semibold hover:bg-[#094EE0] transition-colors"
+                    >
+                      <span>Open {blockedOAuth.label} Sign-In</span>
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  </div>
+                )}
 
+                <button
+                  type="button"
+                  disabled={loadingProvider !== null}
+                  onClick={() => void handleOAuthClick('google')}
+                  className="w-full h-[54px] rounded-[14px] bg-white hover:bg-[#FAFAFC] active:scale-[0.99] border border-black/[0.14] shadow-[0_3px_14px_rgba(15,15,30,0.06)] px-4 flex items-center justify-center gap-3 text-[15.5px] font-semibold text-[#0B0B0F] transition-all disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0D5BFF]"
+                >
+                  {loadingProvider === 'google' ? (
+                    <Loader2 className="w-5 h-5 animate-spin text-[#0D5BFF]" />
+                  ) : (
+                    <GoogleIcon />
+                  )}
+                  <span>Continue with Google</span>
+                </button>
+
+                <div className="grid grid-cols-2 gap-2.5">
                   <button
                     type="button"
                     disabled={loadingProvider !== null}
                     onClick={() => void handleOAuthClick('apple')}
                     aria-label="Continue with Apple"
-                    title="Continue with Apple"
-                    className="w-[64px] h-[64px] rounded-full bg-[#F5F5F7] hover:bg-[#ECECEF] active:scale-[0.95] border border-black/[0.08] shadow-[0_2px_10px_rgba(15,15,30,0.04)] flex items-center justify-center transition-all disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0D5BFF]"
+                    className="h-[48px] rounded-[13px] bg-[#F5F5F7] hover:bg-[#ECECEF] active:scale-[0.98] border border-black/[0.08] px-3 flex items-center justify-center gap-2 text-[14px] font-semibold text-[#0B0B0F] transition-all disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0D5BFF]"
                   >
                     {loadingProvider === 'apple' ? (
-                      <Loader2 className="w-6 h-6 animate-spin text-[#0B0B0F]" />
+                      <Loader2 className="w-5 h-5 animate-spin text-[#0B0B0F]" />
                     ) : (
                       <AppleIcon />
                     )}
+                    <span>Apple</span>
                   </button>
 
                   <button
@@ -720,14 +833,14 @@ export function AuthScreen({
                     disabled={loadingProvider !== null}
                     onClick={() => void handleOAuthClick('github')}
                     aria-label="Continue with GitHub"
-                    title="Continue with GitHub"
-                    className="w-[64px] h-[64px] rounded-full bg-[#F5F5F7] hover:bg-[#ECECEF] active:scale-[0.95] border border-black/[0.08] shadow-[0_2px_10px_rgba(15,15,30,0.04)] flex items-center justify-center transition-all disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0D5BFF]"
+                    className="h-[48px] rounded-[13px] bg-[#F5F5F7] hover:bg-[#ECECEF] active:scale-[0.98] border border-black/[0.08] px-3 flex items-center justify-center gap-2 text-[14px] font-semibold text-[#0B0B0F] transition-all disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0D5BFF]"
                   >
                     {loadingProvider === 'github' ? (
-                      <Loader2 className="w-6 h-6 animate-spin text-[#0B0B0F]" />
+                      <Loader2 className="w-5 h-5 animate-spin text-[#0B0B0F]" />
                     ) : (
                       <GitHubIcon />
                     )}
+                    <span>GitHub</span>
                   </button>
                 </div>
 
@@ -743,11 +856,50 @@ export function AuthScreen({
                   type="button"
                   disabled={loadingProvider !== null}
                   onClick={() => switchView('signin')}
-                  className="w-full h-[54px] rounded-[14px] bg-[#F5F5F7] hover:bg-[#ECECEF] active:scale-[0.99] border border-black/[0.08] px-4 flex items-center justify-center gap-3 text-[15.5px] font-semibold text-[#0B0B0F] transition-all disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0D5BFF]"
+                  className="w-full h-[52px] rounded-[14px] bg-[#F5F5F7] hover:bg-[#ECECEF] active:scale-[0.99] border border-black/[0.08] px-4 flex items-center justify-center gap-3 text-[15px] font-semibold text-[#0B0B0F] transition-all disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0D5BFF]"
                 >
-                  <Mail className="w-[19px] h-[19px] text-[#0B0B0F]" strokeWidth={2.1} />
+                  <Mail className="w-[18px] h-[18px] text-[#0B0B0F]" strokeWidth={2.1} />
                   <span>Continue with Email</span>
                 </button>
+
+                {authConfig && (
+                  <div className="mt-1 rounded-xl border border-black/[0.07] bg-[#FAFAFB] px-3 py-2 text-[11.5px] text-[#52525B]">
+                    {authConfig.supabaseConfigured ? (
+                      <div className="flex items-center justify-center gap-1.5 text-emerald-700 font-medium">
+                        <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                        <span>Supabase Auth connected · Google OAuth ready</span>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col gap-1.5 text-left">
+                        <p className="font-semibold text-amber-800">
+                          Supabase Auth setup needed ({authConfig.missingVars?.join(', ') || 'SUPABASE_URL, SUPABASE_ANON_KEY'})
+                        </p>
+                        <div className="flex items-center justify-between gap-2 rounded-lg bg-white border border-black/[0.08] px-2 py-1">
+                          <span className="truncate font-mono text-[10.5px] text-[#3F3F46]">
+                            {authConfig.callbackUrl}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void handleCopyCallbackUrl()}
+                            className="shrink-0 inline-flex items-center gap-1 text-[10.5px] font-semibold text-[#0D5BFF] hover:underline"
+                          >
+                            {copiedCallback ? (
+                              <>
+                                <Check className="w-3 h-3" />
+                                <span>Copied</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3 h-3" />
+                                <span>Copy Redirect URL</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </motion.div>
           )}
@@ -864,7 +1016,21 @@ export function AuthScreen({
                 </button>
               </form>
 
-              <div className="mt-6 flex flex-col items-center gap-4">
+              <div className="mt-5 flex flex-col items-center gap-3.5">
+                <button
+                  type="button"
+                  disabled={loadingProvider !== null}
+                  onClick={() => void handleOAuthClick('google')}
+                  className="w-full h-[48px] rounded-[13px] bg-white hover:bg-[#FAFAFC] border border-black/[0.12] px-4 flex items-center justify-center gap-2.5 text-[14.5px] font-semibold text-[#0B0B0F] transition-all disabled:opacity-60"
+                >
+                  {loadingProvider === 'google' ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-[#0D5BFF]" />
+                  ) : (
+                    <GoogleIcon />
+                  )}
+                  <span>Continue with Google</span>
+                </button>
+
                 <p className="text-[14.5px] text-[#52525B]">
                   Don&apos;t have an account?{' '}
                   <button
@@ -992,7 +1158,21 @@ export function AuthScreen({
                 </button>
               </form>
 
-              <div className="mt-6 flex flex-col items-center gap-4">
+              <div className="mt-5 flex flex-col items-center gap-3.5">
+                <button
+                  type="button"
+                  disabled={loadingProvider !== null}
+                  onClick={() => void handleOAuthClick('google')}
+                  className="w-full h-[48px] rounded-[13px] bg-white hover:bg-[#FAFAFC] border border-black/[0.12] px-4 flex items-center justify-center gap-2.5 text-[14.5px] font-semibold text-[#0B0B0F] transition-all disabled:opacity-60"
+                >
+                  {loadingProvider === 'google' ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-[#0D5BFF]" />
+                  ) : (
+                    <GoogleIcon />
+                  )}
+                  <span>Continue with Google</span>
+                </button>
+
                 <p className="text-[14.5px] text-[#52525B]">
                   Already have an account?{' '}
                   <button

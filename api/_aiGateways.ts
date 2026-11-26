@@ -645,6 +645,14 @@ export function buildGatewayExecutionPlan(params: {
   requestedModelLabel: string;
 } {
   const requested = (params.requestedModel || '').trim();
+  if (requested.startsWith('agentrouter::')) {
+    const bare = requested.slice('agentrouter::'.length).trim();
+    const label =
+      !bare || bare === 'auto'
+        ? 'AgentRouter · Auto (Primary Brain)'
+        : `AgentRouter · ${bare}`;
+    return { pollinationsCandidates: [], requestedMediaKind: null, requestedModelLabel: label };
+  }
   // The mesh is the only engine: empty id and mesh::* selector ids both
   // resolve to free-mesh labels. Legacy gemini::* ids keep their old names.
   if (!requested || requested.startsWith('mesh::')) {

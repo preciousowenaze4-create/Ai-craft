@@ -239,7 +239,9 @@ export function ModelSelectorPopover({
                         </p>
                         <div className="flex items-center gap-1 mt-0.5 text-[10.5px] text-[#52525B] truncate">
                           <span className="truncate font-medium text-[#3F3F46]">
-                            Vision · Code · DB
+                            {model.capabilities?.length
+                              ? model.capabilities.slice(0, 3).join(' · ')
+                              : 'Vision · Code · DB'}
                           </span>
                           {ctxLabel && (
                             <>

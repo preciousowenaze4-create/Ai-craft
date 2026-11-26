@@ -29,10 +29,15 @@ function getAuthSubroute(request: Request): string {
 function handleConfig(request: Request): Response {
   const sbConfig = getSupabaseConfig();
   const callbackUrl = `${getRequestBaseUrl(request)}/api/auth/callback`;
+  const missingVars: string[] = [];
+  if (!sbConfig.url) missingVars.push('SUPABASE_URL');
+  if (!sbConfig.anonKey) missingVars.push('SUPABASE_ANON_KEY');
   return Response.json(
     {
       supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
       callbackUrl,
+      missingVars,
+      providers: ['google', 'apple', 'github', 'email'],
     },
     {
       headers: { 'Cache-Control': 'no-store' },
@@ -351,7 +356,10 @@ function handleCallback(): Response {
           var noTokenMsg = 'Authorization code received. Please enable Implicit OAuth flow in Supabase or use Email sign-in.';
           titleEl.textContent = 'Authorization code received';
           statusEl.textContent = noTokenMsg;
-          if (!window.opener) {
+          if (window.opener) {
+            window.opener.postMessage({ type: 'OAUTH_AUTH_ERROR', message: noTokenMsg }, '*');
+            setTimeout(function () { window.close(); }, 1600);
+          } else {
             setTimeout(function () {
               window.location.replace('/?auth_error=' + encodeURIComponent(noTokenMsg));
             }, 900);

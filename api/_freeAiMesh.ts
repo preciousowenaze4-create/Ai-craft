@@ -295,7 +295,178 @@ function resolvePollinationsModels(baseUrl: string): string[] {
   return [...preferred, ...rest].slice(0, 40);
 }
 
+const AGENTROUTER_DEFAULT_BASE = 'https://co.agentrouter.org/v1';
+
+let agentRouterModelsCache: { models: string[]; at: number } | null = null;
+let agentRouterRefreshInFlight = false;
+
+function getAgentRouterCredentials(): {
+  apiKey: string;
+  baseUrl: string;
+  v1Origin: string;
+} | null {
+  const apiKey = readEnvKey(
+    'AGENTROUTER_API_KEY',
+    'AGENT_ROUTER_API_KEY',
+    'AGENTROUTER_KEY'
+  );
+  if (!apiKey) return null;
+  const rawBase =
+    (process.env.AGENTROUTER_BASE_URL || '').trim() || AGENTROUTER_DEFAULT_BASE;
+  if (!/^https?:\/\//i.test(rawBase)) return null;
+  const normalizedBase = rawBase.replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
+  const v1Origin = /\/v1$/i.test(normalizedBase)
+    ? normalizedBase
+    : `${normalizedBase}/v1`;
+  return {
+    apiKey,
+    baseUrl: toChatCompletionsUrl(normalizedBase),
+    v1Origin,
+  };
+}
+
+export function isAgentRouterConfigured(): boolean {
+  return Boolean(getAgentRouterCredentials());
+}
+
+function scheduleAgentRouterModelsRefresh(v1Origin: string, apiKey: string): void {
+  if (agentRouterRefreshInFlight) return;
+  agentRouterRefreshInFlight = true;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  fetch(`${v1Origin}/models`, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'User-Agent': 'AI-Craft/1.0',
+    },
+    signal: controller.signal,
+  })
+    .then((res) => (res.ok ? res.json() : null))
+    .then((payload: unknown) => {
+      const list = Array.isArray((payload as { data?: unknown[] } | null)?.data)
+        ? (payload as { data: unknown[] }).data
+        : Array.isArray(payload)
+          ? payload
+          : [];
+      const names: string[] = [];
+      for (const entry of list) {
+        const id =
+          typeof entry === 'string'
+            ? entry.trim()
+            : entry && typeof entry === 'object' && 'id' in entry
+              ? String((entry as { id: unknown }).id || '').trim()
+              : '';
+        if (!id || names.includes(id)) continue;
+        if (/^(whisper|tts|dall-e|gpt-image|text-embedding|embedding|moderation)/i.test(id)) {
+          continue;
+        }
+        names.push(id);
+        if (names.length >= 40) break;
+      }
+      if (names.length > 0) {
+        agentRouterModelsCache = { models: names, at: Date.now() };
+      }
+    })
+    .catch(() => undefined)
+    .finally(() => {
+      agentRouterRefreshInFlight = false;
+      clearTimeout(timer);
+    });
+}
+
+export async function refreshAgentRouterModelsIfConfigured(): Promise<string[]> {
+  const creds = getAgentRouterCredentials();
+  if (!creds) return [];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2800);
+  try {
+    const res = await fetch(`${creds.v1Origin}/models`, {
+      headers: {
+        Authorization: `Bearer ${creds.apiKey}`,
+        'User-Agent': 'AI-Craft/1.0',
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
+    const payload = (await res.json().catch(() => null)) as { data?: unknown[] } | unknown[] | null;
+    const list = Array.isArray((payload as { data?: unknown[] } | null)?.data)
+      ? (payload as { data: unknown[] }).data
+      : Array.isArray(payload)
+        ? payload
+        : [];
+    const names: string[] = [];
+    for (const entry of list) {
+      const id =
+        typeof entry === 'string'
+          ? entry.trim()
+          : entry && typeof entry === 'object' && 'id' in entry
+            ? String((entry as { id: unknown }).id || '').trim()
+            : '';
+      if (!id || names.includes(id)) continue;
+      if (/^(whisper|tts|dall-e|gpt-image|text-embedding|embedding|moderation)/i.test(id)) {
+        continue;
+      }
+      names.push(id);
+      if (names.length >= 40) break;
+    }
+    if (names.length > 0) {
+      agentRouterModelsCache = { models: names, at: Date.now() };
+    }
+  } catch {
+    // keep cached/fallback list
+  } finally {
+    clearTimeout(timer);
+  }
+  return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
+}
+
+function resolveAgentRouterModels(v1Origin: string, apiKey: string): string[] {
+  const singleOverride = (process.env.AGENTROUTER_MODEL || '').trim();
+  const csvOverride = readEnvCsv('AGENTROUTER_MODELS');
+  const envModels = [
+    ...singleOverride.split(',').map((s) => s.trim()).filter(Boolean),
+    ...csvOverride,
+  ].filter((m, idx, arr) => arr.indexOf(m) === idx);
+
+  const cacheFresh =
+    agentRouterModelsCache && Date.now() - agentRouterModelsCache.at < 10 * 60_000;
+  if (!cacheFresh) {
+    scheduleAgentRouterModelsRefresh(v1Origin, apiKey);
+  }
+  const live = agentRouterModelsCache?.models || [];
+  const baseList =
+    live.length > 0
+      ? [
+          ...FREE_MODEL_CATALOG.agentrouter.filter((m) => live.includes(m)),
+          ...live.filter((m) => !FREE_MODEL_CATALOG.agentrouter.includes(m)),
+        ]
+      : FREE_MODEL_CATALOG.agentrouter;
+
+  if (envModels.length > 0) {
+    return [...envModels, ...baseList.filter((m) => !envModels.includes(m))].slice(0, 24);
+  }
+  return baseList.slice(0, 24);
+}
+
 const MESH_PROVIDERS: MeshProviderDef[] = [
+  {
+    id: 'agentrouter',
+    label: 'AgentRouter',
+    keyless: false,
+    resolve() {
+      const creds = getAgentRouterCredentials();
+      if (!creds) return null;
+      return {
+        baseUrl: creds.baseUrl,
+        apiKey: creds.apiKey,
+        models: resolveAgentRouterModels(creds.v1Origin, creds.apiKey),
+        headers: {
+          'User-Agent': 'AI-Craft/1.0',
+          'X-Title': 'AI Craft',
+        },
+      };
+    },
+  },
   {
     id: 'self-hosted',
     label: 'Self-Hosted GPU',
@@ -526,12 +697,17 @@ interface MeshWalkBudget {
   maxAttempts: number;
 }
 
-/** Chat = fast (raced); build = roomier (single live stream / agents). */
+/** Chat = fast (raced when keyless); build = roomier (single live stream / agents). */
 function budgetFor(taskKind: 'chat' | 'build'): MeshWalkBudget {
+  const hasPrimaryRouter = isAgentRouterConfigured();
   if (taskKind === 'chat') {
-    return { firstByteMs: 6_000, idleMs: 20_000, walkMs: 30_000, maxAttempts: 8 };
+    return hasPrimaryRouter
+      ? { firstByteMs: 12_000, idleMs: 25_000, walkMs: 45_000, maxAttempts: 8 }
+      : { firstByteMs: 6_000, idleMs: 20_000, walkMs: 30_000, maxAttempts: 8 };
   }
-  return { firstByteMs: 10_000, idleMs: 45_000, walkMs: 65_000, maxAttempts: 12 };
+  return hasPrimaryRouter
+    ? { firstByteMs: 18_000, idleMs: 50_000, walkMs: 80_000, maxAttempts: 12 }
+    : { firstByteMs: 10_000, idleMs: 45_000, walkMs: 65_000, maxAttempts: 12 };
 }
 
 /** Every candidate the walk may consider, with its remaining cooldown
@@ -580,6 +756,78 @@ function buildMeshCandidates(): MeshCandidate[] {
     if (out.length >= MAX_ATTEMPTS_PER_WALK) break;
   }
   return out;
+}
+
+function prioritizeCandidatesForRequestedModel(
+  candidates: MeshCandidate[],
+  requestedModel?: string
+): MeshCandidate[] {
+  const req = (requestedModel || '').trim();
+  if (!req || candidates.length <= 1) return candidates;
+
+  if (req.startsWith('agentrouter::')) {
+    const targetModel = req.slice('agentrouter::'.length).trim();
+    if (!targetModel || targetModel === 'auto') {
+      const ar = candidates.filter((c) => c.providerId === 'agentrouter');
+      const rest = candidates.filter((c) => c.providerId !== 'agentrouter');
+      return [...ar, ...rest];
+    }
+    const exact = candidates.filter(
+      (c) => c.providerId === 'agentrouter' && c.model === targetModel
+    );
+    const sameProvider = candidates.filter(
+      (c) => c.providerId === 'agentrouter' && c.model !== targetModel
+    );
+    const others = candidates.filter((c) => c.providerId !== 'agentrouter');
+    if (exact.length > 0) {
+      return [...exact, ...sameProvider, ...others];
+    }
+    // Requested a specific upstream AgentRouter model ID not in top slice — prepend an on-demand candidate if configured
+    const creds = getAgentRouterCredentials();
+    if (creds) {
+      const cooldownKey = buildCandidateCooldownKey(
+        'mesh:agentrouter',
+        creds.apiKey,
+        targetModel
+      );
+      if (gatewayCandidateCooldownRemainingMs(cooldownKey) <= 0 && !isDailyQuotaExhausted('agentrouter', targetModel)) {
+        return [
+          {
+            providerId: 'agentrouter',
+            providerLabel: 'AgentRouter',
+            keyless: false,
+            baseUrl: creds.baseUrl,
+            apiKey: creds.apiKey,
+            headers: {
+              'User-Agent': 'AI-Craft/1.0',
+              'X-Title': 'AI Craft',
+            },
+            model: targetModel,
+            cooldownKey,
+          },
+          ...sameProvider,
+          ...others,
+        ];
+      }
+    }
+    return [...sameProvider, ...others];
+  }
+
+  if (req === 'mesh::reasoning') {
+    const isReasoning = (m: string) => /r1|reason|opus|gpt-5|kimi|qwq/i.test(m);
+    const preferred = candidates.filter((c) => isReasoning(c.model));
+    const rest = candidates.filter((c) => !isReasoning(c.model));
+    return [...preferred, ...rest];
+  }
+
+  if (req === 'mesh::coder') {
+    const isCoder = (m: string) => /coder|sonnet|claude|gpt-5|deepseek|glm/i.test(m);
+    const preferred = candidates.filter((c) => isCoder(c.model));
+    const rest = candidates.filter((c) => !isCoder(c.model));
+    return [...preferred, ...rest];
+  }
+
+  return candidates;
 }
 
 /** Smallest remaining cooldown across every cooling candidate — 0 when at
@@ -675,7 +923,38 @@ export interface FreeMeshModelOption {
 export function getFreeMeshModelOptions(): FreeMeshModelOption[] {
   const pool = getFreeAiMeshStatus().modelPool;
   const resetLabel = 'Daily reset 00:00 UTC';
-  return [
+  const creds = getAgentRouterCredentials();
+  const options: FreeMeshModelOption[] = [];
+
+  if (creds) {
+    const arModels = resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
+    options.push({
+      id: 'agentrouter::auto',
+      name: 'AgentRouter · Auto (Primary Brain)',
+      provider: 'agentrouter',
+      contextLength: 262144,
+      isFree: false,
+      gateway: 'auto',
+      tierLabel: 'Primary Brain',
+      capabilities: ['Chat', 'Code', 'Vision'],
+      category: 'code',
+    });
+    for (const modelId of arModels.slice(0, 8)) {
+      options.push({
+        id: `agentrouter::${modelId}`,
+        name: `AgentRouter · ${modelId}`,
+        provider: 'agentrouter',
+        contextLength: 262144,
+        isFree: false,
+        gateway: 'auto',
+        tierLabel: 'AgentRouter API',
+        capabilities: ['Chat', 'Code'],
+        category: 'code',
+      });
+    }
+  }
+
+  options.push(
     {
       id: 'mesh::auto',
       name: 'Free AI Mesh · Auto (fastest lane)',
@@ -730,8 +1009,9 @@ export function getFreeMeshModelOptions(): FreeMeshModelOption[] {
       tierLabel: `Creative lanes · ${resetLabel}`,
       capabilities: ['Chat'],
       category: 'chat',
-    },
-  ];
+    }
+  );
+  return options;
 }
 
 interface MeshErrorInfo {
@@ -1184,6 +1464,7 @@ async function completeOneMeshCandidate(
 
 interface MeshWalkParams {
   taskKind: 'chat' | 'build';
+  requestedModel?: string;
   systemPrompt: string;
   historyMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
   userPrompt: string;
@@ -1220,7 +1501,10 @@ async function runMeshStreamAttempt(params: {
   raceSignal?: AbortSignal;
 }): Promise<MeshStreamResult> {
   const { candidate, walk, budget } = params;
-  const modelId = `mesh::${candidate.providerId}::${candidate.model}`;
+  const modelId =
+    candidate.providerId === 'agentrouter'
+      ? `agentrouter::${candidate.model}`
+      : `mesh::${candidate.providerId}::${candidate.model}`;
   const modelName = `${candidate.providerLabel} · ${candidate.model}`;
   walk.onModelMeta?.({ modelId, modelName, provider: candidate.providerId });
 
@@ -1401,13 +1685,19 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
     return buildMeshCandidates().length > 0;
   };
 
-  let candidates = buildMeshCandidates();
+  let candidates = prioritizeCandidatesForRequestedModel(
+    buildMeshCandidates(),
+    params.requestedModel
+  );
   if (candidates.length === 0) {
     // Distinguish "nothing configured" from "everything configured but cooling
     // down / quota-capped" so the user gets an actionable message.
     if (getFreeAiMeshStatus().hasAny) {
       if (await tryWaitForCooldowns()) {
-        candidates = buildMeshCandidates();
+        candidates = prioritizeCandidatesForRequestedModel(
+          buildMeshCandidates(),
+          params.requestedModel
+        );
       } else {
         throw new FreeAiMeshAllFailedError([
           'all configured engines are cooling down after recent errors',
@@ -1423,10 +1713,14 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
   let attempts = 0;
   const racedSet = new Set<MeshCandidate>();
 
-  // Fast path: chat races the top candidates so the quickest free AI answers.
+  // When AgentRouter (or another explicit primary API key) leads, route directly
+  // through that brain first so fast keyless fallback lanes don't steal chat turns.
+  const primaryIsExplicitBrain = candidates[0]?.providerId === 'agentrouter';
+
+  // Fast path: keyless chat races the top candidates so the quickest free AI answers.
   // One lane per provider — same-provider models would only queue behind
   // each other on the single-flight slot.
-  if (params.taskKind === 'chat' && candidates.length > 1) {
+  if (params.taskKind === 'chat' && !primaryIsExplicitBrain && candidates.length > 1) {
     const racePicks = pickRaceCandidates(candidates, Math.min(3, candidates.length));
     attempts += racePicks.length;
     for (const pick of racePicks) racedSet.add(pick);
@@ -1500,6 +1794,7 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
  */
 export async function completeFreeAiMesh(params: {
   taskKind: 'chat' | 'build';
+  requestedModel?: string;
   systemPrompt: string;
   historyMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
   userPrompt: string;
@@ -1509,7 +1804,10 @@ export async function completeFreeAiMesh(params: {
   timeoutMs?: number;
 }): Promise<string | null> {
   const attemptMs = Math.max(3_000, Math.min(params.timeoutMs ?? 25_000, 25_000));
-  let candidates = buildMeshCandidates();
+  let candidates = prioritizeCandidatesForRequestedModel(
+    buildMeshCandidates(),
+    params.requestedModel
+  );
   if (candidates.length === 0) {
     // Short busy cooldowns: wait them out once (bounded) instead of silently
     // degrading the caller to architect-only output.
@@ -1519,7 +1817,10 @@ export async function completeFreeAiMesh(params: {
     const waitCapMs = Math.min(attemptMs, 8_000);
     if (earliest > 0 && earliest <= waitCapMs && getFreeAiMeshStatus().hasAny) {
       await sleepWithSignal(earliest + 200, params.signal).catch(() => undefined);
-      candidates = buildMeshCandidates();
+      candidates = prioritizeCandidatesForRequestedModel(
+        buildMeshCandidates(),
+        params.requestedModel
+      );
     }
     if (candidates.length === 0) return null;
   }

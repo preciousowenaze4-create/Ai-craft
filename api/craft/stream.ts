@@ -27,6 +27,7 @@ import {
   streamServerFreeAiRealTime,
   type VisualHintsSpec,
 } from '../_realtimeEngine.js';
+import { isAgentRouterConfigured } from '../_freeAiMesh.js';
 import {
   getProjectMemory,
   recordBuildCheckpoint,
@@ -254,13 +255,20 @@ export async function POST(request: Request): Promise<Response> {
           },
         });
 
+        const agentRouterPrimary =
+          isAgentRouterConfigured() &&
+          (!requestedModel || requestedModel.startsWith('agentrouter::'));
+
         sendEvent({
           type: 'meta',
           kind: prepared.naturalMediaIntent ? 'media' : 'chat',
-          modelId: requestedModel || 'mesh::auto',
-          modelName: prepared.requestedModelLabel || 'Free AI Mesh · Auto',
-          provider: 'free-mesh',
-          gateway: 'mesh',
+          modelId:
+            requestedModel || (agentRouterPrimary ? 'agentrouter::auto' : 'mesh::auto'),
+          modelName:
+            prepared.requestedModelLabel ||
+            (agentRouterPrimary ? 'AgentRouter · Auto' : 'Free AI Mesh · Auto'),
+          provider: agentRouterPrimary ? 'agentrouter' : 'free-mesh',
+          gateway: agentRouterPrimary ? 'agentrouter' : 'mesh',
           isFallback: false,
         });
 
@@ -318,9 +326,12 @@ export async function POST(request: Request): Promise<Response> {
         let lastPreviewBytesSent = 0;
         let emittedReasoningPhase = false;
 
-        let activeModelUsed = requestedModel || 'mesh::auto';
-        let activeModelName = prepared.requestedModelLabel || 'Free AI Mesh · Auto';
-        let activeProvider = 'free-mesh';
+        let activeModelUsed =
+          requestedModel || (agentRouterPrimary ? 'agentrouter::auto' : 'mesh::auto');
+        let activeModelName =
+          prepared.requestedModelLabel ||
+          (agentRouterPrimary ? 'AgentRouter · Auto' : 'Free AI Mesh · Auto');
+        let activeProvider = agentRouterPrimary ? 'agentrouter' : 'free-mesh';
         let parallelMergedRaw: string | null = null;
 
         let lastReasoningUpdateAt = 0;
