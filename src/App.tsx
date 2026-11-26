@@ -2058,21 +2058,19 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                 flushBuffered();
                 const rawMsg = evt.message ?? 'AI Craft encountered an error.';
                 const isTransientMesh =
-                  /busy or unreachable|cooling down|retry in a few seconds|No free AI engine/i.test(
+                  /busy or unreachable|cooling down|retry in a few seconds|temporarily unavailable/i.test(
                     rawMsg
                   );
                 const priorAuto = transientAutoRetryRef.current[turnId] ?? 0;
                 if (isTransientMesh && priorAuto < 2) {
-                  // Silent auto-retry: another free AI lane takes over after a
-                  // short pause instead of surfacing a wall of red text.
                   transientAutoRetryRef.current[turnId] = priorAuto + 1;
                   updateTurn(projectId, turnId, (t) => ({
                     ...t,
                     phase: 'building',
                     phaseLabel:
                       priorAuto === 0
-                        ? 'Free engines were busy — retrying…'
-                        : 'Switching to another free AI…',
+                        ? 'AgentRouter was busy — retrying…'
+                        : 'Switching to another AgentRouter model…',
                     errorMessage: undefined,
                   }));
                   window.setTimeout(() => {
@@ -2306,7 +2304,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
               ? err.message
               : 'Unable to reach AI Craft engine right now.';
           const isTransientMesh =
-            /busy or unreachable|cooling down|retry in a few seconds|No free AI engine/i.test(
+            /busy or unreachable|cooling down|retry in a few seconds|temporarily unavailable/i.test(
               msg
             );
           const priorAuto = transientAutoRetryRef.current[turnId] ?? 0;
@@ -2317,8 +2315,8 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
               phase: 'building',
               phaseLabel:
                 priorAuto === 0
-                  ? 'Free engines were busy — retrying…'
-                  : 'Switching to another free AI…',
+                  ? 'AgentRouter was busy — retrying…'
+                  : 'Switching to another AgentRouter model…',
               errorMessage: undefined,
             }));
             window.setTimeout(() => {

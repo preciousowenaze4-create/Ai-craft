@@ -91,11 +91,12 @@ function cleanPastedSecret(rawValue: string | undefined): {
       looksLikeUrl: false,
     };
   }
-  let s = rawValue.trim();
+  let s = rawValue.replace(/[\r\n]+/g, ' ').trim();
   const hadAssignPrefix = /^(?:export\s+)?[A-Z0-9_]+\s*=\s*/i.test(s);
   if (hadAssignPrefix) {
     s = s.replace(/^(?:export\s+)?[A-Z0-9_]+\s*=\s*/i, '').trim();
   }
+  s = s.replace(/^(?:authorization|x-api-key)\s*:\s*/i, '').trim();
   const strippedQuotes = s
     .replace(/^[`"'\u201c\u201d\u2018\u2019]+|[`"'\u201c\u201d\u2018\u2019;,]+$/g, '')
     .trim();
@@ -218,8 +219,15 @@ let agentRouterModelsCache: { models: string[]; at: number } | null = null;
 let agentRouterRefreshInFlight = false;
 
 function normalizeAgentRouterOrigin(rawBase: string): string {
-  const trimmed = rawBase.trim();
-  if (!trimmed || !/^https?:\/\//i.test(trimmed)) return AGENTROUTER_DEFAULT_BASE;
+  let trimmed = rawBase.trim().replace(/^["'`]|["'`]$/g, '').trim();
+  if (!trimmed) return AGENTROUTER_DEFAULT_BASE;
+  if (!/^https?:\/\//i.test(trimmed)) {
+    if (/^[a-z0-9.-]+\.[a-z]{2,}(?:\/.*)?$/i.test(trimmed)) {
+      trimmed = `https://${trimmed}`;
+    } else {
+      return AGENTROUTER_DEFAULT_BASE;
+    }
+  }
   try {
     const parsed = new URL(trimmed);
     const host = parsed.hostname.toLowerCase();
@@ -231,7 +239,7 @@ function normalizeAgentRouterOrigin(rawBase: string): string {
     }
     const cleanPath = parsed.pathname
       .replace(/\/+$/, '')
-      .replace(/\/chat\/completions$/i, '');
+      .replace(/\/(?:chat\/completions|responses|messages|models)$/i, '');
     const v1Path = /\/v1$/i.test(cleanPath)
       ? cleanPath
       : cleanPath && cleanPath !== '/'
@@ -264,6 +272,9 @@ function getAgentRouterCredentials(): {
     'AGENT_ROUTER_API_KEY',
     'AGENTROUTER_KEY',
     'AGENTROUTER_TOKEN',
+    'ANTHROPIC_AUTH_TOKEN',
+    'OPENAI_API_KEY',
+    'ANTHROPIC_API_KEY',
   ];
   let matchedKeyName = '';
   let keyInfo = cleanPastedSecret(undefined);
@@ -279,12 +290,22 @@ function getAgentRouterCredentials(): {
   }
   if (!matchedKeyName || !keyInfo.cleaned || keyInfo.looksLikeUrl) return null;
 
-  const baseNames = ['AGENTROUTER_BASE_URL', 'AGENT_ROUTER_BASE_URL'];
+  const baseNames = [
+    'AGENTROUTER_BASE_URL',
+    'AGENT_ROUTER_BASE_URL',
+    'AGENTROUTER_URL',
+    'OPENAI_BASE_URL',
+    'ANTHROPIC_BASE_URL',
+    'API_BASE_URL',
+  ];
   let matchedBaseName = '';
   let rawBase = '';
   for (const name of baseNames) {
-    const val = (process.env[name] || '').trim().replace(/^["'`]|["'`]$/g, '');
-    if (val && /^https?:\/\//i.test(val)) {
+    const val = (process.env[name] || '').trim().replace(/^["'`]|["'`]$/g, '').trim();
+    if (
+      val &&
+      (/^https?:\/\//i.test(val) || /^[a-z0-9.-]+\.[a-z]{2,}(?:\/.*)?$/i.test(val))
+    ) {
       matchedBaseName = name;
       rawBase = val;
       break;
@@ -341,6 +362,17 @@ function recordAgentRouterDiag(
 export function getAgentRouterDiagnostic(): {
   configured: boolean;
   apiOrigin: string;
+  keyEnvName: string | null;
+  baseEnvName: string | null;
+  keyShape: {
+    hadQuotes: boolean;
+    hadAssignPrefix: boolean;
+    hadBearerPrefix: boolean;
+    hadWhitespace: boolean;
+    looksLikeUrl: boolean;
+    looksLikeSkToken: boolean;
+    lengthOk: boolean;
+  } | null;
   lastCheckedAt: string | null;
   lastEndpoint: string | null;
   lastStatus: number | null;
@@ -350,6 +382,9 @@ export function getAgentRouterDiagnostic(): {
   return {
     configured: Boolean(creds),
     apiOrigin: creds?.v1Origin || AGENTROUTER_DEFAULT_BASE,
+    keyEnvName: creds?.keyEnvName ?? null,
+    baseEnvName: creds?.baseEnvName ?? null,
+    keyShape: creds?.keyShape ?? null,
     lastCheckedAt: lastAgentRouterDiag?.checkedAt ?? null,
     lastEndpoint: lastAgentRouterDiag?.endpoint ?? null,
     lastStatus: lastAgentRouterDiag?.status ?? null,
@@ -365,10 +400,29 @@ export function getAgentRouterApiOrigin(): string {
   return getAgentRouterCredentials()?.v1Origin || AGENTROUTER_DEFAULT_BASE;
 }
 
-const AGENTROUTER_CLIENT_HEADERS = {
-  'User-Agent': 'codex_cli_rs/0.34.0',
-  Accept: 'application/json',
-};
+type AgentRouterHeaderProfile = 'codex' | 'standard' | 'claude';
+
+let preferredHeaderProfile: AgentRouterHeaderProfile = 'codex';
+
+function buildHeaderProfileHeaders(profile: AgentRouterHeaderProfile): Record<string, string> {
+  if (profile === 'codex') {
+    return {
+      'User-Agent': 'codex_cli_rs/0.34.0',
+    };
+  }
+  if (profile === 'claude') {
+    return {
+      'User-Agent': 'claude-cli/1.0.56 (external, cli)',
+    };
+  }
+  return {};
+}
+
+function orderedHeaderProfiles(defaultFirst?: AgentRouterHeaderProfile): AgentRouterHeaderProfile[] {
+  const start = defaultFirst || preferredHeaderProfile;
+  const all: AgentRouterHeaderProfile[] = ['codex', 'standard', 'claude'];
+  return [start, ...all.filter((p) => p !== start)];
+}
 
 function scheduleAgentRouterModelsRefresh(v1Origin: string, apiKey: string): void {
   if (agentRouterRefreshInFlight) return;
@@ -378,7 +432,8 @@ function scheduleAgentRouterModelsRefresh(v1Origin: string, apiKey: string): voi
   fetch(`${v1Origin}/models`, {
     headers: {
       Authorization: `Bearer ${apiKey}`,
-      ...AGENTROUTER_CLIENT_HEADERS,
+      Accept: 'application/json',
+      ...buildHeaderProfileHeaders(preferredHeaderProfile),
     },
     signal: controller.signal,
   })
@@ -424,78 +479,90 @@ function scheduleAgentRouterModelsRefresh(v1Origin: string, apiKey: string): voi
 export async function refreshAgentRouterModelsIfConfigured(): Promise<string[]> {
   const creds = getAgentRouterCredentials();
   if (!creds) return [];
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3500);
-  try {
-    const res = await fetch(`${creds.v1Origin}/models`, {
-      headers: {
-        Authorization: `Bearer ${creds.apiKey}`,
-        ...AGENTROUTER_CLIENT_HEADERS,
-      },
-      signal: controller.signal,
-    });
-    const ct = (res.headers.get('content-type') || '').toLowerCase();
-    if (!res.ok || ct.includes('text/html')) {
-      const errBody = await res.text().catch(() => '');
+  const profiles = orderedHeaderProfiles();
+  for (const profile of profiles) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    try {
+      const res = await fetch(`${creds.v1Origin}/models`, {
+        headers: {
+          Authorization: `Bearer ${creds.apiKey}`,
+          Accept: 'application/json',
+          ...buildHeaderProfileHeaders(profile),
+        },
+        signal: controller.signal,
+      });
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      if (!res.ok || ct.includes('text/html')) {
+        const errBody = await res.text().catch(() => '');
+        recordAgentRouterDiag(
+          `${creds.v1Origin}/models`,
+          res.status,
+          ct.includes('text/html') ? 'HTML/WAF response' : errBody || `HTTP ${res.status}`
+        );
+        if (res.status === 401 || res.status === 403 || ct.includes('text/html')) {
+          continue;
+        }
+        return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
+      }
+      const payload = (await res.json().catch(() => null)) as
+        | { data?: unknown[]; code?: number; msg?: string }
+        | unknown[]
+        | null;
+      if (
+        payload &&
+        !Array.isArray(payload) &&
+        typeof payload.code === 'number' &&
+        payload.code !== 0 &&
+        payload.code !== 200
+      ) {
+        recordAgentRouterDiag(
+          `${creds.v1Origin}/models`,
+          payload.code,
+          payload.msg || 'AgentRouter error'
+        );
+        if (payload.code === 401 || payload.code === 403) {
+          continue;
+        }
+        return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
+      }
+      preferredHeaderProfile = profile;
+      const list = Array.isArray((payload as { data?: unknown[] } | null)?.data)
+        ? (payload as { data: unknown[] }).data
+        : Array.isArray(payload)
+          ? payload
+          : [];
       recordAgentRouterDiag(
         `${creds.v1Origin}/models`,
         res.status,
-        ct.includes('text/html') ? 'HTML/WAF response' : errBody || `HTTP ${res.status}`
+        `ok (${list.length} models)`
       );
-      return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
-    }
-    const payload = (await res.json().catch(() => null)) as
-      | { data?: unknown[]; code?: number; msg?: string }
-      | unknown[]
-      | null;
-    if (
-      payload &&
-      !Array.isArray(payload) &&
-      typeof payload.code === 'number' &&
-      payload.code !== 0 &&
-      payload.code !== 200
-    ) {
-      recordAgentRouterDiag(
-        `${creds.v1Origin}/models`,
-        payload.code,
-        payload.msg || 'AgentRouter error'
-      );
-      return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
-    }
-    const list = Array.isArray((payload as { data?: unknown[] } | null)?.data)
-      ? (payload as { data: unknown[] }).data
-      : Array.isArray(payload)
-        ? payload
-        : [];
-    recordAgentRouterDiag(
-      `${creds.v1Origin}/models`,
-      res.status,
-      `ok (${list.length} models)`
-    );
-    const names: string[] = [];
-    for (const entry of list) {
-      const id =
-        typeof entry === 'string'
-          ? entry.trim()
-          : entry && typeof entry === 'object' && 'id' in entry
-            ? String((entry as { id: unknown }).id || '').trim()
-            : '';
-      if (!id || names.includes(id)) continue;
-      if (
-        /^(whisper|tts|dall-e|gpt-image|text-embedding|embedding|moderation)/i.test(id)
-      ) {
-        continue;
+      const names: string[] = [];
+      for (const entry of list) {
+        const id =
+          typeof entry === 'string'
+            ? entry.trim()
+            : entry && typeof entry === 'object' && 'id' in entry
+              ? String((entry as { id: unknown }).id || '').trim()
+              : '';
+        if (!id || names.includes(id)) continue;
+        if (
+          /^(whisper|tts|dall-e|gpt-image|text-embedding|embedding|moderation)/i.test(id)
+        ) {
+          continue;
+        }
+        names.push(id);
+        if (names.length >= 40) break;
       }
-      names.push(id);
-      if (names.length >= 40) break;
+      if (names.length > 0) {
+        agentRouterModelsCache = { models: names, at: Date.now() };
+      }
+      break;
+    } catch {
+      // keep trying alternate profile or cached list
+    } finally {
+      clearTimeout(timer);
     }
-    if (names.length > 0) {
-      agentRouterModelsCache = { models: names, at: Date.now() };
-    }
-  } catch {
-    // keep cached/fallback list
-  } finally {
-    clearTimeout(timer);
   }
   return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
 }
@@ -911,9 +978,7 @@ export function cooldownForMeshError(
     return { ms: 6_000, hard: false };
   }
   if (isAuthError(info)) {
-    // Keep auth cooldown short (15s) so if the user updates their key or retries,
-    // it recovers promptly without sticking for 10 minutes.
-    return { ms: 15_000, hard: false };
+    return { ms: 5_000, hard: false };
   }
   if (
     info.status === 404 ||
@@ -1127,8 +1192,12 @@ async function postJsonEndpoint(
 type ProtocolKind = 'chat_completions' | 'responses' | 'anthropic_messages';
 
 function protocolsForCandidate(model: string): ProtocolKind[] {
-  if (/^claude/i.test(model.trim())) {
+  const lower = model.trim().toLowerCase();
+  if (/^claude/i.test(lower)) {
     return ['anthropic_messages', 'chat_completions', 'responses'];
+  }
+  if (/5\.6/.test(lower)) {
+    return ['chat_completions', 'responses', 'anthropic_messages'];
   }
   return ['chat_completions', 'responses'];
 }
@@ -1141,7 +1210,8 @@ function shouldFallbackProtocol(err: unknown): boolean {
     info.status === 404 ||
     info.status === 405 ||
     info.status === 415 ||
-    /unsupported|not supported|unknown endpoint|use \/v1\/(responses|messages)|claude_native/.test(
+    info.status === 501 ||
+    /unsupported|not supported|unknown endpoint|use \/v1\/(responses|messages|chat)|claude_native/.test(
       lower
     )
   );
@@ -1366,24 +1436,10 @@ async function streamOneMeshCandidateRaw(
     let attemptWithImage = hasImage;
     for (let imageRetry = 0; imageRetry < 2; imageRetry += 1) {
       let url = candidate.baseUrl;
-      let headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream, application/json, text/plain',
-        Authorization: `Bearer ${candidate.apiKey}`,
-        ...(candidate.headers || {}),
-      };
       let body: Record<string, unknown>;
 
       if (protocol === 'anthropic_messages') {
         url = toMessagesUrl(candidate.v1Origin);
-        headers = {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream, application/json',
-          'x-api-key': candidate.apiKey,
-          Authorization: `Bearer ${candidate.apiKey}`,
-          'anthropic-version': '2023-06-01',
-          ...(candidate.headers || {}),
-        };
         body = {
           model: candidate.model,
           max_tokens: 8192,
@@ -1431,31 +1487,70 @@ async function streamOneMeshCandidateRaw(
         };
       }
 
-      try {
-        const res = await postJsonEndpoint(url, headers, body, candidate, params);
-        return await consumeSseOrJsonStream(
-          res,
-          protocol,
-          params,
-          onChunk,
-          onReasoning
-        );
-      } catch (err) {
-        lastErr = err;
-        const info = normalizeMeshError(err);
-        if (
-          attemptWithImage &&
-          info.status !== null &&
-          [400, 413, 415, 422].includes(info.status)
-        ) {
-          attemptWithImage = false;
-          continue;
+      const defaultProfile: AgentRouterHeaderProfile =
+        protocol === 'anthropic_messages' ? 'claude' : preferredHeaderProfile;
+      const profiles = orderedHeaderProfiles(defaultProfile);
+
+      let retryWithImageFallback = false;
+      let fallbackToNextProtocol = false;
+
+      for (const profile of profiles) {
+        const headers: Record<string, string> =
+          protocol === 'anthropic_messages'
+            ? {
+                'Content-Type': 'application/json',
+                Accept: 'text/event-stream, application/json',
+                'x-api-key': candidate.apiKey,
+                Authorization: `Bearer ${candidate.apiKey}`,
+                'anthropic-version': '2023-06-01',
+                ...buildHeaderProfileHeaders(profile),
+              }
+            : {
+                'Content-Type': 'application/json',
+                Accept: 'text/event-stream, application/json, text/plain',
+                Authorization: `Bearer ${candidate.apiKey}`,
+                ...(profile === 'codex' && candidate.headers ? candidate.headers : {}),
+                ...buildHeaderProfileHeaders(profile),
+              };
+
+        try {
+          const res = await postJsonEndpoint(url, headers, body, candidate, params);
+          preferredHeaderProfile = profile;
+          return await consumeSseOrJsonStream(
+            res,
+            protocol,
+            params,
+            onChunk,
+            onReasoning
+          );
+        } catch (err) {
+          lastErr = err;
+          const info = normalizeMeshError(err);
+          if (isAuthError(info)) {
+            // Try the next client header profile (e.g. standard / claude / codex)
+            // before concluding the API key itself is invalid.
+            continue;
+          }
+          if (
+            attemptWithImage &&
+            info.status !== null &&
+            [400, 413, 415, 422].includes(info.status)
+          ) {
+            attemptWithImage = false;
+            retryWithImageFallback = true;
+            break;
+          }
+          if (shouldFallbackProtocol(err)) {
+            fallbackToNextProtocol = true;
+            break;
+          }
+          throw err;
         }
-        if (shouldFallbackProtocol(err)) {
-          break; // try next protocol
-        }
-        throw err;
       }
+
+      if (retryWithImageFallback) continue;
+      if (fallbackToNextProtocol) break;
+      if (lastErr) throw lastErr;
     }
   }
 
