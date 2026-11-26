@@ -1,22 +1,23 @@
 /**
- * AgentRouter engine test (run against local mock OpenAI-compatible server).
+ * Gemini engine test (run against local mock Gemini MLDev server).
  *
  * Asserts:
- *   1. Only AgentRouter is registered (no Pollinations / keyless providers).
- *   2. Model options surface AgentRouter models (`agentrouter::auto`, etc.).
+ *   1. Only Gemini is registered (no Pollinations / AgentRouter / keyless providers).
+ *   2. Model options surface Gemini models (`gemini::gemini-4-hydrogen`, etc.).
  *   3. streamFreeAiMesh & completeFreeAiMesh & streamServerFreeAiRealTime stream/return text.
- *   4. Error cooldown classifications (busy, auth 401, rate-limit 429).
- *   5. Bounded cooldown wait self-heals on short cooldowns.
- *   6. Daily quota failover across AgentRouter models and clean error on exhaustion.
+ *   4. generateMediaAsset creates images and forwards user attachments for image editing.
+ *   5. Error cooldown classifications (busy, auth 401, rate-limit 429).
+ *   6. Bounded cooldown wait self-heals on short cooldowns.
+ *   7. Daily quota failover across Gemini models and clean error on exhaustion.
  */
 import { scrubAiEnv } from './_testEnv.js';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 
 scrubAiEnv();
-process.env.AGENTROUTER_API_KEY = 'sk-test-agentrouter-key';
-process.env.AGENTROUTER_BASE_URL = 'http://127.0.0.1:4592/v1';
-process.env.AGENTROUTER_MODELS = 'gpt-6.2-sol,gpt-6.2-astra';
+process.env.GEMINI_API_KEY = 'AIzaSyTestGeminiKey1234567890';
+process.env.GEMINI_API_BASE_URL = 'http://127.0.0.1:4592';
+process.env.GEMINI_MODELS = 'gemini-4-hydrogen,gemini-3.1-flash-lite';
 
 const mockScript = path.join(import.meta.dirname, 'mock-free-ai-server.mjs');
 const mock = spawn('node', [mockScript, 'streaming', '4592'], { stdio: 'inherit' });
@@ -29,7 +30,7 @@ async function waitForPort(port: number, timeoutMs = 5000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(500) });
+      await fetch(`http://127.0.0.1:${port}/__stats`, { signal: AbortSignal.timeout(500) });
       return;
     } catch {
       if (Date.now() > deadline) throw new Error(`mock on :${port} did not start`);
@@ -51,6 +52,7 @@ const {
   FreeAiMeshAllFailedError,
 } = await import('../api/_freeAiMesh.js');
 const { streamServerFreeAiRealTime } = await import('../api/_realtimeEngine.js');
+const { generateMediaAsset } = await import('../api/_mediaService.js');
 const { buildCandidateCooldownKey, markGatewayCandidateCooldown } = await import(
   '../api/_aiGateways.js'
 );
@@ -63,22 +65,25 @@ function assert(cond: unknown, msg: string): asserts cond {
 }
 
 // --- 1: status ------------------------------------------------------------
-assert(isFreeAiMeshAvailable(), 'AgentRouter engine should be available when configured');
+assert(isFreeAiMeshAvailable(), 'Gemini engine should be available when configured');
 const status = getFreeAiMeshStatus();
 const configured = status.providers.filter((p) => p.configured).map((p) => p.id);
 console.log('configured providers:', configured.join(', '));
 assert(
-  configured.length === 1 && configured[0] === 'agentrouter',
-  `expected only agentrouter configured, got ${configured.join(', ')}`
+  configured.length === 1 && configured[0] === 'gemini',
+  `expected only gemini configured, got ${configured.join(', ')}`
 );
 assert(!status.hasKeyless && !status.pollinationsConfigured, 'keyless/pollinations must be false');
 
 // --- 2: model options -----------------------------------------------------
 const options = getFreeMeshModelOptions();
-assert(options[0]?.id === 'agentrouter::auto', 'first option must be agentrouter::auto');
 assert(
-  options.every((m) => m.id.startsWith('agentrouter::')),
-  'all model options must belong to agentrouter'
+  options[0]?.id === 'gemini::gemini-4-hydrogen',
+  `first option must be gemini::gemini-4-hydrogen, got ${options[0]?.id}`
+);
+assert(
+  options.every((m) => m.id.startsWith('gemini::')),
+  'all model options must belong to gemini'
 );
 
 // --- 3: streaming & non-streaming ----------------------------------------
@@ -92,10 +97,10 @@ const result1 = await streamFreeAiMesh({
   onModelMeta: (m) => seenModels.push(m.modelId),
   onContentChunk: (c) => chunks.push(c),
 });
-assert(result1.provider === 'agentrouter', `expected agentrouter provider, got ${result1.provider}`);
+assert(result1.provider === 'gemini', `expected gemini provider, got ${result1.provider}`);
 assert(result1.rawOutput.includes('Build success'), `unexpected output: ${result1.rawOutput}`);
 assert(chunks.length >= 1, 'expected streamed chunks');
-assert(seenModels.some((m) => m.startsWith('agentrouter::')), 'expected agentrouter model meta');
+assert(seenModels.some((m) => m.startsWith('gemini::')), 'expected gemini model meta');
 
 const completed = await completeFreeAiMesh({
   taskKind: 'build',
@@ -115,21 +120,42 @@ const engineResult = await streamServerFreeAiRealTime({
     engineText += c;
   },
 });
-assert(engineResult.provider === 'agentrouter', 'engine provider must be agentrouter');
+assert(engineResult.provider === 'gemini', 'engine provider must be gemini');
 assert(engineText.includes('Build success'), 'engine should stream chunks via onContentChunk');
 
-// --- 4: error cooldown classification ------------------------------------
-const authCooldown = cooldownForMeshError({ status: 401, message: 'Invalid API Key!' });
+// --- 4: Gemini image generation & image-to-image editing ------------------
+const textImg = await generateMediaAsset({
+  kind: 'image',
+  prompt: 'Create an image of a futuristic sunset city',
+});
+assert(textImg.gateway === 'gemini', `expected gemini media gateway, got ${textImg.gateway}`);
+assert(textImg.dataUrl.startsWith('data:image/png;base64,'), 'expected PNG dataUrl from Gemini image model');
+
+const samplePngDataUrl =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+const editImg = await generateMediaAsset({
+  kind: 'image',
+  prompt: 'Make this photo look like a neon cyberpunk poster',
+  attachmentDataUrl: samplePngDataUrl,
+});
+assert(editImg.gateway === 'gemini', 'image-to-image gateway must be gemini');
+assert(editImg.dataUrl.startsWith('data:image/png;base64,'), 'edited image must return PNG dataUrl');
+const mockStats = (await (await fetch('http://127.0.0.1:4592/__stats')).json()) as {
+  lastImageHasAttachment?: boolean;
+};
+assert(mockStats.lastImageHasAttachment === true, 'attachment inlineData must reach Gemini image model');
+
+// --- 5: error cooldown classification ------------------------------------
+const authCooldown = cooldownForMeshError({ status: 401, message: 'API key not valid' });
 assert(authCooldown.ms <= 20_000 && !authCooldown.hard, 'auth cooldown should stay short');
 
-const rateLimitCooldown = cooldownForMeshError({ status: 429, message: 'Rate limit reached.' });
+const rateLimitCooldown = cooldownForMeshError({ status: 429, message: 'Quota exceeded.' });
 assert(rateLimitCooldown.ms >= 30_000, 'rate limit should set cooldown >= 30s');
 
-const { FREE_MODEL_CATALOG } = await import('../api/_freeAiCatalog.js');
-// --- 5: bounded cooldown wait & self-heal ---------------------------------
-for (const model of FREE_MODEL_CATALOG.agentrouter) {
+// --- 6: bounded cooldown wait & self-heal ---------------------------------
+for (const model of ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']) {
   markGatewayCandidateCooldown(
-    buildCandidateCooldownKey('mesh:agentrouter', 'sk-test-agentrouter-key', model),
+    buildCandidateCooldownKey('gemini', 'AIzaSyTestGeminiKey1234567890', model),
     2_500,
     false
   );
@@ -144,7 +170,7 @@ const healElapsed = Date.now() - healStartedAt;
 assert(healed.rawOutput.includes('Build success'), 'walk must self-heal after cooldown');
 assert(healElapsed >= 2_000, `expected cooldown wait >= 2000ms, got ${healElapsed}ms`);
 
-// --- 6: daily quota failover ---------------------------------------------
+// --- 7: daily quota failover ---------------------------------------------
 resetMeshDailyUsage();
 process.env.MESH_DAILY_LIMIT_PER_MODEL = '1';
 
@@ -154,10 +180,13 @@ const quota1 = await streamFreeAiMesh({
   historyMessages: [],
   userPrompt: 'Say hello',
 });
-assert(quota1.modelUsed === 'agentrouter::gpt-6.2-sol', `expected gpt-6.2-sol, got ${quota1.modelUsed}`);
+assert(
+  quota1.modelUsed === 'gemini::gemini-4-hydrogen',
+  `expected gemini-4-hydrogen, got ${quota1.modelUsed}`
+);
 const usageAfterFirst = getMeshDailyUsage();
 assert(
-  (usageAfterFirst['agentrouter|gpt-6.2-sol|' + new Date().toISOString().slice(0, 10)] ?? 0) >= 1,
+  (usageAfterFirst['gemini|gemini-4-hydrogen|' + new Date().toISOString().slice(0, 10)] ?? 0) >= 1,
   'quota should record usage'
 );
 
@@ -167,7 +196,10 @@ const quota2 = await streamFreeAiMesh({
   historyMessages: [],
   userPrompt: 'Say hello again',
 });
-assert(quota2.modelUsed === 'agentrouter::gpt-6.2-astra', `expected gpt-6.2-astra, got ${quota2.modelUsed}`);
+assert(
+  quota2.modelUsed === 'gemini::gemini-3.1-flash-lite',
+  `expected gemini-3.1-flash-lite, got ${quota2.modelUsed}`
+);
 
 // Drain any remaining candidates then assert quota error
 let quotaError: unknown = null;
@@ -187,9 +219,9 @@ try {
 }
 assert(
   quotaError instanceof FreeAiMeshAllFailedError ||
-    (quotaError instanceof Error && /AgentRouter/i.test(quotaError.message)),
-  `expected AgentRouter error when quota exhausted, got: ${String(quotaError)}`
+    (quotaError instanceof Error && /Gemini/i.test(quotaError.message)),
+  `expected Gemini error when quota exhausted, got: ${String(quotaError)}`
 );
 
-console.log('ALL AGENTROUTER ENGINE TESTS PASSED');
+console.log('ALL GEMINI ENGINE TESTS PASSED');
 process.exit(0);

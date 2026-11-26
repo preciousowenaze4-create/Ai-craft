@@ -26,6 +26,9 @@ const AI_ENV_VARS = [
   'MY_GEMINI_API_KEY',
   'YOUR_GEMINI_API_KEY',
   'GOOGLE_API_KEY',
+  'GEMINI_API_BASE_URL',
+  'GEMINI_MODEL',
+  'GEMINI_MODELS',
   // Free AI mesh providers (see api/_freeAiMesh.ts)
   'SELF_HOSTED_LLM_URL',
   'SELF_HOSTED_LLM_MODEL',

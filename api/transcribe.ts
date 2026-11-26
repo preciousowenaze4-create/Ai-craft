@@ -87,7 +87,7 @@ export async function POST(request: Request): Promise<Response> {
       : new Error('Unable to transcribe audio input.');
   } catch (err) {
     void recordGeminiApiError({
-      modelId: 'gemini-3.8-flash',
+      modelId: 'gemini-3.1-flash-lite',
       error: err,
       source: 'transcribe',
     });

@@ -6,6 +6,7 @@ import {
   commitGenerationCredits,
   verifyUserCanGenerate,
 } from './_billing.js';
+import { generateMediaAsset } from './_mediaService.js';
 import {
   finalizeRealtimeOutput,
   prepareRealtimePrompt,
@@ -315,6 +316,38 @@ export async function POST(request: Request): Promise<Response> {
       );
     }
 
+    const rawAttachment = body.attachmentDataUrl ?? opts.attachmentDataUrl;
+    const attachmentDataUrl =
+      typeof rawAttachment === 'string' && rawAttachment.startsWith('data:image/')
+        ? rawAttachment
+        : null;
+
+    if (prepared.naturalMediaIntent) {
+      const mediaResult = await generateMediaAsset({
+        kind: prepared.naturalMediaIntent,
+        prompt: message,
+        requestedModel: typeof body.model === 'string' ? body.model : undefined,
+        attachmentDataUrl,
+      });
+      return Response.json(
+        {
+          kind: 'media',
+          aiText: `Generated your ${prepared.naturalMediaIntent}: "${message.slice(0, 120)}"`,
+          previewHtml: '',
+          files: [],
+          suggestions: [],
+          dbTables: [],
+          bytesBuilt: 0,
+          media: mediaResult,
+          modelUsed: mediaResult.modelId || 'gemini-3.1-flash-lite-image',
+          modelName: prepared.requestedModelLabel || 'Google Gemini',
+          provider: mediaResult.gateway,
+          searchData: prepared.searchData,
+        },
+        { headers: { 'Cache-Control': 'no-store' } }
+      );
+    }
+
     let rawOutput = '';
     const previousHtmlForRoute =
       typeof body.previousHtml === 'string' ? body.previousHtml : '';
@@ -324,10 +357,7 @@ export async function POST(request: Request): Promise<Response> {
       systemPrompt: prepared.systemPrompt,
       historyMessages: prepared.historyMessages,
       userPrompt: prepared.userPrompt,
-      attachmentDataUrl:
-        typeof (body.attachmentDataUrl ?? opts.attachmentDataUrl) === 'string'
-          ? String(body.attachmentDataUrl ?? opts.attachmentDataUrl)
-          : null,
+      attachmentDataUrl,
       allowParallelAgents:
         prepared.initialRoute === 'build' &&
         !prepared.isPatchMode &&
@@ -348,11 +378,31 @@ export async function POST(request: Request): Promise<Response> {
       message,
       mode,
       previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
-      hasAttachment: Boolean(body.attachmentDataUrl ?? opts.attachmentDataUrl),
+      hasAttachment: Boolean(attachmentDataUrl),
       modelUsed: streamRes.modelUsed,
       modelName: streamRes.modelName,
       provider: streamRes.provider,
     });
+
+    if (finalized.kind === 'media') {
+      const mediaResult = await generateMediaAsset({
+        kind: 'image',
+        prompt: finalized.mediaPrompt || message,
+        requestedModel: typeof body.model === 'string' ? body.model : undefined,
+        attachmentDataUrl,
+      });
+      return Response.json(
+        {
+          ...finalized,
+          media: mediaResult,
+          modelUsed: mediaResult.modelId || finalized.modelUsed,
+          modelName: prepared.requestedModelLabel || finalized.modelName,
+          provider: mediaResult.gateway,
+          searchData: prepared.searchData,
+        },
+        { headers: { 'Cache-Control': 'no-store' } }
+      );
+    }
 
     return Response.json(
       {
@@ -365,7 +415,7 @@ export async function POST(request: Request): Promise<Response> {
     const message =
       err instanceof Error
         ? err.message
-        : 'Unable to run free browser AI right now.';
+        : 'Unable to run Gemini AI right now.';
     return Response.json({ error: message }, { status: 502 });
   }
 }

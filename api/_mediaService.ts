@@ -1,11 +1,12 @@
 import crypto from 'node:crypto';
+import type { GenerateContentConfig, Part } from '@google/genai';
 import {
+  getServerGeminiApiKeys,
   hasServerFreeAiKey,
   parseGatewayModelIdentifier,
   resolveDynamicGeminiExecutionMatrix,
 } from './_aiGateways.js';
 import { createGeminiClient } from './_realtimeEngine.js';
-import { runLiveBrowserSearch } from './_builderCore.js';
 import { isTextToSpeechModel } from './_openrouterModels.js';
 import {
   recordGeminiApiError,
@@ -21,6 +22,7 @@ export interface GeneratedMediaResult {
   mimeType: string;
   modelId: string;
   gateway: 'gemini' | 'web-search' | 'browser';
+  revisedPrompt?: string;
   lyrics?: string;
 }
 
@@ -33,159 +35,200 @@ function bufferToDataUrl(buf: ArrayBuffer | Uint8Array, mimeType: string): strin
   return `data:${mimeType};base64,${b.toString('base64')}`;
 }
 
-function looksLikeValidImageBuffer(buf: Uint8Array): boolean {
-  if (buf.byteLength < 1024) return false;
-  // JPEG: FF D8 FF
-  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true;
-  // PNG: 89 50 4E 47
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
-    return true;
-  }
-  // WEBP: RIFF....WEBP
-  if (
-    buf[0] === 0x52 &&
-    buf[1] === 0x49 &&
-    buf[2] === 0x46 &&
-    buf[3] === 0x46 &&
-    buf[8] === 0x57 &&
-    buf[9] === 0x45 &&
-    buf[10] === 0x42 &&
-    buf[11] === 0x50
-  ) {
-    return true;
-  }
-  return false;
-}
+export const DEFAULT_GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
+export const PRO_GEMINI_IMAGE_MODEL = 'gemini-nano-banana-2.1';
 
-async function fetchImageBytesAsDataUrl(
-  imageUrl: string,
-  timeoutMs = 5500
-): Promise<{ dataUrl: string; mimeType: string } | null> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(imageUrl, {
-      signal: controller.signal,
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        Accept: 'image/avif,image/webp,image/png,image/jpeg,*/*;q=0.8',
-      },
-    });
-    if (!res.ok) return null;
-    const rawMime = (res.headers.get('content-type') || '')
-      .split(';')[0]
-      ?.trim()
-      .toLowerCase();
-    const buf = new Uint8Array(await res.arrayBuffer());
-    if (!looksLikeValidImageBuffer(buf)) return null;
-    const detectedMime =
-      rawMime && rawMime.startsWith('image/') && !rawMime.includes('svg')
-        ? rawMime
-        : buf[0] === 0x89
-          ? 'image/png'
-          : buf[0] === 0x52
-            ? 'image/webp'
-            : 'image/jpeg';
-    return {
-      dataUrl: bufferToDataUrl(buf, detectedMime),
-      mimeType: detectedMime,
-    };
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Keyless AI image generation via Pollinations. Returns null on any failure
- * so callers can fall through to web search / SVG studio fallbacks.
- */
-async function fetchPollinationsAiImage(
-  prompt: string
-): Promise<{ dataUrl: string; mimeType: string } | null> {
-  const baseUrl = (
-    process.env.POLLINATIONS_IMAGE_BASE_URL || 'https://image.pollinations.ai'
-  ).trim().replace(/\/+$/, '');
-  if (!/^https?:\/\//i.test(baseUrl)) return null;
-  try {
-    const seed = Math.floor(Math.random() * 1_000_000);
-    const url =
-      `${baseUrl}/prompt/${encodeURIComponent(prompt.slice(0, 800))}` +
-      `?width=1024&height=1024&nologo=true&seed=${seed}&model=flux`;
-    const downloaded = await fetchImageBytesAsDataUrl(url, 25000);
-    if (!downloaded) return null;
-    return downloaded;
-  } catch {
+function parseInlineImageDataUrl(
+  dataUrl?: string | null
+): { mimeType: string; data: string } | null {
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) {
     return null;
   }
+  const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/i.exec(dataUrl.trim());
+  if (!match?.[1] || !match?.[2]) return null;
+  return {
+    mimeType: match[1].toLowerCase(),
+    data: match[2].replace(/\s+/g, ''),
+  };
 }
 
-async function fetchVerifiedWebImageFallback(
-  prompt: string
-): Promise<GeneratedMediaResult | null> {
-  try {
-    const cleanQuery = prompt
-      .replace(
-        /^(?:please\s+)?(?:can you\s+)?(?:generate|create|make|draw|paint|render|design|show(?:\s+me)?|search(?:\s+for)?|find(?:\s+me)?)\s+(?:an?\s+|the\s+|some\s+)?(?:real\s+|realistic\s+|high\s+quality\s+|hd\s+)?(?:image|photo|picture|illustration|artwork|wallpaper|logo|icon)(?:\s+of|\s+for|\s+showing)?\s*/i,
-        ''
-      )
-      .trim() || prompt;
-    const searchData = await runLiveBrowserSearch(cleanQuery);
-    const candidates = searchData.images.map((i) => i.imageUrl).filter(Boolean);
-    for (const url of candidates.slice(0, 8)) {
-      const downloaded = await fetchImageBytesAsDataUrl(url, 4500);
-      if (downloaded) {
-        return {
-          kind: 'image',
-          prompt,
-          dataUrl: downloaded.dataUrl,
-          mimeType: downloaded.mimeType,
-          modelId: 'google-image-search',
-          gateway: 'web-search',
+function inferImageOptions(prompt: string, requestedModel?: string): {
+  primaryModel: string;
+  aspectRatio?: string;
+  imageSize?: '1K' | '2K' | '4K';
+  useSearchGrounding: boolean;
+} {
+  const lower = prompt.toLowerCase();
+  const bareReq = (requestedModel || '')
+    .trim()
+    .replace(/^gemini::/i, '')
+    .replace(/^models\//i, '')
+    .toLowerCase();
+
+  let aspectRatio: string | undefined;
+  const ratioMatch = /\b(1:1|16:9|9:16|4:3|3:4|3:2|2:3|4:5|5:4|21:9|1:4|4:1|1:8|8:1)\b/.exec(
+    lower
+  );
+  if (ratioMatch?.[1]) {
+    aspectRatio = ratioMatch[1];
+  } else if (/\b(?:wallpaper|youtube thumbnail|landscape|widescreen|desktop banner|cinema(?:tic)?\s*wide)\b/i.test(lower)) {
+    aspectRatio = '16:9';
+  } else if (/\b(?:phone wallpaper|story|reel|tiktok|portrait|vertical|9:16)\b/i.test(lower)) {
+    aspectRatio = '9:16';
+  } else if (/\b(?:square|avatar|profile\s*pic|album\s*cover|icon)\b/i.test(lower)) {
+    aspectRatio = '1:1';
+  }
+
+  let imageSize: '1K' | '2K' | '4K' | undefined;
+  if (/\b4k\b|ultra\s*hd|uhd/i.test(lower)) imageSize = '4K';
+  else if (/\b2k\b|high[- ]?res(?:olution)?/i.test(lower)) imageSize = '2K';
+
+  const needsBananaRatio = Boolean(
+    aspectRatio && ['1:4', '4:1', '1:8', '8:1'].includes(aspectRatio)
+  );
+  const useSearchGrounding =
+    /\b(?:real[- ]world|latest|current|today|news|forecast|live photo)\b/i.test(lower);
+
+  const explicitPro =
+    bareReq === PRO_GEMINI_IMAGE_MODEL || bareReq === 'gemini-3-pro-image';
+  const primaryModel =
+    explicitPro || imageSize || needsBananaRatio || useSearchGrounding
+      ? PRO_GEMINI_IMAGE_MODEL
+      : DEFAULT_GEMINI_IMAGE_MODEL;
+
+  return {
+    primaryModel,
+    aspectRatio,
+    imageSize,
+    useSearchGrounding,
+  };
+}
+
+async function generateGeminiImageAsset(params: {
+  prompt: string;
+  requestedModel?: string;
+  attachmentDataUrl?: string | null;
+}): Promise<GeneratedMediaResult> {
+  const keys = getServerGeminiApiKeys();
+  if (keys.length === 0) {
+    throw new Error(
+      'GEMINI_API_KEY is required to create or edit images. Add GEMINI_API_KEY in Settings > Secrets.'
+    );
+  }
+
+  const cleanPrompt = params.prompt.trim().slice(0, 1500);
+  const attachedImage = parseInlineImageDataUrl(params.attachmentDataUrl);
+  const opts = inferImageOptions(cleanPrompt, params.requestedModel);
+  const modelChain =
+    opts.primaryModel === PRO_GEMINI_IMAGE_MODEL
+      ? [PRO_GEMINI_IMAGE_MODEL, DEFAULT_GEMINI_IMAGE_MODEL]
+      : [DEFAULT_GEMINI_IMAGE_MODEL, PRO_GEMINI_IMAGE_MODEL];
+
+  let lastError: unknown = null;
+
+  for (const modelId of modelChain) {
+    for (const apiKey of keys) {
+      try {
+        const ai = createGeminiClient(apiKey);
+        const isBanana = modelId === PRO_GEMINI_IMAGE_MODEL;
+        const imageConfig: Record<string, string> = {};
+        if (opts.aspectRatio) {
+          if (
+            isBanana ||
+            !['1:4', '4:1', '1:8', '8:1'].includes(opts.aspectRatio)
+          ) {
+            imageConfig.aspectRatio = opts.aspectRatio;
+          }
+        }
+        if (isBanana && opts.imageSize) {
+          imageConfig.imageSize = opts.imageSize;
+        }
+
+        // Never set responseMimeType or responseSchema on Gemini image models.
+        const config: GenerateContentConfig = {
+          ...(Object.keys(imageConfig).length > 0 ? { imageConfig } : {}),
+          ...(isBanana && opts.useSearchGrounding
+            ? { tools: [{ googleSearch: {} }] }
+            : {}),
         };
+
+        const contents = attachedImage
+          ? {
+              parts: [
+                {
+                  inlineData: {
+                    data: attachedImage.data,
+                    mimeType: attachedImage.mimeType,
+                  },
+                },
+                {
+                  text: cleanPrompt,
+                },
+              ] satisfies Part[],
+            }
+          : cleanPrompt;
+
+        const response = await ai.models.generateContent({
+          model: modelId,
+          contents,
+          config: Object.keys(config).length > 0 ? config : undefined,
+        });
+
+        const parts = response.candidates?.[0]?.content?.parts ?? [];
+        let imageData = '';
+        let imageMime = 'image/png';
+        let revisedText = '';
+
+        for (const part of parts) {
+          if (part.inlineData?.data && !imageData) {
+            imageData = part.inlineData.data;
+            imageMime = part.inlineData.mimeType || 'image/png';
+          } else if (typeof part.text === 'string' && part.text.trim()) {
+            revisedText = revisedText
+              ? `${revisedText}\n${part.text.trim()}`
+              : part.text.trim();
+          }
+        }
+
+        const usage = response.usageMetadata;
+        void recordGeminiApiUsage({
+          modelId,
+          promptTokens: usage?.promptTokenCount,
+          candidatesTokens: usage?.candidatesTokenCount,
+          totalTokens:
+            usage?.totalTokenCount ?? Math.max(250, Math.ceil(cleanPrompt.length / 3)),
+          source: 'media-image',
+        });
+
+        if (imageData) {
+          return {
+            kind: 'image',
+            prompt: cleanPrompt,
+            dataUrl: `data:${imageMime};base64,${imageData}`,
+            mimeType: imageMime,
+            modelId: `gemini::${modelId}`,
+            gateway: 'gemini',
+            ...(revisedText ? { revisedPrompt: revisedText } : {}),
+          };
+        }
+
+        lastError = new Error(
+          revisedText || `Gemini model ${modelId} did not return an image.`
+        );
+      } catch (err) {
+        lastError = err;
+        void recordGeminiApiError({
+          modelId,
+          error: err,
+          source: 'media-image',
+        });
       }
     }
-  } catch {
-    // ignore search fallback error
   }
-  return null;
-}
 
-function buildKeylessSvgArtwork(prompt: string, isMotion = false): string {
-  const safe = prompt
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .slice(0, 68);
-  const hash = Array.from(prompt).reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) % 360, 42);
-  const h1 = hash;
-  const h2 = (hash + 65) % 360;
-  const h3 = (hash + 140) % 360;
-  const animRing = isMotion
-    ? `<circle cx="400" cy="400" r="145" fill="none" stroke="rgba(255,255,255,0.45)" stroke-width="4" stroke-dasharray="28 18"><animateTransform attributeName="transform" type="rotate" from="0 400 400" to="360 400 400" dur="8s" repeatCount="indefinite"/></circle>`
-    : '';
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" width="800" height="800">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="hsl(${h1},78%,56%)"/>
-      <stop offset="50%" stop-color="hsl(${h2},74%,46%)"/>
-      <stop offset="100%" stop-color="hsl(${h3},68%,24%)"/>
-    </linearGradient>
-    <radialGradient id="glow" cx="50%" cy="42%" r="55%">
-      <stop offset="0%" stop-color="rgba(255,255,255,0.42)"/>
-      <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
-    </radialGradient>
-  </defs>
-  <rect width="800" height="800" fill="url(#bg)"/>
-  <circle cx="400" cy="360" r="290" fill="url(#glow)"/>
-  ${animRing}
-  <rect x="64" y="610" width="672" height="126" rx="24" fill="rgba(11,11,15,0.52)"/>
-  <text x="96" y="666" font-family="system-ui,sans-serif" font-size="24" font-weight="700" fill="#ffffff">${isMotion ? 'Motion Studio Preview' : 'AI Craft Studio'}</text>
-  <text x="96" y="704" font-family="system-ui,sans-serif" font-size="18" fill="rgba(255,255,255,0.85)">${safe}</text>
-</svg>`;
-  return `data:image/svg+xml;base64,${Buffer.from(svg, 'utf8').toString('base64')}`;
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Unable to generate image with Gemini right now.');
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1099,8 +1142,9 @@ export async function generateMediaAsset(params: {
   kind: MediaAssetKind;
   prompt: string;
   requestedModel?: string;
+  attachmentDataUrl?: string | null;
 }): Promise<GeneratedMediaResult> {
-  const cleanPrompt = params.prompt.trim().slice(0, 1200);
+  const cleanPrompt = params.prompt.trim().slice(0, 1500);
   if (!cleanPrompt) {
     throw new Error('A prompt is required to generate media.');
   }
@@ -1108,7 +1152,7 @@ export async function generateMediaAsset(params: {
   const parsed = parseGatewayModelIdentifier(params.requestedModel);
   if (isTextToSpeechModel(parsed.upstreamModelId)) {
     throw new Error(
-      'Text-to-Speech models are disabled. Use an Image, Music, or Video model.'
+      'Text-to-Speech models are disabled. Use an Image or Music prompt.'
     );
   }
 
@@ -1116,40 +1160,15 @@ export async function generateMediaAsset(params: {
     return generateKeylessAiMusic(cleanPrompt);
   }
 
-  // Keyless AI image generation via Pollinations (opt-out: POLLINATIONS_IMAGE_ENABLED=false)
-  if (
-    params.kind === 'image' &&
-    (process.env.POLLINATIONS_IMAGE_ENABLED || '').trim().toLowerCase() !== 'false'
-  ) {
-    const aiImg = await fetchPollinationsAiImage(cleanPrompt);
-    if (aiImg) {
-      return {
-        kind: params.kind,
-        prompt: cleanPrompt,
-        dataUrl: aiImg.dataUrl,
-        mimeType: aiImg.mimeType,
-        modelId: 'pollinations::flux',
-        gateway: 'browser',
-      };
-    }
+  if (params.kind === 'video') {
+    throw new Error(
+      'Video generation requires Gemini Veo API provisioning; use Gemini image generation or ask to build a video app instead.'
+    );
   }
 
-  // Real Google / Bing / Wikimedia web image search
-  const webImg = await fetchVerifiedWebImageFallback(cleanPrompt);
-  if (webImg) {
-    return {
-      ...webImg,
-      kind: params.kind,
-    };
-  }
-
-  // Guaranteed inline SVG studio fallback so media never crashes offline
-  return {
-    kind: params.kind,
+  return generateGeminiImageAsset({
     prompt: cleanPrompt,
-    dataUrl: buildKeylessSvgArtwork(cleanPrompt, params.kind === 'video'),
-    mimeType: 'image/svg+xml',
-    modelId: params.kind === 'video' ? 'browser::motion-studio' : 'browser::svg-studio',
-    gateway: 'browser',
-  };
+    requestedModel: params.requestedModel,
+    attachmentDataUrl: params.attachmentDataUrl,
+  });
 }

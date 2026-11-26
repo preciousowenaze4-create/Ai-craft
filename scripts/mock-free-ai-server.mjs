@@ -1,22 +1,17 @@
 /**
- * Mock OpenAI-compatible servers for verifying the free AI mesh locally.
+ * Mock Gemini MLDev + OpenAI-compatible servers for verifying the Gemini engine locally.
  *
  * Usage:
  *   node scripts/mock-free-ai-server.mjs <mode> <port>
  *
  * Modes:
- *   rate-limited   → always responds 429 (tests cooldown + failover)
- *   streaming      → streams an SSE chat completion, or JSON when stream:false
- *   streaming-html → streams a complete single-file HTML app (build path)
- *
- * The sandbox blocks live AI providers, so failover is verified against these
- * local endpoints via SELF_HOSTED_LLM_URL / POLLINATIONS_BASE_URL overrides.
+ *   rate-limited   -> always responds 429 (tests cooldown + failover)
+ *   streaming      -> streams Gemini SSE (or JSON), including image generation
+ *   streaming-html -> streams a complete single-file HTML app (build path)
  */
 import http from 'node:http';
 
-const [, , mode = 'streaming', portArg = '4591'] = process.env.NODE_ARGV && false
-  ? []
-  : process.argv;
+const [, , mode = 'streaming', portArg = '4591'] = process.argv;
 const port = Number(portArg);
 
 if (!['rate-limited', 'streaming', 'streaming-html'].includes(mode)) {
@@ -24,7 +19,9 @@ if (!['rate-limited', 'streaming', 'streaming-html'].includes(mode)) {
   process.exit(1);
 }
 
-const REPLY = 'Hello from the free AI mesh! Build success.';
+const REPLY = 'Hello from the Gemini AI engine! Build success.';
+const MOCK_PNG_BASE64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 
 const HTML_APP = `<!DOCTYPE html>
 <html lang="en">
@@ -50,7 +47,7 @@ const HTML_APP = `<!DOCTYPE html>
         <button id="add" type="button">Add</button>
       </form>
       <ul id="list">
-        <li><span>Try the mesh failover</span><button type="button">Done</button></li>
+        <li><span>Try the Gemini engine</span><button type="button">Done</button></li>
         <li><span>Ship the build</span><button type="button">Done</button></li>
       </ul>
       <a href="#" id="help">Need help?</a>
@@ -87,38 +84,81 @@ const HTML_APP = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// Concurrency/counters for the mesh single-flight tests:
-//   GET    /__stats        → { count, active, peak }
-//   POST   /__stats/reset  → zero them
-const stats = { count: 0, active: 0, peak: 0 };
+// Concurrency/counters for diagnostics & tests:
+//   GET    /__stats        -> { count, active, peak, lastImageHasAttachment }
+//   POST   /__stats/reset  -> zero them
+const stats = { count: 0, active: 0, peak: 0, lastImageHasAttachment: false };
+
+function extractGeminiPromptText(parsed) {
+  const contents = Array.isArray(parsed.contents)
+    ? parsed.contents
+    : parsed.contents
+      ? [parsed.contents]
+      : [];
+  const lastUser = [...contents].reverse().find((c) => !c?.role || c.role === 'user') ?? contents[contents.length - 1];
+  const parts = Array.isArray(lastUser?.parts) ? lastUser.parts : [];
+  const text = parts.map((p) => (typeof p?.text === 'string' ? p.text : '')).join(' ');
+  const hasInlineImage = contents.some((c) =>
+    Array.isArray(c?.parts) && c.parts.some((p) => Boolean(p?.inlineData?.data))
+  );
+  return { text, hasInlineImage };
+}
 
 const server = http.createServer((req, res) => {
-  if (req.method === 'GET' && req.url === '/__stats') {
+  const reqUrl = req.url || '/';
+
+  if (req.method === 'GET' && reqUrl === '/__stats') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(stats));
     return;
   }
-  if (req.method === 'GET' && req.url === '/v1/models') {
+
+  if (req.method === 'POST' && reqUrl === '/__stats/reset') {
+    stats.count = 0;
+    stats.active = 0;
+    stats.peak = 0;
+    stats.lastImageHasAttachment = false;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{}');
+    return;
+  }
+
+  if (req.method === 'GET' && /^\/v1(?:beta)?\/models(?:\?|$)/.test(reqUrl)) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(
       JSON.stringify({
-        object: 'list',
-        data: [
-          { id: 'gpt-6.2-sol' },
-          { id: 'gpt-6.2-astra' },
+        models: [
+          {
+            name: 'models/gemini-4-hydrogen',
+            displayName: 'Gemini 4 Hydrogen',
+            supportedGenerationMethods: ['generateContent'],
+          },
+          {
+            name: 'models/gemini-3.1-flash-lite',
+            displayName: 'Gemini 3.1 Flash Lite',
+            supportedGenerationMethods: ['generateContent'],
+          },
+          {
+            name: 'models/gemini-4-neon',
+            displayName: 'Gemini 4 Neon',
+            supportedGenerationMethods: ['generateContent'],
+          },
+          {
+            name: 'models/gemini-4-argon',
+            displayName: 'Gemini 4 Argon',
+            supportedGenerationMethods: ['generateContent'],
+          },
+          {
+            name: 'models/gemini-4-carbon',
+            displayName: 'Gemini 4 Carbon',
+            supportedGenerationMethods: ['generateContent'],
+          },
         ],
       })
     );
     return;
   }
-  if (req.method === 'POST' && req.url === '/__stats/reset') {
-    stats.count = 0;
-    stats.active = 0;
-    stats.peak = 0;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end('{}');
-    return;
-  }
+
   stats.count += 1;
   stats.active += 1;
   if (stats.active > stats.peak) stats.peak = stats.active;
@@ -128,6 +168,7 @@ const server = http.createServer((req, res) => {
     closed = true;
     stats.active -= 1;
   });
+
   let body = '';
   req.on('data', (chunk) => {
     body += chunk;
@@ -139,21 +180,141 @@ const server = http.createServer((req, res) => {
     } catch {
       // ignore malformed bodies
     }
+
+    const isGeminiEndpoint = /^\/v1(?:beta)?\/models\//.test(reqUrl);
+    const isGeminiStream = reqUrl.includes(':streamGenerateContent');
+    const isImageModel =
+      reqUrl.includes('-image:') || reqUrl.includes('nano-banana');
+
     console.log(
-      `[mock:${mode}:${port}] ${req.method} ${req.url} stream=${Boolean(parsed.stream)}`
+      `[mock:${mode}:${port}] ${req.method} ${reqUrl} stream=${Boolean(parsed.stream || isGeminiStream)}`
     );
 
     if (mode === 'rate-limited') {
       res.writeHead(429, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
-          error: { message: 'Rate limit reached for this model.', code: 'rate_limit_exceeded' },
+          error: {
+            code: 429,
+            message: 'Quota exceeded.',
+            status: 'RESOURCE_EXHAUSTED',
+          },
         })
       );
       return;
     }
 
-    // streaming mode — reply with an HTML app when the prompt asks to build
+    if (isGeminiEndpoint && isImageModel) {
+      const { hasInlineImage } = extractGeminiPromptText(parsed);
+      stats.lastImageHasAttachment = hasInlineImage;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [
+                  {
+                    text: hasInlineImage
+                      ? 'Edited your attached image with Gemini.'
+                      : 'Generated your image with Gemini.',
+                  },
+                  {
+                    inlineData: {
+                      mimeType: 'image/png',
+                      data: MOCK_PNG_BASE64,
+                    },
+                  },
+                ],
+              },
+              finishReason: 'STOP',
+            },
+          ],
+          usageMetadata: {
+            promptTokenCount: 14,
+            candidatesTokenCount: 256,
+            totalTokenCount: 270,
+          },
+        })
+      );
+      return;
+    }
+
+    if (isGeminiEndpoint) {
+      const { text: lastUserText } = extractGeminiPromptText(parsed);
+      const wantsBuild = /\b(build|todo|app|website|create)\b/i.test(lastUserText);
+      const replyText =
+        mode === 'streaming-html' || (mode === 'streaming' && wantsBuild) ? HTML_APP : REPLY;
+
+      if (isGeminiStream) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        });
+        const chunks = [];
+        for (let i = 0; i < replyText.length; i += 700) {
+          chunks.push(replyText.slice(i, i + 700));
+        }
+        let i = 0;
+        const send = () => {
+          if (i < chunks.length) {
+            const isLast = i === chunks.length - 1;
+            const payload = {
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [{ text: chunks[i] }],
+                  },
+                  ...(isLast ? { finishReason: 'STOP' } : {}),
+                },
+              ],
+              ...(isLast
+                ? {
+                    usageMetadata: {
+                      promptTokenCount: 12,
+                      candidatesTokenCount: 20,
+                      totalTokenCount: 32,
+                    },
+                  }
+                : {}),
+            };
+            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+            i += 1;
+            setTimeout(send, 5);
+          } else {
+            res.end();
+          }
+        };
+        send();
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ text: replyText }],
+              },
+              finishReason: 'STOP',
+            },
+          ],
+          usageMetadata: {
+            promptTokenCount: 10,
+            candidatesTokenCount: 12,
+            totalTokenCount: 22,
+          },
+        })
+      );
+      return;
+    }
+
+    // Legacy OpenAI-compatible fallback
     const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
     const lastUser = [...messages].reverse().find((m) => m && m.role === 'user');
     const lastUserText =
@@ -163,33 +324,15 @@ const server = http.createServer((req, res) => {
           ? lastUser.content.map((p) => p?.text || '').join(' ')
           : '';
     const wantsBuild = /\b(build|todo|app|website|create)\b/i.test(lastUserText);
-    let replyText =
+    const replyText =
       mode === 'streaming-html' || (mode === 'streaming' && wantsBuild) ? HTML_APP : REPLY;
 
-    // 3-agent parallel builds append MESH_ROLE=<role> to the system prompt.
-    // Stamp each role's output so tests can prove all three agents ran and
-    // their contributions were merged into the final HTML.
-    const systemMsg = messages.find((m) => m && m.role === 'system');
-    const systemText =
-      typeof systemMsg?.content === 'string' ? systemMsg.content : '';
-    const roleMatch = /MESH_ROLE=(architect|designer|engineer)/.exec(systemText);
-    if (roleMatch && replyText === HTML_APP) {
-      const role = roleMatch[1];
-      if (role === 'designer') {
-        replyText = replyText.replace('</style>', `  /* mesh-${role}-mark */\n</style>`);
-      } else if (role === 'engineer') {
-        replyText = replyText.replace('</script>', `// mesh-${role}-mark\n</script>`);
-      } else {
-        replyText = replyText.replace('</html>', `<!-- mesh-${role}-mark -->\n</html>`);
-      }
-    }
     if (parsed.stream) {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
       });
-      // Split into ~700-char chunks so the pipeline sees realistic partials.
       const chunks = [];
       for (let i = 0; i < replyText.length; i += 700) {
         chunks.push(replyText.slice(i, i + 700));

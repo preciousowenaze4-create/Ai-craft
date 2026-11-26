@@ -32,6 +32,7 @@ export async function POST(request: Request): Promise<Response> {
       kind?: string;
       prompt?: string;
       model?: string;
+      attachmentDataUrl?: string | null;
     };
 
     const kind =
@@ -43,6 +44,11 @@ export async function POST(request: Request): Promise<Response> {
     const prompt = typeof body?.prompt === 'string' ? body.prompt.trim() : '';
     const requestedModel =
       typeof body?.model === 'string' ? body.model.trim() : undefined;
+    const attachmentDataUrl =
+      typeof body?.attachmentDataUrl === 'string' &&
+      body.attachmentDataUrl.startsWith('data:image/')
+        ? body.attachmentDataUrl
+        : null;
 
     if (!prompt) {
       return Response.json({ error: 'Prompt is required.' }, { status: 400 });
@@ -52,6 +58,7 @@ export async function POST(request: Request): Promise<Response> {
       kind,
       prompt,
       requestedModel,
+      attachmentDataUrl,
     });
 
     return Response.json(result, {

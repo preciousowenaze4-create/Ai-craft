@@ -2910,8 +2910,8 @@ export function BuilderWorkspace({
                   ? turn.modelName ||
                     models.find((m) => m.id === turn.modelId)?.name ||
                     activeModel?.name ||
-                    'AgentRouter'
-                  : turn.modelName || 'AgentRouter';
+                    'Gemini'
+                  : turn.modelName || 'Gemini';
 
               const stageSteps = ['Building', 'Coding', 'Checking'] as const;
               const showLivePipelineCard =
@@ -3204,7 +3204,11 @@ export function BuilderWorkspace({
                                 ? turn.media.mimeType.includes('wav')
                                   ? 'wav'
                                   : 'mp3'
-                                : 'jpg'
+                                : turn.media.mimeType.includes('png')
+                                  ? 'png'
+                                  : turn.media.mimeType.includes('webp')
+                                    ? 'webp'
+                                    : 'jpg'
                           }`}
                           className="h-8 px-2.5 rounded-lg bg-white border border-black/10 hover:bg-black/[0.03] text-[12px] font-medium text-[#0B0B0F] inline-flex items-center gap-1.5 shrink-0 active:scale-95 transition-all"
                         >
@@ -3444,11 +3448,11 @@ export function BuilderWorkspace({
                   />
                   <span className="text-[12px] font-medium text-[#18181B] truncate">
                     {activeModel?.name ??
-                      (modelsLoading ? 'Connecting AgentRouter...' : 'AgentRouter')}
+                      (modelsLoading ? 'Connecting Gemini...' : 'Gemini 4 Hydrogen')}
                   </span>
                   <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10.5px] font-semibold text-indigo-700 shrink-0">
                     <span className="w-1.5 h-1.5 rounded-full bg-indigo-500" />
-                    AgentRouter
+                    Gemini
                   </span>
                 </div>
                 <ModelSelectorPopover

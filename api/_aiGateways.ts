@@ -61,8 +61,10 @@ export interface DynamicGeminiCandidate {
 
 export const SERVER_GEMINI_MODEL_ID = 'gemini::gemini-4-hydrogen';
 export const DEFAULT_BUILDER_MODEL_ID = 'gemini::gemini-4-hydrogen';
-export const SECONDARY_BUILDER_MODEL_ID = 'gemini::gemini-3.8-flash';
-export const BACKEND_DESIGNER_MODEL_ID = 'gemini-3.8-flash';
+export const SECONDARY_BUILDER_MODEL_ID = 'gemini::gemini-3.1-flash-lite';
+export const BACKEND_DESIGNER_MODEL_ID = 'gemini-3.1-flash-lite';
+
+export const DEFAULT_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com';
 
 const KEY_PLACEHOLDERS = [
   'MY_GEMINI_API_KEY',
@@ -77,6 +79,17 @@ function parseMultiKeysFromRaw(raw: string | undefined): string[] {
     .split(/[\r\n,;]+/)
     .map((part) => cleanEnvKey(part, KEY_PLACEHOLDERS))
     .filter((k) => k.length >= 16);
+}
+
+export function getGeminiBaseUrlOverride(): string {
+  const raw = (process.env.GEMINI_API_BASE_URL || '').trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) return raw;
+  return '';
+}
+
+export function getGeminiEffectiveBaseUrl(): string {
+  return getGeminiBaseUrlOverride() || DEFAULT_GEMINI_BASE_URL;
 }
 
 export function getServerGeminiApiKeys(): string[] {
@@ -137,52 +150,90 @@ export function computeApiKeyMask(apiKey: string): string {
 }
 
 /**
- * Active modern Gemini models (never includes retired gemini-1.* or gemini-2.0-*).
- * Serves as a baseline seed combined with live Google `/v1beta/models` auto-discovery.
+ * Active modern Gemini models supported via `@google/genai`.
+ * Free-tier friendly models lead the chain before paid-only reasoning variants.
  */
 export const BACKEND_GEMINI_FAILOVER_CHAIN: ReadonlyArray<{
   upstreamModelId: string;
   label: string;
 }> = [
-  { upstreamModelId: 'gemini-4-hydrogen', label: 'AI Craft Pro (4 Hydrogen)' },
-  { upstreamModelId: 'gemini-3.8-flash', label: 'AI Craft 3.8 Flash' },
-  { upstreamModelId: 'gemini-2.5-flash', label: 'AI Craft 2.5 Flash' },
-  { upstreamModelId: 'gemini-2.5-pro', label: 'AI Craft 2.5 Pro' },
-  { upstreamModelId: 'gemini-4-neon', label: 'AI Craft 4 Neon' },
-  { upstreamModelId: 'gemini-4-argon', label: 'AI Craft 4 Argon' },
-  { upstreamModelId: 'gemini-4-carbon', label: 'AI Craft 4 Carbon' },
-  { upstreamModelId: 'gemini-3.1-pro-preview', label: 'AI Craft 3.1 Pro' },
-  { upstreamModelId: 'gemini-3-flash-preview', label: 'AI Craft 3 Flash' },
-  { upstreamModelId: 'gemini-3.1-flash-lite', label: 'AI Craft 3.1 Lite' },
-  { upstreamModelId: 'gemini-3.1-flash-lite-preview', label: 'AI Craft 3.1 Mini' },
-  { upstreamModelId: 'gemini-2.5-flash-lite', label: 'AI Craft 2.5 Lite' },
+  { upstreamModelId: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen' },
+  { upstreamModelId: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite' },
+  { upstreamModelId: 'gemini-4-neon', label: 'Gemini 4 Neon' },
+  { upstreamModelId: 'gemini-4-argon', label: 'Gemini 4 Argon' },
+  { upstreamModelId: 'gemini-4-carbon', label: 'Gemini 4 Carbon' },
+  { upstreamModelId: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
+  { upstreamModelId: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
+  { upstreamModelId: 'gemini-3.1-flash-lite-preview', label: 'Gemini 3.1 Flash-Lite Preview' },
 ];
 
-/** Display labels for AgentRouter selector ids. */
 export const FREE_MESH_MODEL_LABELS: Record<string, string> = {
-  'agentrouter::auto': 'AgentRouter · Auto',
-  'agentrouter::gpt-6.2-sol': 'AgentRouter · gpt-6.2-sol',
-  'agentrouter::gpt-6.2-astra': 'AgentRouter · gpt-6.2-astra',
-  'agentrouter::gpt-5.6-sol': 'AgentRouter · gpt-5.6-sol',
-  'agentrouter::gpt-6.1-sol': 'AgentRouter · gpt-6.1-sol',
-  'agentrouter::claude-opus-5-5': 'AgentRouter · claude-opus-5-5',
+  'gemini::gemini-4-hydrogen': 'Gemini 4 Hydrogen',
+  'gemini::gemini-3.1-flash-lite': 'Gemini 3.1 Flash-Lite',
+  'gemini::gemini-4-neon': 'Gemini 4 Neon',
+  'gemini::gemini-4-argon': 'Gemini 4 Argon',
+  'gemini::gemini-4-carbon': 'Gemini 4 Carbon',
 };
 
-/**
- * Legacy Gemini lineup entry — kept only for label/compat lookups of stored
- * ids. The mesh (see api/_freeAiMesh.ts) is the actual engine.
- */
 export const GEMINI_BUILDER_MODELS: UnifiedAiModel[] = [
   {
     id: 'gemini::gemini-4-hydrogen',
     upstreamModelId: 'gemini-4-hydrogen',
     gateway: 'gemini',
-    name: 'AI Craft Pro (4 Hydrogen)',
-    provider: 'aicraft',
+    name: 'Gemini 4 Hydrogen',
+    provider: 'gemini',
     contextLength: 1048576,
     isFree: true,
-    tierLabel: 'Flagship · Auto',
-    capabilities: ['Vision', 'Screenshots', 'Code', 'DB'],
+    tierLabel: 'Flagship · Thinking',
+    capabilities: ['Thinking', 'Chat', 'Code', 'Vision'],
+    category: 'code',
+  },
+  {
+    id: 'gemini::gemini-3.1-flash-lite',
+    upstreamModelId: 'gemini-3.1-flash-lite',
+    gateway: 'gemini',
+    name: 'Gemini 3.1 Flash-Lite',
+    provider: 'gemini',
+    contextLength: 1048576,
+    isFree: true,
+    tierLabel: 'Fast · Free Tier',
+    capabilities: ['Fast', 'Chat', 'Code', 'Vision'],
+    category: 'code',
+  },
+  {
+    id: 'gemini::gemini-4-neon',
+    upstreamModelId: 'gemini-4-neon',
+    gateway: 'gemini',
+    name: 'Gemini 4 Neon',
+    provider: 'gemini',
+    contextLength: 1048576,
+    isFree: false,
+    tierLabel: 'Pro · Architecture',
+    capabilities: ['Architecture', 'Thinking', 'Code'],
+    category: 'code',
+  },
+  {
+    id: 'gemini::gemini-4-argon',
+    upstreamModelId: 'gemini-4-argon',
+    gateway: 'gemini',
+    name: 'Gemini 4 Argon',
+    provider: 'gemini',
+    contextLength: 1048576,
+    isFree: false,
+    tierLabel: 'Code Specialist',
+    capabilities: ['Coding', 'Debug', 'Refactor'],
+    category: 'code',
+  },
+  {
+    id: 'gemini::gemini-4-carbon',
+    upstreamModelId: 'gemini-4-carbon',
+    gateway: 'gemini',
+    name: 'Gemini 4 Carbon',
+    provider: 'gemini',
+    contextLength: 1048576,
+    isFree: false,
+    tierLabel: 'Deep Reasoning',
+    capabilities: ['Reasoning', 'Review', 'Code'],
     category: 'code',
   },
 ];
@@ -270,9 +321,6 @@ export function inferGeminiThinkingMode(modelId: string): GeminiThinkingMode {
   if (/^gemini-(?:[4-9]|[1-9]\d|3(?:\.\d+)?)\b/.test(lower)) {
     return lower.includes('lite') ? 'none' : 'level';
   }
-  if (/^gemini-2\.5\b/.test(lower)) {
-    return lower.includes('lite') ? 'none' : 'budget';
-  }
   return 'none';
 }
 
@@ -285,7 +333,8 @@ export function isDeprecatedGeminiModelId(modelId: string): boolean {
   if (!lower.startsWith('gemini')) return false;
   return (
     /^gemini-1\./.test(lower) ||
-    /^gemini-2\.0\b/.test(lower) ||
+    /^gemini-2\./.test(lower) ||
+    /^gemini-3\.8\b/.test(lower) ||
     /^gemini-pro(?:-vision)?$/.test(lower)
   );
 }
@@ -325,17 +374,20 @@ export function scoreDiscoveredGeminiModel(
     taskKind === 'media' ||
     taskKind === 'transcribe';
 
-  if (lower === 'gemini-4-hydrogen') score += preferFast ? 140 : 220;
-  else if (lower === 'gemini-3.8-flash') score += preferFast ? 210 : 190;
-  else if (lower === 'gemini-2.5-flash') score += preferFast ? 195 : 145;
-  else if (lower === 'gemini-2.5-pro') score += preferFast ? 110 : 165;
-  else if (lower.includes('hydrogen')) score += 175;
+  if (lower === 'gemini-4-hydrogen') score += preferFast ? 210 : 250;
+  else if (lower === 'gemini-3.1-flash-lite') score += preferFast ? 245 : 220;
+  else if (lower === 'gemini-4-neon') score += preferFast ? 110 : 185;
+  else if (lower === 'gemini-4-argon') score += preferFast ? 120 : 175;
+  else if (lower === 'gemini-4-carbon') score += preferFast ? 105 : 165;
+  else if (lower === 'gemini-3-flash-preview') score += preferFast ? 190 : 155;
+  else if (lower === 'gemini-3.1-pro-preview') score += preferFast ? 100 : 150;
+  else if (lower.includes('hydrogen')) score += 180;
   else if (lower.includes('neon')) score += preferFast ? 95 : 155;
-  else if (lower.includes('pro')) score += preferFast ? 90 : 150;
+  else if (lower.includes('pro')) score += preferFast ? 90 : 145;
   else if (lower.includes('flash') && !lower.includes('lite')) score += preferFast ? 180 : 140;
   else if (lower.includes('argon')) score += 120;
   else if (lower.includes('carbon')) score += 110;
-  else if (lower.includes('lite')) score += preferFast ? 115 : 85;
+  else if (lower.includes('lite')) score += preferFast ? 170 : 115;
 
   if (lower.includes('preview') || lower.includes('-exp')) score -= 18;
   if (/-\d{2}-\d{2,4}$/.test(lower) || /-\d{3}$/.test(lower)) score -= 8;
@@ -372,7 +424,8 @@ export async function discoverLiveGeminiModelsForKey(
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3800);
-    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(
+    const origin = getGeminiEffectiveBaseUrl();
+    const url = `${origin}/v1beta/models?key=${encodeURIComponent(
       apiKey
     )}&pageSize=100`;
     const resp = await fetch(url, {
@@ -400,7 +453,7 @@ export async function discoverLiveGeminiModelsForKey(
       const methods = Array.isArray(item?.supportedGenerationMethods)
         ? item.supportedGenerationMethods
         : [];
-      if (!methods.includes('generateContent')) continue;
+      if (methods.length > 0 && !methods.includes('generateContent')) continue;
       const bare = String(item?.name || '').replace(/^models\//i, '').trim();
       if (!bare || !isBuilderCompatibleGeminiModel(bare)) continue;
       usable.push(bare);
@@ -419,12 +472,12 @@ export async function discoverLiveGeminiModelsForKey(
   }
 }
 
-function makeModelDisplayLabel(upstreamModelId: string): string {
+export function makeGeminiDisplayLabel(upstreamModelId: string): string {
   const staticEntry = BACKEND_GEMINI_FAILOVER_CHAIN.find(
     (m) => m.upstreamModelId === upstreamModelId
   );
   if (staticEntry) return staticEntry.label;
-  return `AI Craft (${upstreamModelId})`;
+  return `Gemini (${upstreamModelId})`;
 }
 
 export async function resolveDynamicGeminiExecutionMatrix(options?: {
@@ -462,7 +515,6 @@ export async function resolveDynamicGeminiExecutionMatrix(options?: {
           scoreDiscoveredGeminiModel(b, taskKind) - scoreDiscoveredGeminiModel(a, taskKind)
       );
 
-      // Put preferred model at the front if it's confirmed live OR when discovery returned nothing
       if (preferredId) {
         const liveIdx = liveList.indexOf(preferredId);
         if (liveIdx > 0) {
@@ -510,7 +562,7 @@ export async function resolveDynamicGeminiExecutionMatrix(options?: {
         keyFingerprint: fp,
         keyMask: mask,
         upstreamModelId: id,
-        label: makeModelDisplayLabel(id),
+        label: makeGeminiDisplayLabel(id),
         cooldownKey: buildCandidateCooldownKey('gemini', apiKey, id),
         confirmedLive,
         thinkingMode: inferGeminiThinkingMode(id),
@@ -520,7 +572,6 @@ export async function resolveDynamicGeminiExecutionMatrix(options?: {
       return { apiKey, items };
     });
 
-  // Interleave confirmed live models across keys first, then unconfirmed baseline models
   const maxLen = Math.max(0, ...perKeyOrderedModels.map((entry) => entry.items.length));
   for (let pass = 0; pass < 2; pass += 1) {
     const wantLive = pass === 0;
@@ -575,9 +626,15 @@ export function parseGatewayModelIdentifier(
   modelId?: string
 ): { gateway: AiGatewayId; upstreamModelId: string } {
   const raw = typeof modelId === 'string' ? modelId.trim() : '';
-  const bare = raw.replace(/^gemini::/i, '').trim();
+  const bare = raw.replace(/^(?:gemini|models)::/i, '').replace(/^models\//i, '').trim();
 
-  if (bare && !isDeprecatedGeminiModelId(bare)) {
+  if (
+    bare &&
+    bare !== 'auto' &&
+    !raw.startsWith('agentrouter::') &&
+    !raw.startsWith('mesh::') &&
+    !isDeprecatedGeminiModelId(bare)
+  ) {
     const matched =
       GEMINI_BUILDER_MODELS.find(
         (m) => m.id === raw || m.upstreamModelId === bare
@@ -586,6 +643,9 @@ export function parseGatewayModelIdentifier(
 
     if (matched) {
       return { gateway: 'gemini', upstreamModelId: matched.upstreamModelId };
+    }
+    if (bare.startsWith('gemini-') && isBuilderCompatibleGeminiModel(bare)) {
+      return { gateway: 'gemini', upstreamModelId: bare };
     }
   }
 
@@ -596,7 +656,7 @@ export function classifyGatewayModelCapabilities(): {
   capabilities: string[];
   category: FreeModelCategory;
 } {
-  return { capabilities: ['Vision', 'Screenshots', 'Code', 'DB'], category: 'code' };
+  return { capabilities: ['Thinking', 'Vision', 'Code', 'DB'], category: 'code' };
 }
 
 export async function fetchAllGatewayModels(
@@ -618,12 +678,12 @@ export async function fetchAllGatewayModels(
   const gateways: GatewayStatusSummary[] = [
     {
       id: 'gemini',
-      label: 'AI Craft Engine',
-      baseUrl: 'https://generativelanguage.googleapis.com',
+      label: 'Google Gemini',
+      baseUrl: getGeminiEffectiveBaseUrl(),
       configured: geminiConfigured,
       keyCount: keys.length,
       modelCount: GEMINI_BUILDER_MODELS.length,
-      defaultModel: 'gemini-4-hydrogen',
+      defaultModel: DEFAULT_BUILDER_MODEL_ID,
     },
   ];
 
@@ -645,18 +705,6 @@ export function buildGatewayExecutionPlan(params: {
   requestedMediaKind: 'image' | 'music' | 'video' | null;
   requestedModelLabel: string;
 } {
-  const requested = (params.requestedModel || '').trim();
-  if (!requested || requested.startsWith('agentrouter::') || requested.startsWith('mesh::')) {
-    const bare = requested.startsWith('agentrouter::')
-      ? requested.slice('agentrouter::'.length).trim()
-      : '';
-    const label =
-      !bare || bare === 'auto'
-        ? 'AgentRouter · Auto'
-        : `AgentRouter · ${bare}`;
-    return { pollinationsCandidates: [], requestedMediaKind: null, requestedModelLabel: label };
-  }
-
   const parsed = parseGatewayModelIdentifier(params.requestedModel);
   const matched =
     GEMINI_BUILDER_MODELS.find(
@@ -666,6 +714,6 @@ export function buildGatewayExecutionPlan(params: {
   return {
     pollinationsCandidates: [],
     requestedMediaKind: null,
-    requestedModelLabel: matched ? matched.name : 'AgentRouter · Auto',
+    requestedModelLabel: matched ? matched.name : makeGeminiDisplayLabel(parsed.upstreamModelId),
   };
 }

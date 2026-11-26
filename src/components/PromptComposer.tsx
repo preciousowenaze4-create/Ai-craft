@@ -153,11 +153,11 @@ export function PromptComposer({
             />
             <span className="text-[12.5px] font-medium text-[#18181B] truncate">
               {activeModel?.name ??
-                (modelsLoading ? 'Connecting AgentRouter...' : 'AgentRouter')}
+                (modelsLoading ? 'Connecting Gemini...' : 'Gemini 4 Hydrogen')}
             </span>
             <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10.5px] font-semibold text-indigo-700 shrink-0">
               <span className="w-1.5 h-1.5 rounded-full bg-indigo-500" />
-              AgentRouter
+              Gemini
             </span>
           </div>
 

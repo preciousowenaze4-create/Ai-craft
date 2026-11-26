@@ -69,6 +69,7 @@ const IS_PROD = process.env.NODE_ENV === 'production';
 
 import {
   getServerGeminiApiKey,
+  getServerGeminiApiKeys,
   hasServerFreeAiKey,
   resolveDynamicGeminiExecutionMatrix,
 } from './api/_aiGateways.js';
@@ -77,12 +78,12 @@ import {
   type GeneratedMediaResult,
 } from './api/_mediaService.js';
 import {
-  getAgentRouterApiOrigin,
-  getAgentRouterDiagnostic,
   getFreeAiMeshStatus,
   getFreeMeshModelOptions,
-  isAgentRouterConfigured,
-  refreshAgentRouterModelsIfConfigured,
+  getGeminiApiOrigin,
+  getGeminiDiagnostic,
+  isGeminiConfigured,
+  refreshGeminiModelsIfConfigured,
 } from './api/_freeAiMesh.js';
 import { cleanEnvKey } from './api/_openrouterModels.js';
 import {
@@ -580,13 +581,12 @@ async function startServer() {
   app.get('/api/health', (_req, res) => {
     const sbConfig = getSupabaseConfig();
     const mesh = getFreeAiMeshStatus();
-    const agentRouterConfigured = isAgentRouterConfigured();
+    const geminiConfigured = isGeminiConfigured();
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       ok: true,
-      geminiConfigured: false,
-      agentRouterConfigured,
-      agentRouter: getAgentRouterDiagnostic(),
+      geminiConfigured,
+      gemini: getGeminiDiagnostic(),
       serverFreeAiReady: mesh.hasAny,
       freeAiMesh: {
         hasAny: mesh.hasAny,
@@ -2423,7 +2423,7 @@ async function startServer() {
         : new Error('Unable to process audio input.');
     } catch (err) {
       void recordGeminiApiError({
-        modelId: 'gemini-3.8-flash',
+        modelId: 'gemini-3.1-flash-lite',
         error: err,
         source: 'transcribe',
       });
@@ -2435,27 +2435,27 @@ async function startServer() {
 
   app.get('/api/models', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    if (req.query.refresh === '1') {
-      await refreshAgentRouterModelsIfConfigured().catch(() => {});
+    if (req.query.refresh === '1' && isGeminiConfigured()) {
+      await refreshGeminiModelsIfConfigured().catch(() => {});
     }
     const mesh = getFreeAiMeshStatus();
-    const agentRouterConfigured = isAgentRouterConfigured();
-    const agentRouterStatus = mesh.providers.find((p) => p.id === 'agentrouter');
+    const geminiConfigured = isGeminiConfigured();
+    const geminiStatus = mesh.providers.find((p) => p.id === 'gemini');
+    const keyCount = getServerGeminiApiKeys().length;
     res.json({
       models: getFreeMeshModelOptions(),
       gateways: [
         {
-          id: 'agentrouter',
-          label: 'AgentRouter',
-          baseUrl: getAgentRouterApiOrigin(),
-          configured: agentRouterConfigured,
-          keyCount: agentRouterConfigured ? 1 : 0,
-          modelCount: agentRouterStatus?.modelCount || 5,
-          defaultModel: 'agentrouter::auto',
+          id: 'gemini',
+          label: 'Google Gemini',
+          baseUrl: getGeminiApiOrigin(),
+          configured: geminiConfigured,
+          keyCount,
+          modelCount: geminiStatus?.modelCount || 5,
+          defaultModel: 'gemini::gemini-4-hydrogen',
         },
       ],
-      geminiConfigured: false,
-      agentRouterConfigured,
+      geminiConfigured,
       serverFreeAiReady: mesh.hasAny,
       pollinationsConfigured: false,
       puterConfigured: false,
@@ -2503,6 +2503,7 @@ async function startServer() {
         kind?: string;
         prompt?: string;
         model?: string;
+        attachmentDataUrl?: string | null;
       };
       const kind =
         body?.kind === 'video'
@@ -2513,6 +2514,11 @@ async function startServer() {
       const prompt = typeof body?.prompt === 'string' ? body.prompt.trim() : '';
       const requestedModel =
         typeof body?.model === 'string' ? body.model.trim() : undefined;
+      const attachmentDataUrl =
+        typeof body?.attachmentDataUrl === 'string' &&
+        body.attachmentDataUrl.startsWith('data:image/')
+          ? body.attachmentDataUrl
+          : null;
       if (!prompt) {
         res.status(400).json({ error: 'Prompt is required.' });
         return;
@@ -2521,6 +2527,7 @@ async function startServer() {
         kind,
         prompt,
         requestedModel,
+        attachmentDataUrl,
       });
       res.json(result);
     } catch (err) {
@@ -2866,6 +2873,37 @@ async function startServer() {
         return;
       }
 
+      const rawAttachment = body.attachmentDataUrl ?? opts.attachmentDataUrl;
+      const attachmentDataUrl =
+        typeof rawAttachment === 'string' && rawAttachment.startsWith('data:image/')
+          ? rawAttachment
+          : null;
+
+      if (prepared.naturalMediaIntent) {
+        const mediaResult = await generateMediaAsset({
+          kind: prepared.naturalMediaIntent,
+          prompt: message,
+          requestedModel: typeof body.model === 'string' ? body.model : undefined,
+          attachmentDataUrl,
+        });
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({
+          kind: 'media',
+          aiText: `Generated your ${prepared.naturalMediaIntent}: "${message.slice(0, 120)}"`,
+          previewHtml: '',
+          files: [],
+          suggestions: [],
+          dbTables: [],
+          bytesBuilt: 0,
+          media: mediaResult,
+          modelUsed: mediaResult.modelId || 'gemini-3.1-flash-lite-image',
+          modelName: prepared.requestedModelLabel || 'Google Gemini',
+          provider: mediaResult.gateway,
+          searchData: prepared.searchData,
+        });
+        return;
+      }
+
       let rawOutput = '';
       const previousHtmlForRoute =
         typeof body.previousHtml === 'string' ? body.previousHtml : '';
@@ -2875,10 +2913,7 @@ async function startServer() {
         systemPrompt: prepared.systemPrompt,
         historyMessages: prepared.historyMessages,
         userPrompt: prepared.userPrompt,
-        attachmentDataUrl:
-          typeof (body.attachmentDataUrl ?? opts.attachmentDataUrl) === 'string'
-            ? String(body.attachmentDataUrl ?? opts.attachmentDataUrl)
-            : null,
+        attachmentDataUrl,
         allowParallelAgents:
           prepared.initialRoute === 'build' &&
           !prepared.isPatchMode &&
@@ -2899,11 +2934,30 @@ async function startServer() {
         message,
         mode,
         previousHtml: typeof body.previousHtml === 'string' ? body.previousHtml : '',
-        hasAttachment: Boolean(body.attachmentDataUrl ?? opts.attachmentDataUrl),
+        hasAttachment: Boolean(attachmentDataUrl),
         modelUsed: streamRes.modelUsed,
         modelName: streamRes.modelName,
         provider: streamRes.provider,
       });
+
+      if (finalized.kind === 'media') {
+        const mediaResult = await generateMediaAsset({
+          kind: 'image',
+          prompt: finalized.mediaPrompt || message,
+          requestedModel: typeof body.model === 'string' ? body.model : undefined,
+          attachmentDataUrl,
+        });
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({
+          ...finalized,
+          media: mediaResult,
+          modelUsed: mediaResult.modelId || finalized.modelUsed,
+          modelName: prepared.requestedModelLabel || finalized.modelName,
+          provider: mediaResult.gateway,
+          searchData: prepared.searchData,
+        });
+        return;
+      }
 
       res.setHeader('Cache-Control', 'no-store');
       res.json({
@@ -2912,7 +2966,7 @@ async function startServer() {
       });
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : 'Unable to run free browser AI.';
+        err instanceof Error ? err.message : 'Unable to run Gemini AI right now.';
       res.status(502).json({ error: message });
     }
   });
@@ -3240,10 +3294,10 @@ async function startServer() {
       sendEvent({
         type: 'meta',
         kind: prepared.naturalMediaIntent ? 'media' : 'chat',
-        modelId: requestedModel || 'agentrouter::auto',
-        modelName: prepared.requestedModelLabel || 'AgentRouter · Auto',
-        provider: 'agentrouter',
-        gateway: 'agentrouter',
+        modelId: requestedModel || 'gemini::gemini-4-hydrogen',
+        modelName: prepared.requestedModelLabel || 'Gemini 4 Hydrogen',
+        provider: 'gemini',
+        gateway: 'gemini',
         isFallback: false,
       });
 
@@ -3258,13 +3312,16 @@ async function startServer() {
               ? 'Generating motion preview...'
               : mediaKind === 'music'
                 ? 'Composing custom studio track...'
-                : 'Generating image & searching visual references...',
+                : attachmentDataUrl
+                  ? 'Editing & generating image with Gemini...'
+                  : 'Generating image with Gemini...',
         });
 
         const mediaResult: GeneratedMediaResult = await generateMediaAsset({
           kind: mediaKind,
           prompt: message,
           requestedModel,
+          attachmentDataUrl,
         });
 
         clearInterval(keepAlive);
@@ -3281,8 +3338,8 @@ async function startServer() {
           creditsUsed: 0,
           billing: initialBillingSummary,
           media: mediaResult,
-          modelUsed: mediaResult.modelId || 'free-media',
-          modelName: prepared.requestedModelLabel || 'AgentRouter',
+          modelUsed: mediaResult.modelId || 'gemini-3.1-flash-lite-image',
+          modelName: prepared.requestedModelLabel || 'Google Gemini',
           provider: mediaResult.gateway,
           startedAt: job.startedAt,
         });
@@ -3300,9 +3357,9 @@ async function startServer() {
       let lastPreviewBytesSent = 0;
       let emittedReasoningPhase = false;
 
-      let activeModelUsed = requestedModel || 'agentrouter::auto';
-      let activeModelName = prepared.requestedModelLabel || 'AgentRouter · Auto';
-      let activeProvider = 'agentrouter';
+      let activeModelUsed = requestedModel || 'gemini::gemini-4-hydrogen';
+      let activeModelName = prepared.requestedModelLabel || 'Gemini 4 Hydrogen';
+      let activeProvider = 'gemini';
       let parallelMergedRaw: string | null = null;
 
       let lastReasoningUpdateAt = 0;
@@ -3579,6 +3636,7 @@ async function startServer() {
           kind: 'image',
           prompt: finalized.mediaPrompt || message,
           requestedModel,
+          attachmentDataUrl,
         });
         sendEvent({ type: 'media', media: mediaResult });
         sendEvent({
@@ -3594,8 +3652,8 @@ async function startServer() {
           creditsUsed: 0,
           billing: initialBillingSummary,
           media: mediaResult,
-          modelUsed: mediaResult.modelId || 'free-media',
-          modelName: prepared.requestedModelLabel,
+          modelUsed: mediaResult.modelId || 'gemini-3.1-flash-lite-image',
+          modelName: prepared.requestedModelLabel || 'Google Gemini',
           provider: mediaResult.gateway,
           startedAt: job.startedAt,
         });
@@ -3685,7 +3743,9 @@ async function startServer() {
         });
       }
       const errorMessage =
-        err instanceof Error ? err.message : 'Unable to reach free AI engine right now.';
+        err instanceof Error
+          ? err.message
+          : 'Unable to reach Gemini backend right now. Check GEMINI_API_KEY in Settings > Secrets.';
       if (projectId && generationCreditContext?.user?.id) {
         void recordBuildCheckpoint(
           {

@@ -1971,13 +1971,16 @@ export function buildCraftSystemPrompt(params: {
     'THINK FIRST BEFORE RESPONDING (MANDATORY):',
     '1. ALWAYS start by thinking carefully inside `<think>...</think>` before emitting any visible text or markers.',
     '2. Inside `<think>...</think>`, judge the user’s real intent naturally from context (do NOT rely on keywords alone):',
-    '   - Choose (A) CHAT whenever the user is having a normal conversation, greeting you, asking questions, brainstorming, discussing ChatGPT/apps/websites conceptually, giving feedback, asking why/how something works, or testing how you reply — EVEN IF they mention words like "app", "website", "tool", or "ChatGPT", and even when an app already exists in Preview.',
+    '   - Choose (A) CHAT whenever the user is having a normal conversation, greeting you, asking questions, brainstorming, discussing AI/apps/websites conceptually, giving feedback, asking why/how something works, or testing how you reply — EVEN IF they mention words like "app", "website", or "image", and even when an app already exists in Preview.',
     '   - Choose (B) BUILD ONLY when the user genuinely wants you to create, build, code, modify, fix, restyle, add a feature to, or monetize an app in Preview right now.',
+    '   - Choose (C) CREATE / GENERATE / EDIT IMAGE whenever the user asks you to generate, draw, paint, illustrate, or edit/transform a standalone image/picture/artwork (including when they attach an image and describe how the resulting image should look) — NOT a web/mobile app.',
     '(A) NORMAL CONVERSATION / CHAT:',
     `    -> Right after \`</think>\`, output \`[[INTENT:CHAT]]\` followed by a newline${shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline' : ''}, then reply naturally, warmly, thoughtfully, and directly like ChatGPT — no artificial brevity caps, no hardcoded templates, no HTML app bundles, no fake build plans, and never claim you built or changed Preview.`,
     '(B) BUILD / EDIT / MONETIZE APP:',
     '    -> Right after `</think>`, output `[[INTENT:BUILD]]` followed by a newline, then output TWO strictly separated parts:',
     buildRulesBlock,
+    '(C) CREATE / GENERATE / EDIT IMAGE:',
+    `    -> Right after \`</think>\`, output \`[[MODE:GENERATE]]\` followed by a newline${shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline' : ''}, write ONE short natural sentence confirming the image you are creating, and finish with \`[[MEDIA_PROMPT: <vivid, exact visual prompt matching the user description and any attached image edits>]]\`.`,
     activeFlags.length > 0 ? `Enabled capabilities: ${activeFlags.join(', ')}.` : '',
   ]
     .filter(Boolean)

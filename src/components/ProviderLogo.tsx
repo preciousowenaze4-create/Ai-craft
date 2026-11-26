@@ -10,13 +10,18 @@ function resolveProviderKey(provider?: string, modelId?: string): string {
   const raw = (provider || modelId?.split('/')[0] || 'aicraft')
     .toLowerCase()
     .trim();
-  if (raw === 'agentrouter' || modelId?.startsWith('agentrouter::')) {
-    return 'agentrouter';
+  if (
+    raw === 'agentrouter' ||
+    modelId?.startsWith('agentrouter::') ||
+    raw.includes('gemini') ||
+    raw.includes('google') ||
+    modelId?.startsWith('gemini::')
+  ) {
+    return 'google';
   }
   if (raw === 'auto' || raw.includes('aicraft') || modelId === 'auto::architect') {
     return 'aicraft';
   }
-  // Free AI mesh (the only engine now): selector ids, gateway, and mesh providers.
   if (
     raw.includes('mesh') ||
     modelId?.startsWith('mesh::') ||
@@ -24,9 +29,6 @@ function resolveProviderKey(provider?: string, modelId?: string): string {
     raw === 'self-hosted'
   ) {
     return 'aicraft';
-  }
-  if (raw.includes('gemini') || raw.includes('google') || modelId?.startsWith('gemini::')) {
-    return 'google';
   }
   if (raw.includes('web-search') || modelId?.startsWith('web-search::')) return 'perplexity';
   if (raw.includes('browser') || modelId?.startsWith('browser::')) return 'browser';
@@ -70,24 +72,6 @@ export function ProviderLogo({
 
   const renderMark = () => {
     switch (key) {
-      case 'agentrouter':
-        return (
-          <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <circle cx="12" cy="12" r="9.5" fill="url(#agentRouterGrad)" />
-            <path
-              d="M12 6.4L17 16.4H14.5L13.5 14.2H10.5L9.5 16.4H7L12 6.4ZM11.3 12.1H12.7L12 10.4L11.3 12.1Z"
-              fill="#FFFFFF"
-            />
-            <defs>
-              <linearGradient id="agentRouterGrad" x1="2.5" y1="2.5" x2="21.5" y2="21.5" gradientUnits="userSpaceOnUse">
-                <stop offset="0%" stopColor="#0D5BFF" />
-                <stop offset="55%" stopColor="#7C3AED" />
-                <stop offset="100%" stopColor="#EC4899" />
-              </linearGradient>
-            </defs>
-          </svg>
-        );
-
       case 'aicraft':
         return (
           <svg width={iconSize} height={iconSize} viewBox="0 0 24 24" fill="none" aria-hidden="true">

@@ -1,21 +1,35 @@
 /**
- * AI Craft — AgentRouter Brain Engine
+ * AI Craft — Gemini Brain Engine
  *
- * Routes every chat and build request directly to the user's configured
- * AgentRouter backend (`AGENTROUTER_API_KEY` + `AGENTROUTER_BASE_URL`).
- * All built-in free/keyless providers (Pollinations, Groq, Cerebras, OpenRouter,
- * Mistral, HuggingFace, GitHub, Together, DeepInfra, etc.) have been removed.
+ * Routes every chat, thinking, and app-build request directly to Google Gemini
+ * via the official `@google/genai` SDK (`GEMINI_API_KEY`).
  *
- * Supports all 3 AgentRouter wire protocols seen in AgentRouter model badges:
- *  - `/v1/chat/completions` (OpenAI Chat Completions)
- *  - `/v1/responses` (OpenAI Responses API fallback)
- *  - `/v1/messages` (Anthropic Claude native for `claude-*` models)
+ * Features:
+ * - Native Gemini 4 & 3.1 streaming via `ai.models.generateContentStream`
+ * - Thought summaries streamed via `part.thought` -> `onReasoningChunk`
+ * - Strict Gemini 4 config discipline (zero temperature/topP/topK/thinkingBudget overrides)
+ * - Multimodal image understanding via `inlineData` attachments
+ * - Model & multi-key cooldown + daily quota failover
  */
 
+import { GoogleGenAI, type Content, type GenerateContentConfig, type Part } from '@google/genai';
 import {
+  DEFAULT_GEMINI_BASE_URL,
+  GEMINI_BUILDER_MODELS,
   buildCandidateCooldownKey,
+  discoverLiveGeminiModelsForKey,
   gatewayCandidateCooldownRemainingMs,
+  getGeminiBaseUrlOverride,
+  getGeminiEffectiveBaseUrl,
+  getServerGeminiApiKeys,
+  inferGeminiThinkingMode,
+  isBuilderCompatibleGeminiModel,
+  isGatewayCandidateHardBlocked,
+  isGemini4SeriesModel,
+  makeGeminiDisplayLabel,
+  markApiKeyInvalidCooldown,
   markGatewayCandidateCooldown,
+  parseGatewayModelIdentifier,
 } from './_aiGateways.js';
 import {
   FREE_MODEL_CATALOG,
@@ -23,6 +37,10 @@ import {
   staticCatalogSize,
   utcQuotaDay,
 } from './_freeAiCatalog.js';
+import {
+  recordGeminiApiError,
+  recordGeminiApiUsage,
+} from './_geminiUsage.js';
 
 // ---------------------------------------------------------------------------
 // Types & typed errors
@@ -47,7 +65,7 @@ export class FreeAiMeshUnavailableError extends Error {
   readonly code = 'mesh_unavailable' as const;
   constructor() {
     super(
-      'AgentRouter API key is not configured on the backend. Add AGENTROUTER_API_KEY in your project Secrets.'
+      'GEMINI_API_KEY is not configured on the backend. Add your Gemini API key in Settings > Secrets (or Vercel environment variables).'
     );
     this.name = 'FreeAiMeshUnavailableError';
   }
@@ -62,7 +80,7 @@ export class FreeAiMeshAllFailedError extends Error {
       .map((d) => (d.length > 140 ? `${d.slice(0, 140)}...` : d))
       .join('; ');
     super(
-      `AgentRouter request failed${tail ? ` (${tail})` : ''}. Check your AgentRouter API key and try again.`
+      `Gemini request failed${tail ? ` (${tail})` : ''}. Check your GEMINI_API_KEY in Settings > Secrets and try again.`
     );
     this.name = 'FreeAiMeshAllFailedError';
     this.details = details;
@@ -70,57 +88,8 @@ export class FreeAiMeshAllFailedError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Env helpers
+// Env & helper utilities
 // ---------------------------------------------------------------------------
-
-function cleanPastedSecret(rawValue: string | undefined): {
-  cleaned: string;
-  hadQuotes: boolean;
-  hadAssignPrefix: boolean;
-  hadBearerPrefix: boolean;
-  hadWhitespace: boolean;
-  looksLikeUrl: boolean;
-} {
-  if (typeof rawValue !== 'string') {
-    return {
-      cleaned: '',
-      hadQuotes: false,
-      hadAssignPrefix: false,
-      hadBearerPrefix: false,
-      hadWhitespace: false,
-      looksLikeUrl: false,
-    };
-  }
-  let s = rawValue.replace(/[\r\n]+/g, ' ').trim();
-  const hadAssignPrefix = /^(?:export\s+)?[A-Z0-9_]+\s*=\s*/i.test(s);
-  if (hadAssignPrefix) {
-    s = s.replace(/^(?:export\s+)?[A-Z0-9_]+\s*=\s*/i, '').trim();
-  }
-  s = s.replace(/^(?:authorization|x-api-key)\s*:\s*/i, '').trim();
-  const strippedQuotes = s
-    .replace(/^[`"'\u201c\u201d\u2018\u2019]+|[`"'\u201c\u201d\u2018\u2019;,]+$/g, '')
-    .trim();
-  const hadQuotes = strippedQuotes !== s;
-  s = strippedQuotes;
-  const hadBearerPrefix = /^bearer\s+/i.test(s);
-  if (hadBearerPrefix) {
-    s = s.replace(/^bearer\s+/i, '').trim();
-  }
-  const hadWhitespace = /\s/.test(s);
-  if (hadWhitespace) {
-    const skMatch = s.match(/sk-[A-Za-z0-9._-]+/);
-    s = skMatch ? skMatch[0] : s.replace(/\s+/g, '');
-  }
-  const looksLikeUrl = /^https?:\/\//i.test(s);
-  return {
-    cleaned: s,
-    hadQuotes,
-    hadAssignPrefix,
-    hadBearerPrefix,
-    hadWhitespace,
-    looksLikeUrl,
-  };
-}
 
 function readEnvCsv(name: string): string[] {
   return (process.env[name] || '')
@@ -137,25 +106,21 @@ function readEnvNumber(name: string, defaultValue: number): number {
   return Math.floor(parsed);
 }
 
-function toChatCompletionsUrl(rawBase: string): string {
-  const base = rawBase.trim().replace(/\/+$/, '');
-  if (/\/chat\/completions$/i.test(base)) return base;
-  if (/\/v1$/i.test(base)) return `${base}/chat/completions`;
-  return `${base}/v1/chat/completions`;
-}
-
-function toResponsesUrl(v1Origin: string): string {
-  const base = v1Origin.trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
-  return /\/v1$/i.test(base) ? `${base}/responses` : `${base}/v1/responses`;
-}
-
-function toMessagesUrl(v1Origin: string): string {
-  const base = v1Origin.trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
-  return /\/v1$/i.test(base) ? `${base}/messages` : `${base}/v1/messages`;
+function createSdkClient(apiKey: string): GoogleGenAI {
+  const baseUrlOverride = getGeminiBaseUrlOverride();
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      ...(baseUrlOverride ? { baseUrl: baseUrlOverride } : {}),
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
-// Abortable sleep + per-provider concurrency slot
+// Abortable sleep + concurrency guard
 // ---------------------------------------------------------------------------
 
 function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
@@ -197,7 +162,7 @@ async function acquireProviderSlot(
       return;
     }
     if (Date.now() - startedAt > maxWaitMs) {
-      throw new MeshHttpError('Timed out waiting for AgentRouter slot', null);
+      throw new MeshHttpError('Timed out waiting for Gemini slot', null);
     }
     await sleepWithSignal(120, signal);
   }
@@ -210,128 +175,12 @@ function releaseProviderSlot(providerId: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// AgentRouter credentials, model discovery & diagnostics
+// Gemini credentials, model discovery & diagnostics
 // ---------------------------------------------------------------------------
 
-const AGENTROUTER_DEFAULT_BASE = 'https://co.agentrouter.org/v1';
+let geminiModelsCache: { models: string[]; at: number } | null = null;
 
-let agentRouterModelsCache: { models: string[]; at: number } | null = null;
-let agentRouterRefreshInFlight = false;
-
-function normalizeAgentRouterOrigin(rawBase: string): string {
-  let trimmed = rawBase.trim().replace(/^["'`]|["'`]$/g, '').trim();
-  if (!trimmed) return AGENTROUTER_DEFAULT_BASE;
-  if (!/^https?:\/\//i.test(trimmed)) {
-    if (/^[a-z0-9.-]+\.[a-z]{2,}(?:\/.*)?$/i.test(trimmed)) {
-      trimmed = `https://${trimmed}`;
-    } else {
-      return AGENTROUTER_DEFAULT_BASE;
-    }
-  }
-  try {
-    const parsed = new URL(trimmed);
-    const host = parsed.hostname.toLowerCase();
-    // agentrouter.org (root/www) serves the web dashboard behind an interactive
-    // Aliyun WAF captcha; API calls use co.agentrouter.org/v1.
-    if (host === 'agentrouter.org' || host === 'www.agentrouter.org') {
-      parsed.protocol = 'https:';
-      parsed.hostname = 'co.agentrouter.org';
-    }
-    const cleanPath = parsed.pathname
-      .replace(/\/+$/, '')
-      .replace(/\/(?:chat\/completions|responses|messages|models)$/i, '');
-    const v1Path = /\/v1$/i.test(cleanPath)
-      ? cleanPath
-      : cleanPath && cleanPath !== '/'
-        ? `${cleanPath}/v1`
-        : '/v1';
-    return `${parsed.origin}${v1Path}`;
-  } catch {
-    return AGENTROUTER_DEFAULT_BASE;
-  }
-}
-
-function getAgentRouterCredentials(): {
-  apiKey: string;
-  baseUrl: string;
-  v1Origin: string;
-  keyEnvName: string;
-  baseEnvName: string;
-  keyShape: {
-    hadQuotes: boolean;
-    hadAssignPrefix: boolean;
-    hadBearerPrefix: boolean;
-    hadWhitespace: boolean;
-    looksLikeUrl: boolean;
-    looksLikeSkToken: boolean;
-    lengthOk: boolean;
-  };
-} | null {
-  const keyNames = [
-    'AGENTROUTER_API_KEY',
-    'AGENT_ROUTER_API_KEY',
-    'AGENTROUTER_KEY',
-    'AGENTROUTER_TOKEN',
-    'ANTHROPIC_AUTH_TOKEN',
-    'OPENAI_API_KEY',
-    'ANTHROPIC_API_KEY',
-  ];
-  let matchedKeyName = '';
-  let keyInfo = cleanPastedSecret(undefined);
-  for (const name of keyNames) {
-    const info = cleanPastedSecret(process.env[name]);
-    if (!info.cleaned) continue;
-    if (/^(my[_-]|your[_-]|xxx+|<|change[-_]?me|placeholder)/i.test(info.cleaned)) {
-      continue;
-    }
-    matchedKeyName = name;
-    keyInfo = info;
-    break;
-  }
-  if (!matchedKeyName || !keyInfo.cleaned || keyInfo.looksLikeUrl) return null;
-
-  const baseNames = [
-    'AGENTROUTER_BASE_URL',
-    'AGENT_ROUTER_BASE_URL',
-    'AGENTROUTER_URL',
-    'OPENAI_BASE_URL',
-    'ANTHROPIC_BASE_URL',
-    'API_BASE_URL',
-  ];
-  let matchedBaseName = '';
-  let rawBase = '';
-  for (const name of baseNames) {
-    const val = (process.env[name] || '').trim().replace(/^["'`]|["'`]$/g, '').trim();
-    if (
-      val &&
-      (/^https?:\/\//i.test(val) || /^[a-z0-9.-]+\.[a-z]{2,}(?:\/.*)?$/i.test(val))
-    ) {
-      matchedBaseName = name;
-      rawBase = val;
-      break;
-    }
-  }
-  if (!rawBase) rawBase = AGENTROUTER_DEFAULT_BASE;
-  const v1Origin = normalizeAgentRouterOrigin(rawBase);
-  return {
-    apiKey: keyInfo.cleaned,
-    baseUrl: toChatCompletionsUrl(v1Origin),
-    v1Origin,
-    keyEnvName: matchedKeyName,
-    baseEnvName: matchedBaseName || 'default',
-    keyShape: {
-      hadQuotes: keyInfo.hadQuotes,
-      hadAssignPrefix: keyInfo.hadAssignPrefix,
-      hadBearerPrefix: keyInfo.hadBearerPrefix,
-      hadWhitespace: keyInfo.hadWhitespace,
-      looksLikeUrl: keyInfo.looksLikeUrl,
-      looksLikeSkToken: /^sk-/i.test(keyInfo.cleaned),
-      lengthOk: keyInfo.cleaned.length >= 12,
-    },
-  };
-}
-
-let lastAgentRouterDiag: {
+let lastGeminiDiag: {
   checkedAt: string;
   endpoint: string;
   status: number | null;
@@ -340,18 +189,19 @@ let lastAgentRouterDiag: {
 
 function sanitizeDiagMessage(rawMessage: string): string {
   return String(rawMessage || '')
-    .replace(/sk-[A-Za-z0-9._-]{6,}/g, 'sk-***')
+    .replace(/AIza[A-Za-z0-9_-]{8,}/g, 'AIza***')
+    .replace(/key=[A-Za-z0-9._-]+/gi, 'key=***')
     .replace(/Bearer\s+\S+/gi, 'Bearer ***')
     .trim()
     .slice(0, 220);
 }
 
-function recordAgentRouterDiag(
+function recordGeminiDiag(
   endpoint: string,
   status: number | null,
   rawMessage: string
 ): void {
-  lastAgentRouterDiag = {
+  lastGeminiDiag = {
     checkedAt: new Date().toISOString(),
     endpoint,
     status,
@@ -359,296 +209,86 @@ function recordAgentRouterDiag(
   };
 }
 
-export function getAgentRouterDiagnostic(): {
+export function getGeminiDiagnostic(): {
   configured: boolean;
+  keyCount: number;
   apiOrigin: string;
-  keyEnvName: string | null;
-  baseEnvName: string | null;
-  keyShape: {
-    hadQuotes: boolean;
-    hadAssignPrefix: boolean;
-    hadBearerPrefix: boolean;
-    hadWhitespace: boolean;
-    looksLikeUrl: boolean;
-    looksLikeSkToken: boolean;
-    lengthOk: boolean;
-  } | null;
   lastCheckedAt: string | null;
   lastEndpoint: string | null;
   lastStatus: number | null;
   lastMessage: string | null;
 } {
-  const creds = getAgentRouterCredentials();
+  const keys = getServerGeminiApiKeys();
   return {
-    configured: Boolean(creds),
-    apiOrigin: creds?.v1Origin || AGENTROUTER_DEFAULT_BASE,
-    keyEnvName: creds?.keyEnvName ?? null,
-    baseEnvName: creds?.baseEnvName ?? null,
-    keyShape: creds?.keyShape ?? null,
-    lastCheckedAt: lastAgentRouterDiag?.checkedAt ?? null,
-    lastEndpoint: lastAgentRouterDiag?.endpoint ?? null,
-    lastStatus: lastAgentRouterDiag?.status ?? null,
-    lastMessage: lastAgentRouterDiag?.message ?? null,
+    configured: keys.length > 0,
+    keyCount: keys.length,
+    apiOrigin: getGeminiEffectiveBaseUrl() || DEFAULT_GEMINI_BASE_URL,
+    lastCheckedAt: lastGeminiDiag?.checkedAt ?? null,
+    lastEndpoint: lastGeminiDiag?.endpoint ?? null,
+    lastStatus: lastGeminiDiag?.status ?? null,
+    lastMessage: lastGeminiDiag?.message ?? null,
   };
 }
 
-export function isAgentRouterConfigured(): boolean {
-  return Boolean(getAgentRouterCredentials());
+export function isGeminiConfigured(): boolean {
+  return getServerGeminiApiKeys().length > 0;
 }
 
-export function getAgentRouterApiOrigin(): string {
-  return getAgentRouterCredentials()?.v1Origin || AGENTROUTER_DEFAULT_BASE;
+export function getGeminiApiOrigin(): string {
+  return getGeminiEffectiveBaseUrl();
 }
 
-type AgentRouterHeaderProfile = 'codex' | 'standard' | 'claude';
-
-let preferredHeaderProfile: AgentRouterHeaderProfile = 'codex';
-
-function buildHeaderProfileHeaders(profile: AgentRouterHeaderProfile): Record<string, string> {
-  if (profile === 'codex') {
-    return {
-      'User-Agent': 'codex_cli_rs/0.34.0',
-    };
+export async function refreshGeminiModelsIfConfigured(): Promise<string[]> {
+  const keys = getServerGeminiApiKeys();
+  if (keys.length === 0) return [];
+  const discovered = await discoverLiveGeminiModelsForKey(keys[0], true).catch(() => []);
+  if (discovered.length > 0) {
+    geminiModelsCache = { models: discovered, at: Date.now() };
+    recordGeminiDiag(`${getGeminiEffectiveBaseUrl()}/v1beta/models`, 200, `ok (${discovered.length} models)`);
   }
-  if (profile === 'claude') {
-    return {
-      'User-Agent': 'claude-cli/1.0.56 (external, cli)',
-    };
-  }
-  return {};
+  return resolveGeminiModels();
 }
 
-function orderedHeaderProfiles(defaultFirst?: AgentRouterHeaderProfile): AgentRouterHeaderProfile[] {
-  const start = defaultFirst || preferredHeaderProfile;
-  const all: AgentRouterHeaderProfile[] = ['codex', 'standard', 'claude'];
-  return [start, ...all.filter((p) => p !== start)];
-}
-
-function scheduleAgentRouterModelsRefresh(v1Origin: string, apiKey: string): void {
-  if (agentRouterRefreshInFlight) return;
-  agentRouterRefreshInFlight = true;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3500);
-  fetch(`${v1Origin}/models`, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      Accept: 'application/json',
-      ...buildHeaderProfileHeaders(preferredHeaderProfile),
-    },
-    signal: controller.signal,
-  })
-    .then((res) => {
-      const ct = (res.headers.get('content-type') || '').toLowerCase();
-      if (!res.ok || ct.includes('text/html')) return null;
-      return res.json();
-    })
-    .then((payload: unknown) => {
-      const list = Array.isArray((payload as { data?: unknown[] } | null)?.data)
-        ? (payload as { data: unknown[] }).data
-        : Array.isArray(payload)
-          ? payload
-          : [];
-      const names: string[] = [];
-      for (const entry of list) {
-        const id =
-          typeof entry === 'string'
-            ? entry.trim()
-            : entry && typeof entry === 'object' && 'id' in entry
-              ? String((entry as { id: unknown }).id || '').trim()
-              : '';
-        if (!id || names.includes(id)) continue;
-        if (
-          /^(whisper|tts|dall-e|gpt-image|text-embedding|embedding|moderation)/i.test(id)
-        ) {
-          continue;
-        }
-        names.push(id);
-        if (names.length >= 40) break;
-      }
-      if (names.length > 0) {
-        agentRouterModelsCache = { models: names, at: Date.now() };
-      }
-    })
-    .catch(() => undefined)
-    .finally(() => {
-      agentRouterRefreshInFlight = false;
-      clearTimeout(timer);
-    });
-}
-
-export async function refreshAgentRouterModelsIfConfigured(): Promise<string[]> {
-  const creds = getAgentRouterCredentials();
-  if (!creds) return [];
-  const profiles = orderedHeaderProfiles();
-  for (const profile of profiles) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3500);
-    try {
-      const res = await fetch(`${creds.v1Origin}/models`, {
-        headers: {
-          Authorization: `Bearer ${creds.apiKey}`,
-          Accept: 'application/json',
-          ...buildHeaderProfileHeaders(profile),
-        },
-        signal: controller.signal,
-      });
-      const ct = (res.headers.get('content-type') || '').toLowerCase();
-      if (!res.ok || ct.includes('text/html')) {
-        const errBody = await res.text().catch(() => '');
-        recordAgentRouterDiag(
-          `${creds.v1Origin}/models`,
-          res.status,
-          ct.includes('text/html') ? 'HTML/WAF response' : errBody || `HTTP ${res.status}`
-        );
-        if (res.status === 401 || res.status === 403 || ct.includes('text/html')) {
-          continue;
-        }
-        return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
-      }
-      const payload = (await res.json().catch(() => null)) as
-        | { data?: unknown[]; code?: number; msg?: string }
-        | unknown[]
-        | null;
-      if (
-        payload &&
-        !Array.isArray(payload) &&
-        typeof payload.code === 'number' &&
-        payload.code !== 0 &&
-        payload.code !== 200
-      ) {
-        recordAgentRouterDiag(
-          `${creds.v1Origin}/models`,
-          payload.code,
-          payload.msg || 'AgentRouter error'
-        );
-        if (payload.code === 401 || payload.code === 403) {
-          continue;
-        }
-        return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
-      }
-      preferredHeaderProfile = profile;
-      const list = Array.isArray((payload as { data?: unknown[] } | null)?.data)
-        ? (payload as { data: unknown[] }).data
-        : Array.isArray(payload)
-          ? payload
-          : [];
-      recordAgentRouterDiag(
-        `${creds.v1Origin}/models`,
-        res.status,
-        `ok (${list.length} models)`
-      );
-      const names: string[] = [];
-      for (const entry of list) {
-        const id =
-          typeof entry === 'string'
-            ? entry.trim()
-            : entry && typeof entry === 'object' && 'id' in entry
-              ? String((entry as { id: unknown }).id || '').trim()
-              : '';
-        if (!id || names.includes(id)) continue;
-        if (
-          /^(whisper|tts|dall-e|gpt-image|text-embedding|embedding|moderation)/i.test(id)
-        ) {
-          continue;
-        }
-        names.push(id);
-        if (names.length >= 40) break;
-      }
-      if (names.length > 0) {
-        agentRouterModelsCache = { models: names, at: Date.now() };
-      }
-      break;
-    } catch {
-      // keep trying alternate profile or cached list
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
-}
-
-function resolveAgentRouterModels(v1Origin: string, apiKey: string): string[] {
-  const singleOverride = (process.env.AGENTROUTER_MODEL || '').trim();
-  const csvOverride = readEnvCsv('AGENTROUTER_MODELS');
+function resolveGeminiModels(): string[] {
+  const singleOverride = (process.env.GEMINI_MODEL || '').trim();
+  const csvOverride = readEnvCsv('GEMINI_MODELS');
   const envModels = [
     ...singleOverride.split(',').map((s) => s.trim()).filter(Boolean),
     ...csvOverride,
-  ].filter((m, idx, arr) => arr.indexOf(m) === idx);
+  ]
+    .filter((m) => isBuilderCompatibleGeminiModel(m))
+    .filter((m, idx, arr) => arr.indexOf(m) === idx);
 
-  const cacheFresh =
-    agentRouterModelsCache && Date.now() - agentRouterModelsCache.at < 10 * 60_000;
-  if (!cacheFresh) {
-    scheduleAgentRouterModelsRefresh(v1Origin, apiKey);
+  if (envModels.length > 0) {
+    return envModels.slice(0, 12);
   }
-  const live = agentRouterModelsCache?.models || [];
+
+  const live = geminiModelsCache?.models || [];
   const baseList =
     live.length > 0
       ? [
-          ...FREE_MODEL_CATALOG.agentrouter.filter((m) => live.includes(m)),
-          ...live.filter((m) => !FREE_MODEL_CATALOG.agentrouter.includes(m)),
+          ...FREE_MODEL_CATALOG.gemini.filter((m) => live.includes(m)),
+          ...live.filter((m) => !FREE_MODEL_CATALOG.gemini.includes(m)),
         ]
-      : FREE_MODEL_CATALOG.agentrouter;
+      : FREE_MODEL_CATALOG.gemini;
 
-  if (envModels.length > 0) {
-    return [...envModels, ...baseList.filter((m) => !envModels.includes(m))].slice(0, 24);
-  }
-  return baseList.slice(0, 24);
+  return baseList.slice(0, 12);
 }
-
-interface ResolvedMeshProvider {
-  baseUrl: string;
-  v1Origin: string;
-  apiKey: string;
-  models: string[];
-  headers?: Record<string, string>;
-}
-
-interface MeshProviderDef {
-  id: string;
-  label: string;
-  keyless: boolean;
-  resolve(): ResolvedMeshProvider | null;
-}
-
-const MESH_PROVIDERS: MeshProviderDef[] = [
-  {
-    id: 'agentrouter',
-    label: 'AgentRouter',
-    keyless: false,
-    resolve() {
-      const creds = getAgentRouterCredentials();
-      if (!creds) return null;
-      return {
-        baseUrl: creds.baseUrl,
-        v1Origin: creds.v1Origin,
-        apiKey: creds.apiKey,
-        models: resolveAgentRouterModels(creds.v1Origin, creds.apiKey),
-        headers: {
-          'User-Agent': 'codex_cli_rs/0.34.0',
-          'X-Title': 'AI Craft',
-        },
-      };
-    },
-  },
-];
 
 // ---------------------------------------------------------------------------
 // Candidates, cooldowns, quotas & budgets
 // ---------------------------------------------------------------------------
 
 interface MeshCandidate {
-  providerId: string;
+  providerId: 'gemini';
   providerLabel: string;
   keyless: boolean;
-  baseUrl: string;
-  v1Origin: string;
   apiKey: string;
-  headers?: Record<string, string>;
   model: string;
   cooldownKey: string;
 }
 
-const MAX_MODELS_PER_PROVIDER = 8;
+const MAX_MODELS_PER_KEY = 8;
 const MAX_ATTEMPTS_PER_WALK = 8;
 
 const dailyUsage = new Map<string, number>();
@@ -679,7 +319,6 @@ export function resetMeshDailyUsage(): void {
   dailyUsage.clear();
 }
 
-/** Single-brain AgentRouter execution (never spawns 3 competing free AIs). */
 export function isMeshParallelBuildsEnabled(): boolean {
   return false;
 }
@@ -693,37 +332,28 @@ interface MeshWalkBudget {
 
 function budgetFor(taskKind: 'chat' | 'build'): MeshWalkBudget {
   if (taskKind === 'chat') {
-    return { firstByteMs: 30_000, idleMs: 35_000, walkMs: 75_000, maxAttempts: 6 };
+    return { firstByteMs: 35_000, idleMs: 40_000, walkMs: 90_000, maxAttempts: 6 };
   }
-  return { firstByteMs: 45_000, idleMs: 60_000, walkMs: 120_000, maxAttempts: 8 };
+  return { firstByteMs: 55_000, idleMs: 65_000, walkMs: 140_000, maxAttempts: 8 };
 }
 
 function enumerateMeshCandidates(): Array<{ candidate: MeshCandidate; coolingMs: number }> {
+  const keys = getServerGeminiApiKeys();
+  if (keys.length === 0) return [];
+  const models = resolveGeminiModels().slice(0, MAX_MODELS_PER_KEY);
   const all: Array<{ candidate: MeshCandidate; coolingMs: number }> = [];
-  for (const def of MESH_PROVIDERS) {
-    let resolved: ResolvedMeshProvider | null = null;
-    try {
-      resolved = def.resolve();
-    } catch {
-      resolved = null;
-    }
-    if (!resolved) continue;
-    for (const model of resolved.models.slice(0, MAX_MODELS_PER_PROVIDER)) {
-      if (isDailyQuotaExhausted(def.id, model)) continue;
-      const cooldownKey = buildCandidateCooldownKey(
-        `mesh:${def.id}`,
-        resolved.apiKey || def.id,
-        model
-      );
+
+  for (const model of models) {
+    if (isDailyQuotaExhausted('gemini', model)) continue;
+    for (const apiKey of keys) {
+      const cooldownKey = buildCandidateCooldownKey('gemini', apiKey, model);
+      if (isGatewayCandidateHardBlocked(cooldownKey)) continue;
       all.push({
         candidate: {
-          providerId: def.id,
-          providerLabel: def.label,
-          keyless: def.keyless,
-          baseUrl: resolved.baseUrl,
-          v1Origin: resolved.v1Origin,
-          apiKey: resolved.apiKey,
-          headers: resolved.headers,
+          providerId: 'gemini',
+          providerLabel: 'Google Gemini',
+          keyless: false,
+          apiKey,
           model,
           cooldownKey,
         },
@@ -751,50 +381,41 @@ function prioritizeCandidatesForRequestedModel(
   const req = (requestedModel || '').trim();
   if (!req) return candidates;
 
-  if (req.startsWith('agentrouter::')) {
-    const targetModel = req.slice('agentrouter::'.length).trim();
-    if (!targetModel || targetModel === 'auto') {
-      return candidates;
-    }
-    const exact = candidates.filter((c) => c.model === targetModel);
-    const sameProvider = candidates.filter((c) => c.model !== targetModel);
-    if (exact.length > 0) {
-      return [...exact, ...sameProvider];
-    }
-    const creds = getAgentRouterCredentials();
-    if (creds) {
-      const cooldownKey = buildCandidateCooldownKey(
-        'mesh:agentrouter',
-        creds.apiKey,
-        targetModel
-      );
-      if (
-        gatewayCandidateCooldownRemainingMs(cooldownKey) <= 0 &&
-        !isDailyQuotaExhausted('agentrouter', targetModel)
-      ) {
-        return [
-          {
-            providerId: 'agentrouter',
-            providerLabel: 'AgentRouter',
-            keyless: false,
-            baseUrl: creds.baseUrl,
-            v1Origin: creds.v1Origin,
-            apiKey: creds.apiKey,
-            headers: {
-              'User-Agent': 'codex_cli_rs/0.34.0',
-              'X-Title': 'AI Craft',
-            },
-            model: targetModel,
-            cooldownKey,
-          },
-          ...sameProvider,
-        ];
-      }
-    }
-    return sameProvider;
+  const parsed = parseGatewayModelIdentifier(req);
+  const targetModel = parsed.upstreamModelId;
+  if (!targetModel) return candidates;
+
+  const exact = candidates.filter((c) => c.model === targetModel);
+  const others = candidates.filter((c) => c.model !== targetModel);
+  if (exact.length > 0) {
+    return [...exact, ...others];
   }
 
-  return candidates;
+  const keys = getServerGeminiApiKeys();
+  if (keys.length > 0 && !isDailyQuotaExhausted('gemini', targetModel)) {
+    const fallbackEntries: MeshCandidate[] = [];
+    for (const apiKey of keys) {
+      const cooldownKey = buildCandidateCooldownKey('gemini', apiKey, targetModel);
+      if (
+        !isGatewayCandidateHardBlocked(cooldownKey) &&
+        gatewayCandidateCooldownRemainingMs(cooldownKey) <= 0
+      ) {
+        fallbackEntries.push({
+          providerId: 'gemini',
+          providerLabel: 'Google Gemini',
+          keyless: false,
+          apiKey,
+          model: targetModel,
+          cooldownKey,
+        });
+      }
+    }
+    if (fallbackEntries.length > 0) {
+      return [...fallbackEntries, ...others];
+    }
+  }
+
+  return others;
 }
 
 function earliestMeshCooldownMs(): number {
@@ -827,26 +448,20 @@ export function getFreeAiMeshStatus(): {
     dailyLimitPerModel: number;
   };
 } {
-  const providers: MeshProviderStatus[] = [];
-  for (const def of MESH_PROVIDERS) {
-    let resolved: ResolvedMeshProvider | null = null;
-    try {
-      resolved = def.resolve();
-    } catch {
-      resolved = null;
-    }
-    providers.push({
-      id: def.id,
-      label: def.label,
-      keyless: def.keyless,
-      configured: Boolean(resolved),
-      modelCount: resolved ? resolved.models.length : 0,
-    });
-  }
-  const hasAny = providers.some((p) => p.configured);
+  const configured = isGeminiConfigured();
+  const models = resolveGeminiModels();
+  const providers: MeshProviderStatus[] = [
+    {
+      id: 'gemini',
+      label: 'Google Gemini',
+      keyless: false,
+      configured,
+      modelCount: configured ? models.length : 0,
+    },
+  ];
   return {
     providers,
-    hasAny,
+    hasAny: configured,
     hasKeyless: false,
     pollinationsEnabled: false,
     pollinationsConfigured: false,
@@ -878,41 +493,17 @@ export interface FreeMeshModelOption {
 }
 
 export function getFreeMeshModelOptions(): FreeMeshModelOption[] {
-  const creds = getAgentRouterCredentials();
-  const arModels = creds
-    ? resolveAgentRouterModels(creds.v1Origin, creds.apiKey)
-    : FREE_MODEL_CATALOG.agentrouter;
-
-  const options: FreeMeshModelOption[] = [
-    {
-      id: 'agentrouter::auto',
-      name: 'AgentRouter · Auto',
-      provider: 'agentrouter',
-      contextLength: 262144,
-      isFree: false,
-      gateway: 'auto',
-      tierLabel: 'Thinking · Auto',
-      capabilities: ['Thinking', 'Chat', 'Code'],
-      category: 'code',
-    },
-  ];
-
-  for (const modelId of arModels.slice(0, 12)) {
-    const isClaudeNative = /^claude/i.test(modelId);
-    options.push({
-      id: `agentrouter::${modelId}`,
-      name: `AgentRouter · ${modelId}`,
-      provider: 'agentrouter',
-      contextLength: 262144,
-      isFree: false,
-      gateway: 'auto',
-      tierLabel: isClaudeNative ? 'Claude Native' : 'Chat · Responses',
-      capabilities: ['Thinking', 'Chat', 'Code'],
-      category: 'code',
-    });
-  }
-
-  return options;
+  return GEMINI_BUILDER_MODELS.map((m) => ({
+    id: m.id,
+    name: m.name,
+    provider: m.provider,
+    contextLength: m.contextLength,
+    isFree: m.isFree,
+    gateway: m.gateway,
+    tierLabel: m.tierLabel,
+    capabilities: m.capabilities,
+    category: m.category,
+  }));
 }
 
 interface MeshErrorInfo {
@@ -940,13 +531,12 @@ function normalizeMeshError(err: unknown): MeshErrorInfo {
         const text =
           typeof anyErr.body === 'string' ? anyErr.body : JSON.stringify(anyErr.body);
         const parsed = JSON.parse(text) as {
-          error?: { message?: string; code?: string; type?: string };
+          error?: { message?: string; code?: string | number; status?: string };
           message?: string;
-          msg?: string;
         };
-        message = parsed?.error?.message || parsed?.message || parsed?.msg || message;
+        message = parsed?.error?.message || parsed?.message || message;
       } catch {
-        // keep original message
+        // ignore JSON parse issues
       }
     }
     return { status, message: message.slice(0, 300) };
@@ -956,7 +546,7 @@ function normalizeMeshError(err: unknown): MeshErrorInfo {
 
 export function isBusyMeshError(info: MeshErrorInfo): boolean {
   const lower = info.message.toLowerCase();
-  return /previous request is still running|1 request at a time per ip|wait for it to finish/.test(
+  return /previous request is still running|1 request at a time|overloaded|try again shortly/.test(
     lower
   );
 }
@@ -966,7 +556,9 @@ function isAuthError(info: MeshErrorInfo): boolean {
   return (
     info.status === 401 ||
     info.status === 403 ||
-    /invalid.?api.?key|incorrect api key|unauthorized|forbidden|authentication/.test(lower)
+    /api_key_invalid|invalid.?api.?key|api key not valid|unauthorized|permission_denied|forbidden/.test(
+      lower
+    )
   );
 }
 
@@ -982,7 +574,7 @@ export function cooldownForMeshError(
   }
   if (
     info.status === 404 ||
-    /model[_ ]?not[_ ]?found|does not exist|unknown model|no such model|deprecated model/.test(
+    /model[_ ]?not[_ ]?found|is not found|not supported for generatecontent|unknown model/.test(
       lower
     )
   ) {
@@ -993,7 +585,7 @@ export function cooldownForMeshError(
   }
   if (
     info.status === 429 ||
-    /rate.?limit|too many requests|quota|quota exceeded|limit reached|overloaded/.test(lower)
+    /resource_exhausted|rate.?limit|too many requests|quota|limit reached|overloaded/.test(lower)
   ) {
     return { ms: 45_000, hard: false };
   }
@@ -1004,89 +596,78 @@ export function cooldownForMeshError(
 }
 
 // ---------------------------------------------------------------------------
-// Message building
+// Gemini Content Building & Config Rules
 // ---------------------------------------------------------------------------
 
-interface MeshMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string | Array<Record<string, unknown>>;
-}
-
-function buildMeshMessages(params: {
-  systemPrompt: string;
+function buildGeminiContents(params: {
   historyMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
   userPrompt: string;
   attachmentDataUrl?: string | null;
   withImage?: boolean;
-}): MeshMessage[] {
-  const messages: MeshMessage[] = [];
-  const system = params.systemPrompt.trim();
-  if (system) messages.push({ role: 'system', content: system.slice(0, 60000) });
-  const history = params.historyMessages || [];
-  for (const item of history.slice(-10)) {
-    if (!item?.content) continue;
-    messages.push({
-      role: item.role === 'assistant' ? 'assistant' : 'user',
-      content: String(item.content).slice(0, 4000),
-    });
-  }
-  const prompt = params.userPrompt.slice(0, 30000);
-  if (params.withImage && params.attachmentDataUrl?.startsWith('data:image/')) {
-    messages.push({
-      role: 'user',
-      content: [
-        { type: 'text', text: prompt },
-        { type: 'image_url', image_url: { url: params.attachmentDataUrl } },
-      ],
-    });
-  } else {
-    messages.push({ role: 'user', content: prompt });
-  }
-  return messages;
-}
-
-function buildAnthropicMessages(params: {
-  historyMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
-  userPrompt: string;
-  attachmentDataUrl?: string | null;
-  withImage?: boolean;
-}): Array<{ role: 'user' | 'assistant'; content: string | Array<Record<string, unknown>> }> {
-  const out: Array<{
-    role: 'user' | 'assistant';
-    content: string | Array<Record<string, unknown>>;
-  }> = [];
+}): Content[] {
+  const contents: Content[] = [];
   for (const item of (params.historyMessages || []).slice(-10)) {
-    if (!item?.content) continue;
-    out.push({
-      role: item.role === 'assistant' ? 'assistant' : 'user',
-      content: String(item.content).slice(0, 4000),
+    const text = typeof item?.content === 'string' ? item.content.trim() : '';
+    if (!text) continue;
+    contents.push({
+      role: item.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: text.slice(0, 4000) }],
     });
   }
-  const prompt = params.userPrompt.slice(0, 30000);
+
+  const userParts: Part[] = [];
   if (params.withImage && params.attachmentDataUrl?.startsWith('data:image/')) {
-    const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/.exec(
+    const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/i.exec(
       params.attachmentDataUrl
     );
     if (match?.[1] && match?.[2]) {
-      out.push({
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            source: { type: 'base64', media_type: match[1], data: match[2] },
-          },
-          { type: 'text', text: prompt },
-        ],
+      userParts.push({
+        inlineData: {
+          mimeType: match[1],
+          data: match[2],
+        },
       });
-      return out;
     }
   }
-  out.push({ role: 'user', content: prompt });
-  return out;
+  userParts.push({ text: params.userPrompt.slice(0, 30000) });
+  contents.push({ role: 'user', parts: userParts });
+  return contents;
+}
+
+function buildGeminiGenerateConfig(
+  modelId: string,
+  systemPrompt: string,
+  abortSignal?: AbortSignal
+): GenerateContentConfig {
+  const isG4 = isGemini4SeriesModel(modelId);
+  const thinkingMode = inferGeminiThinkingMode(modelId);
+
+  const config: GenerateContentConfig = {
+    abortSignal,
+  };
+
+  const trimmedSys = systemPrompt.trim();
+  if (trimmedSys) {
+    config.systemInstruction = trimmedSys.slice(0, 60000);
+  }
+
+  // Strictly obey Gemini 4 config rules:
+  // NEVER pass temperature, topP, topK, candidateCount, or thinkingBudget on Gemini 4 models.
+  if (isG4) {
+    config.thinkingConfig = {
+      includeThoughts: true,
+    };
+  } else if (thinkingMode === 'level') {
+    config.thinkingConfig = {
+      includeThoughts: true,
+    };
+  }
+
+  return config;
 }
 
 // ---------------------------------------------------------------------------
-// HTTP: one candidate, streaming + non-streaming (Chat Completions, Responses, Claude Messages)
+// Streaming & Non-Streaming Execution
 // ---------------------------------------------------------------------------
 
 interface MeshAttemptParams {
@@ -1111,450 +692,149 @@ class MeshHttpError extends Error {
   }
 }
 
-async function readMeshResponseBody(res: Response): Promise<{ text: string; json: unknown }> {
-  const text = await res.text();
-  let json: unknown = null;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = null;
-  }
-  return { text, json };
-}
-
-function extractOpenAiError(json: unknown, fallback: string): string {
-  if (json && typeof json === 'object') {
-    const obj = json as {
-      error?: { message?: string; code?: string; type?: string };
-      message?: string;
-      msg?: string;
-      detail?: string;
-    };
-    const msg = obj.error?.message || obj.message || obj.msg || obj.detail;
-    if (typeof msg === 'string' && msg.trim()) return msg.slice(0, 300);
-  }
-  return fallback.slice(0, 300);
-}
-
-async function postJsonEndpoint(
-  url: string,
-  headers: Record<string, string>,
-  body: Record<string, unknown>,
-  candidate: MeshCandidate,
-  params: MeshAttemptParams
-): Promise<Response> {
-  const controller = new AbortController();
-  const outerSignal = params.signal?.signal;
-  if (outerSignal?.aborted) throw new Error('Request cancelled.');
-  const onOuterAbort = () => controller.abort();
-  outerSignal?.addEventListener('abort', onOuterAbort, { once: true });
-
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, params.firstByteTimeoutMs);
-
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      const { text, json } = await readMeshResponseBody(res).catch(() => ({
-        text: '',
-        json: null,
-      }));
-      const errMsg = extractOpenAiError(json, text || `HTTP ${res.status}`);
-      recordAgentRouterDiag(`${url} [${candidate.model}]`, res.status, errMsg);
-      throw new MeshHttpError(errMsg, res.status, json ?? text);
-    }
-    recordAgentRouterDiag(`${url} [${candidate.model}]`, res.status, 'connected');
-    return res;
-  } catch (err) {
-    if (err instanceof MeshHttpError) throw err;
-    const msg = timedOut
-      ? 'Timed out waiting for AgentRouter response'
-      : err instanceof Error
-        ? err.message
-        : String(err);
-    recordAgentRouterDiag(`${url} [${candidate.model}]`, null, msg);
-    if (timedOut) throw new MeshHttpError('Timed out waiting for AgentRouter response', null);
-    throw err;
-  } finally {
-    clearTimeout(timer);
-    outerSignal?.removeEventListener('abort', onOuterAbort);
-  }
-}
-
-type ProtocolKind = 'chat_completions' | 'responses' | 'anthropic_messages';
-
-function protocolsForCandidate(model: string): ProtocolKind[] {
-  const lower = model.trim().toLowerCase();
-  if (/^claude/i.test(lower)) {
-    return ['anthropic_messages', 'chat_completions', 'responses'];
-  }
-  if (/5\.6/.test(lower)) {
-    return ['chat_completions', 'responses', 'anthropic_messages'];
-  }
-  return ['chat_completions', 'responses'];
-}
-
-function shouldFallbackProtocol(err: unknown): boolean {
-  const info = normalizeMeshError(err);
-  if (isAuthError(info)) return false;
-  const lower = info.message.toLowerCase();
-  return (
-    info.status === 404 ||
-    info.status === 405 ||
-    info.status === 415 ||
-    info.status === 501 ||
-    /unsupported|not supported|unknown endpoint|use \/v1\/(responses|messages|chat)|claude_native/.test(
-      lower
-    )
-  );
-}
-
-async function consumeSseOrJsonStream(
-  res: Response,
-  protocol: ProtocolKind,
-  params: MeshAttemptParams,
-  onChunk: (text: string) => void,
-  onReasoning?: (text: string) => void
-): Promise<string> {
-  const contentType = (res.headers.get('content-type') || '').toLowerCase();
-  if (!res.body) {
-    throw new MeshHttpError('Empty response body', res.status);
-  }
-
-  if (contentType.includes('text/html')) {
-    const { text } = await readMeshResponseBody(res).catch(() => ({ text: '' }));
-    throw new MeshHttpError(
-      'Upstream returned an HTML/WAF page instead of an API response',
-      502,
-      text.slice(0, 300)
-    );
-  }
-
-  if (contentType.includes('application/json')) {
-    const { json, text } = await readMeshResponseBody(res);
-    const errField =
-      (json as { error?: unknown; code?: number; msg?: string } | null)?.error ||
-      ((json as { code?: number } | null)?.code &&
-      (json as { code?: number }).code !== 0 &&
-      (json as { code?: number }).code !== 200
-        ? (json as { msg?: string }).msg || 'AgentRouter error'
-        : null);
-    if (errField) {
-      throw new MeshHttpError(extractOpenAiError(json, 'AgentRouter error'), res.status, json);
-    }
-
-    if (protocol === 'anthropic_messages') {
-      const blocks = Array.isArray((json as { content?: unknown[] } | null)?.content)
-        ? ((json as { content: Array<{ type?: string; text?: string; thinking?: string }> }).content)
-        : [];
-      let out = '';
-      for (const blk of blocks) {
-        if (blk?.type === 'thinking' && blk.thinking && onReasoning) {
-          onReasoning(blk.thinking);
-        } else if (blk?.type === 'text' && blk.text) {
-          out += blk.text;
-        }
-      }
-      if (out) onChunk(out);
-      return out || text;
-    }
-
-    if (protocol === 'responses') {
-      const respObj = json as {
-        output_text?: string;
-        output?: Array<{ content?: Array<{ type?: string; text?: string }> }>;
-      } | null;
-      let out = typeof respObj?.output_text === 'string' ? respObj.output_text : '';
-      if (!out && Array.isArray(respObj?.output)) {
-        for (const item of respObj.output) {
-          for (const part of item.content || []) {
-            if (typeof part.text === 'string') out += part.text;
-          }
-        }
-      }
-      if (out) onChunk(out);
-      return out || text;
-    }
-
-    const msgObj = (
-      json as {
-        choices?: Array<{
-          message?: { content?: string; reasoning_content?: string; reasoning?: string };
-        }>;
-      } | null
-    )?.choices?.[0]?.message;
-    const reasoning = msgObj?.reasoning_content || msgObj?.reasoning || '';
-    if (reasoning && onReasoning) onReasoning(reasoning);
-    const content = msgObj?.content || '';
-    if (content) onChunk(content);
-    return content || text;
-  }
-
-  // SSE or plain-text stream
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let raw = '';
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-  const idleMs = params.idleTimeoutMs ?? 45_000;
-  const resetIdle = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      try {
-        reader.cancel().catch(() => undefined);
-      } catch {
-        // ignore
-      }
-    }, idleMs);
-  };
-  resetIdle();
-  const isEventStream = contentType.includes('event-stream');
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      resetIdle();
-      buffer += decoder.decode(value, { stream: true });
-      let newlineIdx = buffer.indexOf('\n');
-      while (newlineIdx >= 0) {
-        const line = buffer.slice(0, newlineIdx).trim();
-        buffer = buffer.slice(newlineIdx + 1);
-        newlineIdx = buffer.indexOf('\n');
-        if (!line || line.startsWith('event:') || line.startsWith(':')) continue;
-        if (!isEventStream && !line.startsWith('data:')) {
-          if (!raw && /^<!doctype\s+html|^<html\b|aliyun_waf|CF_APP_WAF/i.test(line)) {
-            throw new MeshHttpError(
-              'Upstream returned an HTML/WAF challenge instead of an API stream',
-              502
-            );
-          }
-          raw += line;
-          onChunk(line);
-          continue;
-        }
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (!payload || payload === '[DONE]') continue;
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(payload);
-        } catch {
-          continue;
-        }
-        if (!parsed || typeof parsed !== 'object') continue;
-        const obj = parsed as Record<string, unknown>;
-        if (obj.error) {
-          throw new MeshHttpError(
-            extractOpenAiError(obj, 'AgentRouter stream error'),
-            res.status,
-            obj
-          );
-        }
-
-        if (protocol === 'anthropic_messages') {
-          const evType = typeof obj.type === 'string' ? obj.type : '';
-          if (evType === 'content_block_delta') {
-            const delta = obj.delta as
-              | { type?: string; text?: string; thinking?: string }
-              | undefined;
-            if (delta?.type === 'thinking_delta' && delta.thinking && onReasoning) {
-              onReasoning(delta.thinking);
-            } else if (delta?.type === 'text_delta' && delta.text) {
-              raw += delta.text;
-              onChunk(delta.text);
-            }
-          }
-          continue;
-        }
-
-        if (protocol === 'responses') {
-          const evType = typeof obj.type === 'string' ? obj.type : '';
-          const deltaText = typeof obj.delta === 'string' ? obj.delta : '';
-          if (
-            (evType.includes('reasoning') && evType.endsWith('.delta')) &&
-            deltaText &&
-            onReasoning
-          ) {
-            onReasoning(deltaText);
-          } else if (evType === 'response.output_text.delta' && deltaText) {
-            raw += deltaText;
-            onChunk(deltaText);
-          } else if (evType === 'response.failed') {
-            throw new MeshHttpError(
-              extractOpenAiError(obj.response || obj, 'Responses API failed'),
-              res.status,
-              obj
-            );
-          }
-          continue;
-        }
-
-        // OpenAI Chat Completions SSE
-        const choices = obj.choices as
-          | Array<{
-              delta?: { content?: string; reasoning_content?: string; reasoning?: string };
-              message?: { content?: string };
-            }>
-          | undefined;
-        const choice = choices?.[0];
-        if (!choice) continue;
-        const reasoning =
-          choice.delta?.reasoning_content || choice.delta?.reasoning || '';
-        if (reasoning && onReasoning) onReasoning(reasoning);
-        const piece = choice.delta?.content || choice.message?.content || '';
-        if (piece) {
-          raw += piece;
-          onChunk(piece);
-        }
-      }
-    }
-  } finally {
-    if (idleTimer) clearTimeout(idleTimer);
-  }
-  return raw;
-}
-
 async function streamOneMeshCandidateRaw(
   candidate: MeshCandidate,
   params: MeshAttemptParams,
   onChunk: (text: string) => void,
   onReasoning?: (text: string) => void
 ): Promise<string> {
-  const protocols = protocolsForCandidate(candidate.model);
   const hasImage = Boolean(params.attachmentDataUrl?.startsWith('data:image/'));
+  const maxImagePasses = hasImage ? 2 : 1;
   let lastErr: unknown = null;
 
-  for (const protocol of protocols) {
-    let attemptWithImage = hasImage;
-    for (let imageRetry = 0; imageRetry < 2; imageRetry += 1) {
-      let url = candidate.baseUrl;
-      let body: Record<string, unknown>;
+  for (let pass = 0; pass < maxImagePasses; pass += 1) {
+    const withImage = hasImage && pass === 0;
+    const controller = new AbortController();
+    const outerSignal = params.signal?.signal;
+    if (outerSignal?.aborted) throw new Error('Request cancelled.');
+    const onOuterAbort = () => controller.abort();
+    outerSignal?.addEventListener('abort', onOuterAbort, { once: true });
 
-      if (protocol === 'anthropic_messages') {
-        url = toMessagesUrl(candidate.v1Origin);
-        body = {
-          model: candidate.model,
-          max_tokens: 8192,
-          ...(params.systemPrompt.trim()
-            ? { system: params.systemPrompt.trim().slice(0, 60000) }
-            : {}),
-          messages: buildAnthropicMessages({
-            historyMessages: params.historyMessages,
-            userPrompt: params.userPrompt,
-            attachmentDataUrl: params.attachmentDataUrl,
-            withImage: attemptWithImage,
-          }),
-          stream: true,
-        };
-      } else if (protocol === 'responses') {
-        url = toResponsesUrl(candidate.v1Origin);
-        const msgs = buildMeshMessages({
-          systemPrompt: '',
-          historyMessages: params.historyMessages,
-          userPrompt: params.userPrompt,
-          attachmentDataUrl: params.attachmentDataUrl,
-          withImage: attemptWithImage,
-        });
-        body = {
-          model: candidate.model,
-          ...(params.systemPrompt.trim()
-            ? { instructions: params.systemPrompt.trim().slice(0, 60000) }
-            : {}),
-          input: msgs.map((m) => ({ role: m.role, content: m.content })),
-          stream: true,
-        };
-      } else {
-        url = candidate.baseUrl;
-        body = {
-          model: candidate.model,
-          messages: buildMeshMessages({
-            systemPrompt: params.systemPrompt,
-            historyMessages: params.historyMessages,
-            userPrompt: params.userPrompt,
-            attachmentDataUrl: params.attachmentDataUrl,
-            withImage: attemptWithImage,
-          }),
-          stream: true,
-          temperature: params.taskKind === 'build' ? 0.45 : 0.7,
-        };
+    let gotFirstEvent = false;
+    let firstByteTimedOut = false;
+    let idleTimedOut = false;
+
+    const firstByteTimer = setTimeout(() => {
+      if (!gotFirstEvent) {
+        firstByteTimedOut = true;
+        controller.abort();
       }
+    }, params.firstByteTimeoutMs);
 
-      const defaultProfile: AgentRouterHeaderProfile =
-        protocol === 'anthropic_messages' ? 'claude' : preferredHeaderProfile;
-      const profiles = orderedHeaderProfiles(defaultProfile);
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const idleMs = params.idleTimeoutMs ?? 45_000;
+    const resetIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleTimedOut = true;
+        controller.abort();
+      }, idleMs);
+    };
 
-      let retryWithImageFallback = false;
-      let fallbackToNextProtocol = false;
+    try {
+      const ai = createSdkClient(candidate.apiKey);
+      const contents = buildGeminiContents({
+        historyMessages: params.historyMessages,
+        userPrompt: params.userPrompt,
+        attachmentDataUrl: params.attachmentDataUrl,
+        withImage,
+      });
+      const config = buildGeminiGenerateConfig(
+        candidate.model,
+        params.systemPrompt,
+        controller.signal
+      );
 
-      for (const profile of profiles) {
-        const headers: Record<string, string> =
-          protocol === 'anthropic_messages'
-            ? {
-                'Content-Type': 'application/json',
-                Accept: 'text/event-stream, application/json',
-                'x-api-key': candidate.apiKey,
-                Authorization: `Bearer ${candidate.apiKey}`,
-                'anthropic-version': '2023-06-01',
-                ...buildHeaderProfileHeaders(profile),
-              }
-            : {
-                'Content-Type': 'application/json',
-                Accept: 'text/event-stream, application/json, text/plain',
-                Authorization: `Bearer ${candidate.apiKey}`,
-                ...(profile === 'codex' && candidate.headers ? candidate.headers : {}),
-                ...buildHeaderProfileHeaders(profile),
-              };
+      const stream = await ai.models.generateContentStream({
+        model: candidate.model,
+        contents,
+        config,
+      });
 
-        try {
-          const res = await postJsonEndpoint(url, headers, body, candidate, params);
-          preferredHeaderProfile = profile;
-          return await consumeSseOrJsonStream(
-            res,
-            protocol,
-            params,
-            onChunk,
-            onReasoning
-          );
-        } catch (err) {
-          lastErr = err;
-          const info = normalizeMeshError(err);
-          if (isAuthError(info)) {
-            // Try the next client header profile (e.g. standard / claude / codex)
-            // before concluding the API key itself is invalid.
-            continue;
+      resetIdle();
+      let raw = '';
+      let promptTokens = 0;
+      let candidatesTokens = 0;
+      let totalTokens = 0;
+
+      for await (const chunk of stream) {
+        if (!gotFirstEvent) {
+          gotFirstEvent = true;
+          clearTimeout(firstByteTimer);
+        }
+        resetIdle();
+
+        const parts = chunk.candidates?.[0]?.content?.parts ?? [];
+        if (parts.length > 0) {
+          for (const part of parts) {
+            if (!part?.text) continue;
+            if (part.thought) {
+              onReasoning?.(part.text);
+            } else {
+              raw += part.text;
+              onChunk(part.text);
+            }
           }
-          if (
-            attemptWithImage &&
-            info.status !== null &&
-            [400, 413, 415, 422].includes(info.status)
-          ) {
-            attemptWithImage = false;
-            retryWithImageFallback = true;
-            break;
-          }
-          if (shouldFallbackProtocol(err)) {
-            fallbackToNextProtocol = true;
-            break;
-          }
-          throw err;
+        } else if (typeof chunk.text === 'string' && chunk.text) {
+          raw += chunk.text;
+          onChunk(chunk.text);
+        }
+
+        if (chunk.usageMetadata) {
+          promptTokens = chunk.usageMetadata.promptTokenCount ?? promptTokens;
+          candidatesTokens = chunk.usageMetadata.candidatesTokenCount ?? candidatesTokens;
+          totalTokens = chunk.usageMetadata.totalTokenCount ?? totalTokens;
         }
       }
 
-      if (retryWithImageFallback) continue;
-      if (fallbackToNextProtocol) break;
-      if (lastErr) throw lastErr;
+      recordGeminiDiag(
+        `${getGeminiEffectiveBaseUrl()}/v1beta/models/${candidate.model}`,
+        200,
+        'connected'
+      );
+
+      if (raw.trim()) {
+        void recordGeminiApiUsage({
+          modelId: candidate.model,
+          promptTokens,
+          candidatesTokens,
+          totalTokens:
+            totalTokens || Math.max(40, Math.ceil((params.userPrompt.length + raw.length) / 4)),
+          source: params.taskKind,
+        });
+      }
+
+      return raw;
+    } catch (err) {
+      lastErr = err;
+      const info = normalizeMeshError(err);
+      const friendlyErr = firstByteTimedOut
+        ? new MeshHttpError('Timed out waiting for Gemini response', null)
+        : idleTimedOut
+          ? new MeshHttpError('Gemini stream stalled before completing', null)
+          : err;
+      recordGeminiDiag(
+        `${getGeminiEffectiveBaseUrl()}/v1beta/models/${candidate.model}`,
+        info.status,
+        friendlyErr instanceof Error ? friendlyErr.message : info.message
+      );
+
+      if (
+        withImage &&
+        info.status !== null &&
+        [400, 413, 415, 422].includes(info.status)
+      ) {
+        continue;
+      }
+      throw friendlyErr;
+    } finally {
+      clearTimeout(firstByteTimer);
+      if (idleTimer) clearTimeout(idleTimer);
+      outerSignal?.removeEventListener('abort', onOuterAbort);
     }
   }
 
-  throw lastErr ?? new MeshHttpError('AgentRouter request failed', null);
+  throw lastErr ?? new MeshHttpError('Gemini request failed', null);
 }
 
 async function streamOneMeshCandidate(
@@ -1571,29 +851,22 @@ async function streamOneMeshCandidate(
   }
 }
 
-async function completeOneMeshCandidateRaw(
-  candidate: MeshCandidate,
-  params: MeshAttemptParams
-): Promise<string> {
-  let out = '';
-  const raw = await streamOneMeshCandidateRaw(
-    candidate,
-    params,
-    (chunk) => {
-      out += chunk;
-    },
-    undefined
-  );
-  return out || raw;
-}
-
 async function completeOneMeshCandidate(
   candidate: MeshCandidate,
   params: MeshAttemptParams
 ): Promise<string> {
   await acquireProviderSlot(candidate.providerId, params.signal?.signal);
   try {
-    return await completeOneMeshCandidateRaw(candidate, params);
+    let out = '';
+    const raw = await streamOneMeshCandidateRaw(
+      candidate,
+      params,
+      (chunk) => {
+        out += chunk;
+      },
+      undefined
+    );
+    return out || raw;
   } finally {
     releaseProviderSlot(candidate.providerId);
   }
@@ -1634,8 +907,8 @@ async function runMeshStreamAttempt(params: {
   onForwardChunk: (chunk: string) => void;
 }): Promise<MeshStreamResult> {
   const { candidate, walk, budget } = params;
-  const modelId = `agentrouter::${candidate.model}`;
-  const modelName = `AgentRouter · ${candidate.model}`;
+  const modelId = `gemini::${candidate.model}`;
+  const modelName = makeGeminiDisplayLabel(candidate.model);
   walk.onModelMeta?.({ modelId, modelName, provider: candidate.providerId });
 
   const controller = new AbortController();
@@ -1674,6 +947,14 @@ async function runMeshStreamAttempt(params: {
     const info = normalizeMeshError(err);
     const { ms, hard } = cooldownForMeshError(info);
     markGatewayCandidateCooldown(candidate.cooldownKey, ms, hard);
+    if (isAuthError(info)) {
+      markApiKeyInvalidCooldown(candidate.apiKey, 5 * 60_000);
+    }
+    void recordGeminiApiError({
+      modelId: candidate.model,
+      error: err,
+      source: walk.taskKind,
+    });
     throw err;
   } finally {
     unlink();
@@ -1712,8 +993,8 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
         );
       } else {
         throw new FreeAiMeshAllFailedError([
-          lastAgentRouterDiag?.message ||
-            'AgentRouter models are temporarily cooling down after recent errors',
+          lastGeminiDiag?.message ||
+            'Gemini models are temporarily cooling down after recent quota or rate-limit responses',
         ]);
       }
     } else {
@@ -1741,9 +1022,7 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
         if (params.signal?.aborted) throw new Error('Request cancelled.');
         const info = normalizeMeshError(err);
         details.push(`${candidate.model}: ${info.message}`);
-        // Auth failures apply to the AgentRouter API key as a whole — fail fast
-        // with the exact upstream error instead of retrying 5 other models.
-        if (isAuthError(info)) {
+        if (isAuthError(info) && getServerGeminiApiKeys().length <= 1) {
           throw new FreeAiMeshAllFailedError(details);
         }
       }
@@ -1808,7 +1087,7 @@ export async function completeFreeAiMesh(params: {
       const info = normalizeMeshError(err);
       const { ms, hard } = cooldownForMeshError(info);
       markGatewayCandidateCooldown(candidate.cooldownKey, ms, hard);
-      if (isAuthError(info)) return null;
+      if (isAuthError(info) && getServerGeminiApiKeys().length <= 1) return null;
     } finally {
       unlink();
     }

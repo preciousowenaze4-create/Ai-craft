@@ -1,8 +1,7 @@
-import { getServerGeminiApiKey } from './_aiGateways.js';
 import {
-  getAgentRouterDiagnostic,
   getFreeAiMeshStatus,
-  isAgentRouterConfigured,
+  getGeminiDiagnostic,
+  isGeminiConfigured,
 } from './_freeAiMesh.js';
 import { getPaymentSecretKey } from './_paystack.js';
 import { getSupabaseConfig } from './_supabaseAuth.js';
@@ -10,14 +9,13 @@ import { getSupabaseConfig } from './_supabaseAuth.js';
 export async function GET(): Promise<Response> {
   const sbConfig = getSupabaseConfig();
   const mesh = getFreeAiMeshStatus();
-  const agentRouterConfigured = isAgentRouterConfigured();
+  const geminiConfigured = isGeminiConfigured();
 
   return Response.json(
     {
       ok: true,
-      geminiConfigured: Boolean(getServerGeminiApiKey()),
-      agentRouterConfigured,
-      agentRouter: getAgentRouterDiagnostic(),
+      geminiConfigured,
+      gemini: getGeminiDiagnostic(),
       serverFreeAiReady: mesh.hasAny,
       freeAiMesh: {
         hasAny: mesh.hasAny,

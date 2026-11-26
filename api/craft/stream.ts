@@ -257,10 +257,10 @@ export async function POST(request: Request): Promise<Response> {
         sendEvent({
           type: 'meta',
           kind: prepared.naturalMediaIntent ? 'media' : 'chat',
-          modelId: requestedModel || 'agentrouter::auto',
-          modelName: prepared.requestedModelLabel || 'AgentRouter · Auto',
-          provider: 'agentrouter',
-          gateway: 'agentrouter',
+          modelId: requestedModel || 'gemini::gemini-4-hydrogen',
+          modelName: prepared.requestedModelLabel || 'Gemini 4 Hydrogen',
+          provider: 'gemini',
+          gateway: 'gemini',
           isFallback: false,
         });
 
@@ -276,13 +276,16 @@ export async function POST(request: Request): Promise<Response> {
                 ? 'Generating motion preview...'
                 : mediaKind === 'music'
                   ? 'Composing custom studio track...'
-                  : 'Generating image & searching visual references...',
+                  : attachmentDataUrl
+                    ? 'Editing & generating image with Gemini...'
+                    : 'Generating image with Gemini...',
           });
 
           const mediaResult: GeneratedMediaResult = await generateMediaAsset({
             kind: mediaKind,
             prompt: message,
             requestedModel,
+            attachmentDataUrl,
           });
 
           sendEvent({ type: 'media', media: mediaResult });
@@ -298,8 +301,8 @@ export async function POST(request: Request): Promise<Response> {
             creditsUsed: 0,
             billing: creditCheck.billing,
             media: mediaResult,
-            modelUsed: mediaResult.modelId || 'free-media',
-            modelName: prepared.requestedModelLabel || 'AgentRouter',
+            modelUsed: mediaResult.modelId || 'gemini-3.1-flash-lite-image',
+            modelName: prepared.requestedModelLabel || 'Google Gemini',
             provider: mediaResult.gateway,
           });
           closeStream();
@@ -318,9 +321,9 @@ export async function POST(request: Request): Promise<Response> {
         let lastPreviewBytesSent = 0;
         let emittedReasoningPhase = false;
 
-        let activeModelUsed = requestedModel || 'agentrouter::auto';
-        let activeModelName = prepared.requestedModelLabel || 'AgentRouter · Auto';
-        let activeProvider = 'agentrouter';
+        let activeModelUsed = requestedModel || 'gemini::gemini-4-hydrogen';
+        let activeModelName = prepared.requestedModelLabel || 'Gemini 4 Hydrogen';
+        let activeProvider = 'gemini';
         let parallelMergedRaw: string | null = null;
 
         let lastReasoningUpdateAt = 0;
@@ -601,6 +604,7 @@ export async function POST(request: Request): Promise<Response> {
             kind: 'image',
             prompt: finalized.mediaPrompt || message,
             requestedModel,
+            attachmentDataUrl,
           });
           sendEvent({ type: 'media', media: mediaResult });
           sendEvent({
@@ -616,8 +620,8 @@ export async function POST(request: Request): Promise<Response> {
             creditsUsed: 0,
             billing: creditCheck.billing,
             media: mediaResult,
-            modelUsed: mediaResult.modelId || 'free-media',
-            modelName: prepared.requestedModelLabel,
+            modelUsed: mediaResult.modelId || 'gemini-3.1-flash-lite-image',
+            modelName: prepared.requestedModelLabel || 'Google Gemini',
             provider: mediaResult.gateway,
           });
           closeStream();
@@ -707,7 +711,7 @@ export async function POST(request: Request): Promise<Response> {
         const errorMessage =
           err instanceof Error
             ? err.message
-            : 'Unable to reach AgentRouter backend right now.';
+            : 'Unable to reach Gemini backend right now. Check GEMINI_API_KEY in Settings > Secrets.';
         if (projectId && creditCheck.context?.user?.id) {
           void recordBuildCheckpoint(
             {

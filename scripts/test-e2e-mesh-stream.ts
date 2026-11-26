@@ -1,6 +1,6 @@
 /**
- * E2E: POST /api/craft/stream against local mock AgentRouter backend.
- * Verifies /api/health, /api/models, normal chat SSE, and app build SSE.
+ * E2E: POST /api/craft/stream and /api/media against local mock Gemini backend.
+ * Verifies /api/health, /api/models, normal chat SSE, app build SSE, and image generation.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { emptyAiEnv, scrubAiEnv } from './_testEnv.js';
@@ -57,9 +57,9 @@ const PORT = process.env.E2E_PORT || '4610';
 run('npx', ['tsx', 'server.ts'], {
   ...emptyAiEnv(),
   PORT,
-  AGENTROUTER_API_KEY: 'sk-test-agentrouter-key',
-  AGENTROUTER_BASE_URL: 'http://127.0.0.1:4592/v1',
-  AGENTROUTER_MODELS: 'gpt-6.2-sol,gpt-6.2-astra',
+  GEMINI_API_KEY: 'AIzaSyTestGeminiKey1234567890',
+  GEMINI_API_BASE_URL: 'http://127.0.0.1:4592',
+  GEMINI_MODELS: 'gemini-4-hydrogen,gemini-3.1-flash-lite',
   SUPABASE_URL: '',
   SUPABASE_ANON_KEY: '',
   SUPABASE_SERVICE_ROLE_KEY: '',
@@ -68,23 +68,23 @@ run('npx', ['tsx', 'server.ts'], {
 await waitForHealth(`http://127.0.0.1:${PORT}/api/health`, 30000);
 const health = await (await fetch(`http://127.0.0.1:${PORT}/api/health`)).json();
 console.log('HEALTH:', JSON.stringify(health));
-if (!health.agentRouterConfigured || !health.serverFreeAiReady) {
-  console.error('FAIL: health should report agentRouterConfigured & serverFreeAiReady');
+if (!health.geminiConfigured || !health.serverFreeAiReady) {
+  console.error('FAIL: health should report geminiConfigured & serverFreeAiReady');
   process.exit(1);
 }
-if (!health.freeAiMesh?.providers?.includes('agentrouter')) {
-  console.error('FAIL: freeAiMesh providers should include agentrouter');
+if (!health.freeAiMesh?.providers?.includes('gemini')) {
+  console.error('FAIL: freeAiMesh providers should include gemini');
   process.exit(1);
 }
 
 const models = await (await fetch(`http://127.0.0.1:${PORT}/api/models`)).json();
 console.log('MODELS count:', models.models?.length, 'keyless:', models.keyless);
-if (!models.agentRouterConfigured || models.keyless !== false) {
-  console.error('FAIL: /api/models should report AgentRouter configured and keyless=false');
+if (!models.geminiConfigured || models.keyless !== false) {
+  console.error('FAIL: /api/models should report Gemini configured and keyless=false');
   process.exit(1);
 }
-if (!Array.isArray(models.models) || !models.models.every((m: { id: string }) => m.id.startsWith('agentrouter::'))) {
-  console.error('FAIL: /api/models should only expose agentrouter:: models');
+if (!Array.isArray(models.models) || !models.models.every((m: { id: string }) => m.id.startsWith('gemini::'))) {
+  console.error('FAIL: /api/models should only expose gemini:: models');
   process.exit(1);
 }
 
@@ -93,7 +93,7 @@ const res = await fetch(`http://127.0.0.1:${PORT}/api/craft/stream`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
-    projectId: 'e2e-agentrouter-test',
+    projectId: 'e2e-gemini-test',
     turnId: 'turn_e2e_1',
     message: 'hello there',
     mode: 'web',
@@ -133,7 +133,7 @@ const buildRes = await fetch(`http://127.0.0.1:${PORT}/api/craft/stream`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
-    projectId: 'e2e-agentrouter-test',
+    projectId: 'e2e-gemini-test',
     turnId: 'turn_e2e_build',
     message: 'Build me a simple todo app',
     mode: 'web',
@@ -164,6 +164,27 @@ if (!previewHtml.includes('<!DOCTYPE html>') || !previewHtml.includes('Mesh Todo
   process.exit(1);
 }
 
-console.log('E2E AGENTROUTER STREAM TEST PASSED');
+// /api/media text-to-image & attachment editing
+const mediaRes = await fetch(`http://127.0.0.1:${PORT}/api/media`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    kind: 'image',
+    prompt: 'Make this a studio portrait',
+    attachmentDataUrl:
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  }),
+});
+if (!mediaRes.ok) {
+  console.error('FAIL: /api/media failed', await mediaRes.text());
+  process.exit(1);
+}
+const mediaJson = (await mediaRes.json()) as { gateway?: string; dataUrl?: string };
+if (mediaJson.gateway !== 'gemini' || !String(mediaJson.dataUrl || '').startsWith('data:image/png;base64,')) {
+  console.error('FAIL: unexpected /api/media response:', JSON.stringify(mediaJson));
+  process.exit(1);
+}
+
+console.log('E2E GEMINI STREAM & MEDIA TEST PASSED');
 cleanup();
 process.exit(0);

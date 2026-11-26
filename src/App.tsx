@@ -1098,11 +1098,11 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
           return matched ? matched.id : fetched[0].id;
         });
       } else if (!response.ok || data?.error) {
-        setModelsError(data?.error || 'Unable to load AgentRouter models.');
+        setModelsError(data?.error || 'Unable to load Gemini models.');
       }
     } catch (err) {
       setModelsError(
-        err instanceof Error ? err.message : 'Unable to load AgentRouter models.'
+        err instanceof Error ? err.message : 'Unable to load Gemini models.'
       );
     } finally {
       setModelsLoading(false);
@@ -2069,8 +2069,8 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                     phase: 'building',
                     phaseLabel:
                       priorAuto === 0
-                        ? 'AgentRouter was busy — retrying…'
-                        : 'Switching to another AgentRouter model…',
+                        ? 'Gemini was busy — retrying…'
+                        : 'Switching to another Gemini model…',
                     errorMessage: undefined,
                   }));
                   window.setTimeout(() => {
@@ -2315,8 +2315,8 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
               phase: 'building',
               phaseLabel:
                 priorAuto === 0
-                  ? 'AgentRouter was busy — retrying…'
-                  : 'Switching to another AgentRouter model…',
+                  ? 'Gemini was busy — retrying…'
+                  : 'Switching to another Gemini model…',
               errorMessage: undefined,
             }));
             window.setTimeout(() => {

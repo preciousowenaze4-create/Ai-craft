@@ -1,37 +1,38 @@
+import { getServerGeminiApiKeys } from './_aiGateways.js';
 import {
-  getAgentRouterApiOrigin,
   getFreeAiMeshStatus,
   getFreeMeshModelOptions,
-  isAgentRouterConfigured,
-  refreshAgentRouterModelsIfConfigured,
+  getGeminiApiOrigin,
+  isGeminiConfigured,
+  refreshGeminiModelsIfConfigured,
 } from './_freeAiMesh.js';
 
 export async function GET(request: Request): Promise<Response> {
   try {
     const reqUrl = new URL(request.url, 'http://localhost');
-    if (reqUrl.searchParams.get('refresh') === '1' && isAgentRouterConfigured()) {
-      await refreshAgentRouterModelsIfConfigured().catch(() => []);
+    if (reqUrl.searchParams.get('refresh') === '1' && isGeminiConfigured()) {
+      await refreshGeminiModelsIfConfigured().catch(() => []);
     }
     const mesh = getFreeAiMeshStatus();
-    const agentRouterConfigured = isAgentRouterConfigured();
+    const geminiConfigured = isGeminiConfigured();
+    const keyCount = getServerGeminiApiKeys().length;
 
     return Response.json(
       {
         models: getFreeMeshModelOptions(),
         gateways: [
           {
-            id: 'agentrouter',
-            label: 'AgentRouter',
-            baseUrl: getAgentRouterApiOrigin(),
-            configured: agentRouterConfigured,
-            keyCount: agentRouterConfigured ? 1 : 0,
+            id: 'gemini',
+            label: 'Google Gemini',
+            baseUrl: getGeminiApiOrigin(),
+            configured: geminiConfigured,
+            keyCount,
             modelCount:
-              mesh.providers.find((p) => p.id === 'agentrouter')?.modelCount || 5,
-            defaultModel: 'agentrouter::auto',
+              mesh.providers.find((p) => p.id === 'gemini')?.modelCount || 5,
+            defaultModel: 'gemini::gemini-4-hydrogen',
           },
         ],
-        agentRouterConfigured,
-        geminiConfigured: false,
+        geminiConfigured,
         serverFreeAiReady: mesh.hasAny,
         pollinationsConfigured: false,
         puterConfigured: false,
@@ -56,8 +57,7 @@ export async function GET(request: Request): Promise<Response> {
     return Response.json(
       {
         models: getFreeMeshModelOptions(),
-        agentRouterConfigured: isAgentRouterConfigured(),
-        geminiConfigured: false,
+        geminiConfigured: isGeminiConfigured(),
         serverFreeAiReady: mesh.hasAny,
         pollinationsConfigured: false,
         puterConfigured: false,

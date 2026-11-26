@@ -5,22 +5,29 @@ export interface BrowserVisualHints {
   height?: number;
 }
 
-export const DEFAULT_GEMINI_BUILDER_MODEL_ID = 'agentrouter::auto';
+export const DEFAULT_GEMINI_BUILDER_MODEL_ID = 'gemini::gemini-4-hydrogen';
 
 export const VALID_GEMINI_MODEL_IDS = [
-  'agentrouter::auto',
-  'agentrouter::gpt-6.2-sol',
-  'agentrouter::gpt-6.2-astra',
-  'agentrouter::gpt-5.6-sol',
-  'agentrouter::gpt-6.1-sol',
-  'agentrouter::claude-opus-5-5',
+  'gemini::gemini-4-hydrogen',
+  'gemini::gemini-3.1-flash-lite',
+  'gemini::gemini-4-neon',
+  'gemini::gemini-4-argon',
+  'gemini::gemini-4-carbon',
 ] as const;
 
 export function normalizeBuilderModelId(rawId?: string | null): string {
   const trimmed = (rawId || '').trim();
   if (!trimmed) return DEFAULT_GEMINI_BUILDER_MODEL_ID;
-  if (trimmed.startsWith('agentrouter::')) return trimmed;
-  // Legacy stored ids (e.g. mesh::*, gemini::*) map to AgentRouter Auto.
+  if ((VALID_GEMINI_MODEL_IDS as readonly string[]).includes(trimmed)) {
+    return trimmed;
+  }
+  if (
+    trimmed.startsWith('gemini::') &&
+    !/^(?:gemini::)?(?:auto|gemini-3\.8|gemini-2\.)/i.test(trimmed)
+  ) {
+    return trimmed;
+  }
+  // Legacy stored ids (e.g. agentrouter::*, mesh::*, gemini::auto) map to Gemini 4 Hydrogen.
   return DEFAULT_GEMINI_BUILDER_MODEL_ID;
 }
 

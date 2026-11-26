@@ -29,7 +29,10 @@ import {
   type SearchVideoItem,
 } from './_builderCore.js';
 import { GoogleGenAI } from '@google/genai';
-import { buildGatewayExecutionPlan } from './_aiGateways.js';
+import {
+  buildGatewayExecutionPlan,
+  getGeminiBaseUrlOverride,
+} from './_aiGateways.js';
 import {
   completeFreeAiMesh,
   isFreeAiMeshAvailable,
@@ -38,9 +41,11 @@ import {
 } from './_freeAiMesh.js';
 
 export function createGeminiClient(apiKey: string): GoogleGenAI {
+  const baseUrlOverride = getGeminiBaseUrlOverride();
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
+      ...(baseUrlOverride ? { baseUrl: baseUrlOverride } : {}),
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -110,14 +115,58 @@ export interface PreparedRealtimePrompt {
 }
 
 export function detectNaturalMediaRequest(
-  _message: string,
-  _hasPreviousHtml: boolean
+  message: string,
+  _hasPreviousHtml: boolean,
+  hasAttachment = false
 ): 'image' | 'music' | 'video' | null {
+  const msg = String(message || '').trim();
+  if (!msg) return null;
+
+  // Never intercept requests to build or modify an app, website, dashboard, or game.
+  if (
+    /\b(?:build|code|create|make|design|update|add)\s+(?:an?\s+|the\s+|me\s+an?\s+)?(?:mobile\s+|web\s+|full[- ]?stack\s+|react\s+)?(?:app|application|website|web\s*app|site|dashboard|game|platform|store|shop|portal|gallery\s+app|photo\s+editor\s+app)\b/i.test(
+      msg
+    )
+  ) {
+    return null;
+  }
+
+  // Informational questions about capabilities belong in chat, not image generation.
+  if (
+    /^(?:can|do|does|how|why|what|is|are|will)\b.*\b(?:image|picture|photo|generate|create)\b\??$/i.test(
+      msg
+    ) &&
+    !/^(?:can you\s+)?(?:create|generate|draw|make|paint|render|edit)\s+(?:an?\s+|me\s+an?\s+|this\s+)?(?:image|picture|photo|artwork|illustration|wallpaper|portrait|logo)\b/i.test(
+      msg
+    )
+  ) {
+    return null;
+  }
+
+  // Direct text-to-image requests.
+  if (
+    /\b(?:generate|create|make|draw|paint|render|sketch|illustrate|design|produce)\s+(?:an?\s+|me\s+an?\s+|the\s+)?(?:ultra[- ]?(?:realistic|hd)|realistic|4k|2k|high[- ]?(?:quality|res)|cinematic|anime|3d|cartoon|digital|minimalist|futuristic|neon|cyberpunk|cute|fantasy|studio)?\s*(?:image|picture|photo|photograph|artwork|illustration|wallpaper|portrait|poster|cover\s*art|icon|emblem|banner)\b/i.test(
+      msg
+    )
+  ) {
+    return 'image';
+  }
+
+  // Image-to-image / editing requests when user attached an image.
+  if (
+    hasAttachment &&
+    /\b(?:edit|transform|turn|convert|recreate|reimagine|restyle|enhance|upscale|change|replace|remove|add|put|place|make|generate|create|bring\s+out|render)\b.*\b(?:image|picture|photo|background|style|look\s+like|into|exactly\s+like)\b/i.test(
+      msg
+    )
+  ) {
+    return 'image';
+  }
+
   return null;
 }
 
 /**
- * Backend UI/UX Design Architect pass powered by AgentRouter.
+ * Backend UI/UX Design Architect pass powered by Gemini.
  */
 async function runBackendDesignArchitect(params: {
   message: string;
@@ -181,11 +230,15 @@ export async function prepareRealtimePrompt(
     requestedGateway: input.requestedGateway,
   });
 
+  const hasAttachment = Boolean(
+    input.attachmentDataUrl && input.attachmentDataUrl.startsWith('data:image/')
+  );
   const mediaKind = executionPlan.requestedMediaKind;
   const naturalMediaIntent =
-    mediaKind ?? (input.forceChat ? null : detectNaturalMediaRequest(message, hasPreviousHtml));
+    mediaKind ??
+    (input.forceChat ? null : detectNaturalMediaRequest(message, hasPreviousHtml, hasAttachment));
 
-  // Let AgentRouter naturally decide between normal chat vs building an app,
+  // Let Gemini naturally decide between normal chat, image creation, or building an app,
   // unless the caller explicitly forces chat or resumes an interrupted build.
   const initialRoute: 'chat' | 'build' | 'auto' = input.forceChat
     ? 'chat'
@@ -311,9 +364,9 @@ export async function prepareRealtimePrompt(
 
   const systemPrompt = buildCraftSystemPrompt({
     mediaKind,
-    requestedModel: input.requestedModel || 'agentrouter::auto',
+    requestedModel: input.requestedModel || 'gemini::gemini-4-hydrogen',
     requestedModelLabel: !input.requestedModel
-      ? 'AgentRouter · Auto'
+      ? 'Gemini 4 Hydrogen'
       : executionPlan.requestedModelLabel,
     initialRoute,
     shouldGenerateTitle,
@@ -453,9 +506,9 @@ export function finalizeRealtimeOutput(
   const cleanedRaw = stripReasoningTags(input.rawOutput || '');
   const startedAt = typeof input.startedAt === 'number' ? input.startedAt : Date.now();
   const thoughtSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-  const modelUsed = input.modelUsed || 'agentrouter::auto';
-  const modelName = input.modelName || 'AgentRouter · Auto';
-  const provider = input.provider || 'agentrouter';
+  const modelUsed = input.modelUsed || 'gemini::gemini-4-hydrogen';
+  const modelName = input.modelName || 'Gemini 4 Hydrogen';
+  const provider = input.provider || 'gemini';
 
   const explicitTitleMatch = /\[\[\s*TITLE\s*:\s*([^\]]+?)\s*\]\]/i.exec(cleanedRaw);
   const title = explicitTitleMatch?.[1]?.trim()

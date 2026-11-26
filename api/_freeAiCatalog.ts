@@ -1,17 +1,17 @@
 /**
- * AI Craft — AgentRouter Model Catalog
+ * AI Craft — Gemini Model Catalog
  *
- * Baseline models provided by AgentRouter (refreshed dynamically from
- * `${AGENTROUTER_BASE_URL}/models` when available).
+ * Baseline Gemini models powered by `@google/genai` (`GEMINI_API_KEY`).
+ * Refreshed dynamically from `/v1beta/models` when configured.
  */
 
 export const FREE_MODEL_CATALOG: Record<string, string[]> = {
-  agentrouter: [
-    'gpt-6.2-sol',
-    'gpt-6.2-astra',
-    'gpt-5.6-sol',
-    'gpt-6.1-sol',
-    'claude-opus-5-5',
+  gemini: [
+    'gemini-4-hydrogen',
+    'gemini-3.1-flash-lite',
+    'gemini-4-neon',
+    'gemini-4-argon',
+    'gemini-4-carbon',
   ],
 };
 
