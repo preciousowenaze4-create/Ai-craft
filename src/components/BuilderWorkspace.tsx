@@ -64,7 +64,6 @@ import {
   applyVisualPatchToHtml,
   VisualElementSelection,
 } from '../utils/visualHtmlEditor';
-import { LivingBotanicalWallpaper } from './LivingBotanicalWallpaper';
 import { ModelSelectorPopover } from './ModelSelectorPopover';
 import {
   DeploySubmitOptions,
@@ -91,26 +90,26 @@ const PREVIEW_DEVICE_SPECS: Record<
   iphone: {
     label: 'iPhone',
     dimensions: '390×844',
-    maxWidthClass: 'max-w-[390px]',
-    radiusClass: 'rounded-3xl',
+    maxWidthClass: 'sm:max-w-[390px]',
+    radiusClass: 'rounded-none sm:rounded-3xl',
   },
   android: {
     label: 'Android',
     dimensions: '412×915',
-    maxWidthClass: 'max-w-[412px]',
-    radiusClass: 'rounded-[26px]',
+    maxWidthClass: 'sm:max-w-[412px]',
+    radiusClass: 'rounded-none sm:rounded-[26px]',
   },
   tablet: {
     label: 'Tablet',
     dimensions: '768×1024',
-    maxWidthClass: 'max-w-[768px]',
-    radiusClass: 'rounded-2xl',
+    maxWidthClass: 'sm:max-w-[768px]',
+    radiusClass: 'rounded-none sm:rounded-2xl',
   },
   desktop: {
     label: 'Desktop',
     dimensions: 'Responsive',
-    maxWidthClass: 'max-w-[1120px]',
-    radiusClass: 'rounded-2xl',
+    maxWidthClass: 'sm:max-w-[1160px]',
+    radiusClass: 'rounded-none sm:rounded-2xl',
   },
 };
 
@@ -142,6 +141,8 @@ function cssColorToHex(raw: string, fallback = '#0B0B0F'): string {
 
 function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
   const cleaned = raw
+    .replace(/<(?:think[a-z0-9_-]*|thought)\b[^>]*>[\s\S]*?<\/(?:think[a-z0-9_-]*|thought)\b[^>]*>\s*/gi, '')
+    .replace(/<(?:think[a-z0-9_-]*|thought)\b[^\n]*\n?/gi, '')
     .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]/gi, '')
     .replace(/\[\[\s*MODE\s*:\s*(?:CHAT|GENERATE)\s*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*MEDIA_PROMPT\s*:[^\]]*\]\]\s*\n?/gi, '')
@@ -149,7 +150,9 @@ function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
     .replace(/\[\[\s*LOGO\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*DB_SCHEMA\s*:[^\]]*\]\]\s*\n?/gi, '')
-    .replace(/\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi, '');
+    .replace(/\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi, '')
+    .replace(/\[\[\s*(?:INTENT|MODE|MEDIA_PROMPT|TITLE|LOGO|PLAN|DB_SCHEMA|SUGGESTIONS|\/SUGGESTIONS)[^\]]*$/gi, '')
+    .replace(/<<<?[^\n>]*$/gi, '');
   if (!isBuildTurn) return cleaned.trim();
   return cleaned
     .replace(/```[\s\S]*?```/g, '')
@@ -409,7 +412,7 @@ export function BuilderWorkspace({
 
   useEffect(() => {
     if (!latestPreviewHtml.trim()) {
-      setPreviewSurfaceBg('#070B14');
+      setPreviewSurfaceBg('#FFFFFF');
       return;
     }
     const themeMatch = /<meta\b[^>]*name=["']theme-color["'][^>]*content=["']([^"']+)["']/i.exec(
@@ -431,7 +434,7 @@ export function BuilderWorkspace({
 
   useEffect(() => {
     if (activeView === 'preview') {
-      const targetBg = hasBuiltApp ? previewSurfaceBg : '#070B14';
+      const targetBg = hasBuiltApp ? previewSurfaceBg : '#FFFFFF';
       document.documentElement.style.backgroundColor = targetBg;
       return () => {
         document.documentElement.style.backgroundColor = '#ffffff';
@@ -1487,7 +1490,7 @@ export function BuilderWorkspace({
       if (prev && prev !== url) URL.revokeObjectURL(prev);
     };
     const sinceLastBuild = Date.now() - lastPreviewBuildRef.current;
-    const minGapMs = isStreaming ? 1200 : 0;
+    const minGapMs = isStreaming ? 650 : 0;
     const delayMs = Math.max(0, minGapMs - sinceLastBuild);
     if (delayMs === 0) {
       buildObjectUrl();
@@ -2249,11 +2252,11 @@ export function BuilderWorkspace({
         </header>
 
         {/* Framed preview + optional Visual Inspector side/bottom drawer */}
-        <div className="flex-1 min-h-0 flex flex-col lg:flex-row items-stretch justify-center overflow-hidden px-3 py-3 gap-3">
+        <div className="flex-1 min-h-0 flex flex-col lg:flex-row items-stretch justify-center overflow-hidden p-0 sm:p-4 gap-3">
           <div className="flex-1 min-h-0 flex items-stretch justify-center overflow-hidden">
             <div
-              className={`relative w-full overflow-hidden border border-black/10 bg-white shadow-[0_10px_36px_rgba(0,0,0,0.14)] transition-all duration-200 ${deviceSpec.maxWidthClass} ${deviceSpec.radiusClass}`}
-              style={{ backgroundColor: hasBuiltApp ? previewSurfaceBg : '#070B14' }}
+              className={`relative w-full h-full overflow-hidden border-0 sm:border sm:border-black/10 bg-white shadow-none sm:shadow-[0_10px_36px_rgba(0,0,0,0.12)] transition-all duration-200 ${deviceSpec.maxWidthClass} ${deviceSpec.radiusClass}`}
+              style={{ backgroundColor: hasBuiltApp ? previewSurfaceBg : '#FFFFFF' }}
             >
               {hasBuiltApp ? (
                 <iframe
@@ -2275,7 +2278,56 @@ export function BuilderWorkspace({
                   className="w-full h-full border-0 block bg-transparent"
                 />
               ) : (
-                <LivingBotanicalWallpaper isBuilding={isStreaming} />
+                <div className="h-full w-full flex flex-col items-center justify-center px-6 text-center bg-[#FAFAFC]">
+                  {isStreaming ? (
+                    <div className="w-full max-w-[300px] flex flex-col items-center gap-4">
+                      <div className="w-11 h-11 rounded-2xl bg-white border border-black/[0.08] shadow-xs flex items-center justify-center">
+                        <Loader2
+                          className="w-5 h-5 animate-spin"
+                          style={{ color: theme.accentColor }}
+                        />
+                      </div>
+                      <div>
+                        <h2 className="font-display font-semibold text-[16px] text-[#0B0B0F]">
+                          Building live preview
+                        </h2>
+                        <p className="mt-1 text-[13px] text-[#71717A] leading-relaxed">
+                          Your interface will render right here as soon as code begins streaming.
+                        </p>
+                      </div>
+                      <div className="w-full space-y-2.5 pt-2">
+                        <div className="h-2.5 w-3/4 mx-auto rounded-full bg-black/[0.06] animate-pulse" />
+                        <div className="h-20 w-full rounded-2xl bg-black/[0.04] animate-pulse" />
+                        <div className="grid grid-cols-2 gap-2.5">
+                          <div className="h-14 rounded-xl bg-black/[0.04] animate-pulse" />
+                          <div className="h-14 rounded-xl bg-black/[0.04] animate-pulse" />
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="max-w-[300px] flex flex-col items-center gap-3">
+                      <div className="w-11 h-11 rounded-2xl bg-white border border-black/[0.08] shadow-xs flex items-center justify-center text-[#52525B]">
+                        <Eye className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <h2 className="font-display font-semibold text-[16px] text-[#0B0B0F]">
+                          Ready for preview
+                        </h2>
+                        <p className="mt-1 text-[13px] text-[#71717A] leading-relaxed">
+                          Describe any app or site in Chat to build and interact with it live here.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => onSetView('chat')}
+                        className="mt-1 h-9 px-4 rounded-xl bg-[#0B0B0F] hover:bg-black/85 text-white text-[13px] font-semibold inline-flex items-center gap-1.5 active:scale-95 transition-all"
+                      >
+                        <MessageSquare className="w-3.5 h-3.5" />
+                        <span>Back to Chat</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           </div>

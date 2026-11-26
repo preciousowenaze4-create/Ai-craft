@@ -103,8 +103,9 @@ import {
   extractSessionTitleFromRaw,
   finalizePartialPreviewHtml,
   findCodeStart,
+  getSafeStreamingProse,
+  hasOpenReasoningTag,
   runLiveBrowserSearch,
-  sanitizeBuildProse,
   stripReasoningTags,
 } from './api/_builderCore.js';
 import {
@@ -3427,9 +3428,7 @@ async function startServer() {
         },
         onContentChunk: (chunk) => {
           rawAccumulated += chunk;
-          const openThinkIdx = rawAccumulated.lastIndexOf('<think>');
-          const closeThinkIdx = rawAccumulated.lastIndexOf('</think>');
-          if (openThinkIdx !== -1 && openThinkIdx > closeThinkIdx && !enteredCodePhase) {
+          if (hasOpenReasoningTag(rawAccumulated) && !enteredCodePhase) {
             const now = Date.now();
             if (!emittedReasoningPhase || now - lastReasoningUpdateAt >= 1200) {
               emittedReasoningPhase = true;
@@ -3472,43 +3471,37 @@ async function startServer() {
             }
           }
 
-          const codeStart = findCodeStart(cleanSoFar);
-          if (!codeStart) {
-            const proseSoFar = sanitizeBuildProse(cleanSoFar);
-            if (proseSoFar.length > emittedProseLen) {
-              const delta = proseSoFar.slice(emittedProseLen);
-              emittedProseLen = proseSoFar.length;
-              if (delta) {
-                sendEvent({ type: 'delta', text: delta });
-              }
+          const proseSoFar = getSafeStreamingProse(cleanSoFar);
+          if (proseSoFar.length > emittedProseLen) {
+            const delta = proseSoFar.slice(emittedProseLen);
+            emittedProseLen = proseSoFar.length;
+            if (delta) {
+              sendEvent({ type: 'delta', text: delta });
             }
-          } else {
-            const preCodeProse = sanitizeBuildProse(cleanSoFar.slice(0, codeStart.markerIdx));
-            if (preCodeProse.length > emittedProseLen) {
-              const delta = preCodeProse.slice(emittedProseLen);
-              emittedProseLen = preCodeProse.length;
-              if (delta) {
-                sendEvent({ type: 'delta', text: delta });
-              }
-            }
+          }
 
+          const codeStart = findCodeStart(cleanSoFar);
+          if (codeStart) {
             if (!enteredCodePhase) {
               enteredCodePhase = true;
               sendEvent({
                 type: 'phase',
                 phase: 'building',
                 kind: 'build',
-                label: 'Writing real-time code...',
+                action: 'Coding',
+                label: codeStart.isPatch
+                  ? 'Updating code...'
+                  : 'Writing real-time code...',
               });
             }
 
             const htmlSoFar = cleanSoFar
               .slice(codeStart.htmlOffset)
-              .replace(/<<<\s*END_AICRAFT_APP_HTML\s*>>>[\s\S]*/i, '');
+              .replace(/<<<\s*(?:END_AICRAFT_APP_HTML|END_PATCH|END_AICRAFT_PATCH)\s*>>>[\s\S]*/i, '');
             const artifacts = extractLiveBuildArtifacts(htmlSoFar);
             const paths = artifacts.map((a) => a.path);
             const filesKey = paths.join('|');
-            if (filesKey !== lastFilesKey || htmlSoFar.length - lastBytesSent >= 450) {
+            if (filesKey !== lastFilesKey || htmlSoFar.length - lastBytesSent >= 250) {
               lastFilesKey = filesKey;
               lastBytesSent = htmlSoFar.length;
               const active = artifacts[artifacts.length - 1];
@@ -3520,7 +3513,11 @@ async function startServer() {
                 bytesBuilt: htmlSoFar.length,
               });
             }
-            if (htmlSoFar.length >= 450 && htmlSoFar.length - lastPreviewBytesSent >= 1400) {
+            if (
+              !codeStart.isPatch &&
+              htmlSoFar.length >= 220 &&
+              htmlSoFar.length - lastPreviewBytesSent >= 900
+            ) {
               lastPreviewBytesSent = htmlSoFar.length;
               const liveHtml = finalizePartialPreviewHtml(cleanSoFar);
               if (liveHtml) {

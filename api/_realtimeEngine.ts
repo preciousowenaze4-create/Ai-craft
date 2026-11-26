@@ -267,12 +267,12 @@ export async function prepareRealtimePrompt(
     !wantsFullRedesign &&
     !/\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(message);
 
-  // Only invoke the extra visual architect pre-pass when a screenshot is attached or user explicitly asks for a full redesign.
+  // Only invoke the extra visual architect pre-pass when an image screenshot is attached.
   const shouldRunDesignEngine =
     !input.forceChat &&
     !naturalMediaIntent &&
     isFreeAiMeshAvailable() &&
-    (Boolean(input.attachmentDataUrl) || wantsFullRedesign);
+    Boolean(input.attachmentDataUrl);
 
   if (wantsSearch || shouldRunDesignEngine) {
     input.onStage?.({

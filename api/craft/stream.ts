@@ -5,7 +5,8 @@ import {
   extractSessionTitleFromRaw,
   finalizePartialPreviewHtml,
   findCodeStart,
-  sanitizeBuildProse,
+  getSafeStreamingProse,
+  hasOpenReasoningTag,
   stripReasoningTags,
 } from '../_builderCore.js';
 import {
@@ -388,9 +389,7 @@ export async function POST(request: Request): Promise<Response> {
           },
           onContentChunk: (chunk) => {
             rawAccumulated += chunk;
-            const openThinkIdx = rawAccumulated.lastIndexOf('<think>');
-            const closeThinkIdx = rawAccumulated.lastIndexOf('</think>');
-            if (openThinkIdx !== -1 && openThinkIdx > closeThinkIdx && !enteredCodePhase) {
+            if (hasOpenReasoningTag(rawAccumulated) && !enteredCodePhase) {
               const now = Date.now();
               if (!emittedReasoningPhase || now - lastReasoningUpdateAt >= 1200) {
                 emittedReasoningPhase = true;
@@ -433,26 +432,17 @@ export async function POST(request: Request): Promise<Response> {
               }
             }
 
-            const codeStart = findCodeStart(cleanSoFar);
-            if (!codeStart) {
-              const proseSoFar = sanitizeBuildProse(cleanSoFar);
-              if (proseSoFar.length > emittedProseLen) {
-                const delta = proseSoFar.slice(emittedProseLen);
-                emittedProseLen = proseSoFar.length;
-                if (delta) {
-                  sendEvent({ type: 'delta', text: delta });
-                }
+            const proseSoFar = getSafeStreamingProse(cleanSoFar);
+            if (proseSoFar.length > emittedProseLen) {
+              const delta = proseSoFar.slice(emittedProseLen);
+              emittedProseLen = proseSoFar.length;
+              if (delta) {
+                sendEvent({ type: 'delta', text: delta });
               }
-            } else {
-              const preCodeProse = sanitizeBuildProse(cleanSoFar.slice(0, codeStart.markerIdx));
-              if (preCodeProse.length > emittedProseLen) {
-                const delta = preCodeProse.slice(emittedProseLen);
-                emittedProseLen = preCodeProse.length;
-                if (delta) {
-                  sendEvent({ type: 'delta', text: delta });
-                }
-              }
+            }
 
+            const codeStart = findCodeStart(cleanSoFar);
+            if (codeStart) {
               if (!enteredCodePhase) {
                 enteredCodePhase = true;
                 sendEvent({
@@ -474,7 +464,7 @@ export async function POST(request: Request): Promise<Response> {
               const filesKey = paths.join('|');
               if (
                 filesKey !== lastFilesKey ||
-                htmlSoFar.length - lastBytesSent >= 450
+                htmlSoFar.length - lastBytesSent >= 250
               ) {
                 lastFilesKey = filesKey;
                 lastBytesSent = htmlSoFar.length;
@@ -489,8 +479,8 @@ export async function POST(request: Request): Promise<Response> {
               }
               if (
                 !codeStart.isPatch &&
-                htmlSoFar.length >= 450 &&
-                htmlSoFar.length - lastPreviewBytesSent >= 1400
+                htmlSoFar.length >= 220 &&
+                htmlSoFar.length - lastPreviewBytesSent >= 900
               ) {
                 lastPreviewBytesSent = htmlSoFar.length;
                 const liveHtml = finalizePartialPreviewHtml(cleanSoFar);

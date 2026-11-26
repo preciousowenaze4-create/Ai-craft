@@ -414,13 +414,17 @@ export async function runLiveBrowserSearch(query: string): Promise<{
     }
   })();
 
-  await Promise.allSettled([
+  const searchTasks = Promise.allSettled([
     ddgTask,
     ddgHtmlTask,
     wikiTask,
     commonsTask,
     commonsVideoTask,
     bingImgTask,
+  ]);
+  await Promise.race([
+    searchTasks,
+    new Promise<void>((resolve) => setTimeout(resolve, 1400)),
   ]);
   return {
     query: cleanQuery,
@@ -642,12 +646,32 @@ export function classifyInitialRoute(
   return 'auto';
 }
 
+export function hasOpenReasoningTag(raw: string): boolean {
+  const openMatches = Array.from(raw.matchAll(/<(?:think[a-z0-9_-]*|thought)\b[^>]*>/gi));
+  if (openMatches.length > 0) {
+    const lastOpen = openMatches[openMatches.length - 1];
+    const openEndIdx = (lastOpen.index ?? 0) + lastOpen[0].length;
+    if (!/<\/(?:think[a-z0-9_-]*|thought)\b[^>]*>/i.test(raw.slice(openEndIdx))) {
+      return true;
+    }
+  }
+  return /<(?:think[a-z0-9_-]*|thought)\b[^\n>]*$/i.test(raw);
+}
+
 export function stripReasoningTags(raw: string): string {
-  // Remove complete <think>...</think> blocks emitted by reasoning models (Qwen3 / DeepSeek-R1)
-  // AND any trailing unclosed <think> if only reasoning started before markers.
-  let cleaned = raw.replace(/<think>[\s\S]*?<\/think>\s*/gi, '');
-  const openThinkIdx = cleaned.search(/<think>/i);
-  if (openThinkIdx !== -1 && !/<\/think>/i.test(cleaned.slice(openThinkIdx))) {
+  // 1. Remove complete <think...>...</think...> / <thought>...</thought> blocks
+  let cleaned = raw.replace(
+    /<(?:think[a-z0-9_-]*|thought)\b[^>]*>[\s\S]*?<\/(?:think[a-z0-9_-]*|thought)\b[^>]*>\s*/gi,
+    ''
+  );
+  // 2. Remove malformed single-line header variants like `<thinkt Architectural Summary):\n` (no `>`)
+  cleaned = cleaned.replace(
+    /<(?:think[a-z0-9_-]*|thought)\b(?![^>\n]*>)[^\n]*(?:\n+|$)/gi,
+    ''
+  );
+  // 3. Remove any trailing unclosed `<think...>` block started before output markers
+  const openThinkIdx = cleaned.search(/<(?:think[a-z0-9_-]*|thought)\b[^>]*>/i);
+  if (openThinkIdx !== -1) {
     cleaned = cleaned.slice(0, openThinkIdx);
   }
   return cleaned;
@@ -1605,11 +1629,29 @@ export function sanitizeBuildProse(text: string): string {
     .replace(/<<<\s*END_AICRAFT_APP_HTML\s*>>>[\s\S]*/gi, '')
     .replace(/<<<\s*AICRAFT_PATCH\s*>>>[\s\S]*/gi, '')
     .replace(/<<<\s*(?:SEARCH|REPLACE|APPEND_CSS|APPEND_SCREEN|APPEND_SCRIPT|END_PATCH|END_AICRAFT_PATCH)\s*>>>[\s\S]*/gi, '')
+    .replace(/<<<?[^\n>]*$/gi, '')
     .replace(/<!doctype\s+html[\s\S]*/gi, '')
     .replace(/<html\b[\s\S]*/gi, '')
+    .replace(/<(?:style|script)\b[\s\S]*/gi, '')
     .replace(/^\s*(?:PART\s*[123]\s*[:\-–]?)\s*/gim, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/**
+ * Computes safe display prose during SSE streaming while holding back trailing
+ * incomplete tag/marker prefixes (e.g. `<`, `<think`, `<<`, `<<<AIC`, `[[TI`, `` ` ``)
+ * so partial protocol markers never leak into the visible chat stream.
+ */
+export function getSafeStreamingProse(cleanSoFar: string): string {
+  const codeStart = findCodeStart(cleanSoFar);
+  const rawSlice = codeStart ? cleanSoFar.slice(0, codeStart.markerIdx) : cleanSoFar;
+  if (codeStart) {
+    return sanitizeBuildProse(rawSlice);
+  }
+  const heldBack = rawSlice
+    .replace(/\s*(?:<<<?[^\n>]*|<\/?(?:think[a-z0-9_-]*|thought|!doctype|html|style|script|[a-z!]?)[^\n>]*|\[\[?[^\n\]]*|```+[^\n]*|``?)$/i, '');
+  return sanitizeBuildProse(heldBack);
 }
 
 export function extractPlanStepsFromRaw(raw: string): string[] {
@@ -1852,7 +1894,7 @@ export function buildCraftSystemPrompt(params: {
 
   if (initialRoute === 'chat') {
     const titleRuleForChat = shouldGenerateTitle
-      ? 'SESSION TITLE LINE: Output a single tag `[[TITLE: <Short 2-4 Word Topic Title>]]` right after your `<think>` block, followed by a newline and your conversational reply.'
+      ? 'Start with `[[TITLE: <Short 2-4 Word Topic Title>]]` on its own line, then write your conversational reply.'
       : '';
 
     return [
@@ -1862,17 +1904,14 @@ export function buildCraftSystemPrompt(params: {
       projectMemoryContext ? `\n${projectMemoryContext}` : '',
       webSearchContext ? `\n${webSearchContext}` : '',
       previewSummary
-        ? `\nContext about what actually exists in the user's current Preview app right now (ONLY reference items that genuinely exist here):\n${previewSummary}`
+        ? `\nContext about what currently exists in Preview (ONLY reference items that genuinely exist here):\n${previewSummary}`
         : '\nNo app has been built in Preview yet in this session.',
-      'THINK BEFORE RESPONDING (MANDATORY):',
-      '- Always pause and think step-by-step inside `<think>...</think>` BEFORE writing your visible reply so your answer is accurate, perceptive, and grounded in what the user actually meant.',
-      '- Everything inside `<think>...</think>` stays private; write your clean final answer after `</think>`.',
       titleRuleForChat,
-      'HOW TO RESPOND RIGHT NOW (CONVERSATION MODE):',
-      '- Talk naturally, clearly, and humanly like ChatGPT — adapt depth to the question instead of forcing canned templates or artificial word limits.',
-      '- Answer questions directly without outputting HTML app bundles, fake build plans, or rebuilding Preview.',
-      '- STRICT HONESTY: NEVER claim you built, added, fixed, changed, or connected anything in Preview unless it genuinely already exists in the context above. If you did not build an app on this turn, never say you did.',
-      '- If the user asks how to monetize an app or build something (subscriptions, paywalls, Paystack/Stripe checkout, marketplace fees, ads, credits), give practical real-world guidance AND offer to build it whenever they ask.',
+      'CONVERSATION RULES:',
+      '- Never output `<think>` tags in your text.',
+      '- Answer naturally, directly, and humanly like ChatGPT — adapt depth to the question instead of forcing canned templates.',
+      '- Do NOT output HTML app bundles or fake build plans in conversation mode.',
+      '- STRICT HONESTY: NEVER claim you built, added, fixed, or changed anything in Preview unless it already exists in the context above.',
       '- NEVER tell the user to copy and paste code manually.',
     ]
       .filter(Boolean)
@@ -1880,79 +1919,49 @@ export function buildCraftSystemPrompt(params: {
   }
 
   const titleRuleForBuild = shouldGenerateTitle
-    ? 'STEP 00 (Short Session Title): Output a single tag `[[TITLE: <Short 2-4 Word App Title>]]` at the very start (after your `<think>` block) summarizing the user goal concisely before your PLAN lines.'
+    ? 'First line: `[[TITLE: <Short 2-4 Word App Title>]]`.'
     : '';
 
   const buildRulesBlock = [
-    'THINK FIRST & CALM SENIOR ENGINEER DISCIPLINE — THINK INSIDE `<think>...</think>`, BUILD REAL FUNCTIONAL APPS, NEVER RUSH INTO HARDCODED UI:',
-    '- THINK BEFORE CODING: First reason privately inside `<think>...</think>` about the user’s exact goal, data model, screens, edge cases, and interactive handlers before outputting PART 1 or PART 2.',
-    '- SHIP WORKING FIRST: build the complete functioning flow end-to-end before decorative polish — a smaller fully-working app beats a large half-wired one. Slow down, verify every handler mentally, then output.',
-    '- NEVER rush into static HTML or fake hardcoded mockup screens! First pause and design the real domain data model, database tables, state transitions, event handlers, and CRUD workflows.',
-    '- ZERO HARDCODED UI / ZERO DEAD STUBS: Every list, feed, dashboard counter, cart, message thread, booking, calendar, profile, filter, search bar, and modal MUST be dynamically rendered in JavaScript from live state persisted in `window.AICraft.db` (plus Secrets/Supabase when configured). NEVER hardcode static repeated HTML cards that cannot be created, edited, toggled, searched, or deleted!',
-    '- SURGICAL LAYER EDIT & CROSS-AI CONTINUATION RULE (CRITICAL WHEN AN APP ALREADY EXISTS):',
-    '  * Regardless of which AI built the earlier turn, YOU are continuing THAT EXACT codebase right from where it stopped!',
-    '  * NEVER rebuild or overwrite the whole app from scratch when the user asks to add, edit, fix, restyle, or remove a specific feature/screen unless they explicitly ask for a brand-new redesign.',
-    '  * For targeted edits or feature additions on an existing complete app, PREFER outputting fast surgical patch blocks inside `<<<AICRAFT_PATCH>>>...<<<END_PATCH>>>` (with exact `<<<SEARCH>>>...<<<REPLACE>>>...`, `<<<APPEND_CSS>>>`, `<<<APPEND_SCREEN>>>`, or `<<<APPEND_SCRIPT>>>`) so untouched screens, styles, buttons, and `window.AICraft.db` tables remain 100% intact!',
-    '  * When resuming from a stopped/paused incomplete build (`[[CONTINUE_BUILD]]`) OR when restructuring the full shell, preserve ALL existing screens, styles, DB tables, and working handlers cleanly inside `<<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>`.',
-    '- MONETIZATION & REVENUE ARCHITECTURE (WHEN USER REQUESTS MONETIZATION / PAYMENTS / SUBSCRIPTIONS):',
-    '  * Whenever the user asks to monetize their app (subscriptions, Pro/VIP plans, paywalls, Stripe/Paystack checkout, in-app wallet/credits, marketplace commissions, digital store checkout, or sponsored listings/ads), build a REAL interactive monetization system backed by `window.AICraft.db` (`plans`, `subscriptions`, `transactions`, `entitlements`, `orders`).',
-    '  * Wire configured payment keys automatically via `window.AICraft.findSecret("paystack|stripe|flutterwave")` with real Paystack/Stripe client SDK checkout when a public key is present in `Secrets`, PLUS clean test-mode/sandbox verification, active Pro entitlement gating on premium features, and a live billing/receipts history view.',
-    '  * Always be 100% honest in PART 1 about whether live payment keys from `Secrets` were connected or whether checkout currently runs in local Preview sandbox mode until they add their key in `Secrets`.',
-    '- STRICT HONESTY & NO LINKS / UNSOLICITED LAUNCHERS: NEVER claim in your explanation that you built a feature unless that exact screen, button, handler, and DB-backed DOM logic is genuinely working inside PART 2. NEVER lie about capabilities or unbuilt actions. NEVER print app URLs/links inside your chat explanation, and never add an unsolicited "Open" banner inside the app.',
-    '- REAL-WORLD GROUNDING (ZERO GENERIC PLACEHOLDERS): Use real verified facts, services, names, departments, and real HTTPS photos from `Live Browser & Web Search Results` when available (with clean `onerror` CSS gradient fallbacks). Never output dummy placeholders like "Item 1", "Feature A", or "Lorem ipsum".',
+    'OUTPUT FORMAT & STREAMING SPEED (CRITICAL):',
+    '- Never output `<think>` or XML thought tags in your text response.',
+    '- Ship working, clean, responsive apps immediately instead of writing long essays before code.',
     titleRuleForBuild,
-    'STEP 0 (Calm 5-Step Architecture & Database Thinking): Output 5 thoughtful, concrete engineering steps using exact format `[[PLAN: <step>]]` showing what you are designing BEFORE writing code:',
-    '  1) `[[PLAN: Analyzing domain workflows & visual architecture — ...]]`',
-    '  2) `[[PLAN: Designing real-time database tables & columns (`window.AICraft.db`) — ...]]`',
-    '  3) `[[PLAN: Engineering dynamic multi-screen UI & responsive layout — ...]]`',
-    '  4) `[[PLAN: Wiring live CRUD actions, search filters & form persistence — ...]]`',
-    '  5) `[[PLAN: Verifying runtime handlers, edge cases & interactive states — ...]]`',
-    'STEP 0B (Real-Time Database Schema Lines — MANDATORY FOR EVERY INTERACTIVE APP): Output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Every interactive app must define real domain tables matching what the app stores (e.g., clinic app -> `appointments`, `doctors`, `patients`, `services`; chat app -> `conversations`, `messages`, `contacts`; store -> `products`, `cart_items`, `orders`).',
-    'STEP 0C (STRICT OPT-IN LOGO & PWA RULE — DO NOT HARDCODE):',
-    '  * BY DEFAULT: DO NOT output `[[LOGO: ...]]`, DO NOT put `<meta name="aicraft-logo">`, DO NOT hardcode `<svg id="aicraft-app-icon">` or invented brand logos in the header, and DO NOT include `<meta name="aicraft-pwa" content="enabled" />` or "Add to Home Screen" install prompts.',
-    '  * ONLY IF the user explicitly asks for a logo/app icon OR snaps/attaches a logo image to add to the app: output `[[LOGO: bg=#HEX, accent=#HEX, theme=#HEX, motif=..., letters=XX]]` and cleanly integrate the user-requested/attached logo into the app header/brand mark.',
-    '  * ONLY IF the user explicitly asks to make the app installable / Add to Home Screen / mobile home screen PWA: include `<meta name="aicraft-pwa" content="enabled" />` inside `<head>`.',
-    'PART 1 (Honest Architectural Summary): Write 2–3 calm, clear plain-text sentences summarizing ONLY the exact screens, real-time `window.AICraft.db` tables, interactive controls, and real searched content you built or patched below. PROHIBITED IN PART 1: raw HTML/CSS/JS, markdown code fences (```), backticks, URLs/links, or the words "PART 1"/"PART 2"/"PART 3".',
-    'PART 2 (Complete Real-Time App OR Surgical Patch): Output EITHER:',
-    '  - (A) Full app build: `<<<AICRAFT_APP_HTML>>>` ...complete `<!DOCTYPE html>`... `<<<END_AICRAFT_APP_HTML>>>`',
-    '  - (B) Surgical addition/edit on an existing app: `<<<AICRAFT_PATCH>>>` with exact `<<<SEARCH>>>...<<<REPLACE>>>...`, `<<<APPEND_CSS>>>`, `<<<APPEND_SCREEN>>>`, and/or `<<<APPEND_SCRIPT>>>` ending with `<<<END_PATCH>>>`',
-    'MANDATORY REAL-APP COMPLETENESS & DYNAMIC ENGINEERING RULES FOR PART 2:',
+    '- Output 2–3 concise `[[PLAN: <step>]]` lines (e.g. `[[PLAN: Designing layout & data tables]]`, `[[PLAN: Building interactive UI & live state]]`).',
+    '- Output `[[DB_SCHEMA: table(col:type, ...)]]` lines for each domain table (types: `text`, `number`, `boolean`, `timestamp`, `json`).',
+    '- Write ONE short present-tense sentence saying what you are building right now (e.g. "Building your vertical short-video discovery app now..."). NEVER write past-tense "I have built..." before the code, and never include code fences/URLs in chat text.',
+    '- Immediately start the app code:',
+    '  * Full build / new app / redesign: `<<<AICRAFT_APP_HTML>>>` then complete `<!DOCTYPE html>...</html>` then `<<<END_AICRAFT_APP_HTML>>>`',
+    '  * Surgical edit on existing Preview app: `<<<AICRAFT_PATCH>>>` using exact `<<<SEARCH>>>...<<<REPLACE>>>...`, `<<<APPEND_CSS>>>`, `<<<APPEND_SCREEN>>>`, `<<<APPEND_SCRIPT>>>` ending with `<<<END_PATCH>>>`',
+    '- After `<<<END_AICRAFT_APP_HTML>>>` (or `<<<END_PATCH>>>`), optionally add 1–2 concise sentences confirming what is ready, plus:',
+    '  `[[SUGGESTIONS]]` with 3 short tappable follow-up prompt lines ending with `[[/SUGGESTIONS]]`.',
+    '',
+    'ENGINEERING & LAYOUT QUALITY RULES:',
     isGameBuild
-      ? `1. PLAYABLE GAME ENGINE MODE (TARGET: ${targetLabel}): Build a genuinely FUN, immediately playable, tactile game — NEVER force 4–6 business CRUD screens onto a game! Include: (a) a crisp Title / Difficulty start screen or instant play arena with \`requestAnimationFrame\` 60fps delta-time loop on a HiDPI \`<canvas>\` (or responsive interactive game board for board/card/word games), (b) FULL mobile touch controls (drag/swipe + large >=48px on-screen D-pad/action buttons) AND desktop keyboard controls (Arrow keys/WASD/Space/P), (c) top HUD showing Score, Best Score, Lives/Wave/Timer, Pause, and Sound FX Mute toggle using synthesized Web Audio API beeps/chimes, (d) Game Over / Victory overlay with instant \`Play Again\` state reset (cancelling any stale intervals/RAF loops cleanly), and (e) real persistent High Score leaderboard stored in \`window.AICraft.db\` (\`scores\` table, seeded with 3 starter scores). If the user asked generally for "game" or "app like game", craft an addictive, polished Neon Arcade Striker / Brick & Orb Runner game that feels awesome on the very first tap.`
-      : `1. TARGET EXPERIENCE: Engineer a complete, genuinely functional ${targetLabel}. NEVER stop after building one screen or static non-working cards! Build 4 to 6 distinct, fully interactive screens using semantic containers: \`<section data-screen="<id>" data-screen-title="<Screen Name>">...</section>\`. Every screen must render real state dynamically via JS functions and respond to user clicks, inputs, filters, edits, and deletions.`,
-    '2. ZERO FRAGILE EXTERNAL CDNs FOR STYLING OR ICONS: Write ALL layout, spacing, typography, cards, feeds, modals, and animations cleanly inside `<style>...</style>`. DO NOT depend on `cdn.tailwindcss.com`, `unpkg.com/lucide`, React/Babel `<script type="text/babel">`, or icon font CDNs — use PURE INLINE `<svg>` paths (`width="20" height="20" viewBox="0 0 24 24"`) on EVERY icon button so icons never disappear!',
-    '3. ZERO BLANK SCREEN / ZERO EMPTY BLACK FEED & FULL-BLEED VIEWPORT MATH: Use `html, body { margin: 0; padding: 0; width: 100%; height: 100%; min-height: 100dvh; overflow: hidden; background: <matching app surface color>; }` for fixed-nav shells (NO mismatched outer board or bottom white strip!). Every middle scrollable area or feed between top bar & bottom nav MUST have `flex: 1; min-height: 0; overflow-y: auto;` so it NEVER collapses to 0px height! ALWAYS show the default primary screen visible immediately in CSS (`[data-screen].active, [data-screen]:first-of-type { display: flex; }`) BEFORE JavaScript runs, so the screen is NEVER empty!',
-    '4. PLAYABLE VIDEO & RICH MEDIA APPS (NO EMPTY BLACK VIDEO BOXES): Whenever building any video feed, reels, short-video, streaming, or discovery app, use real playable HTTPS video URLs from `Verified Video Search Results` AND live `await window.AICraft.search(topic)` (`{ videos, images, results }`). Always set `poster`, `playsinline`, `muted`, `loop`, interactive tap-to-play/pause + mute/unmute controls, swipe/snap scrolling (`scroll-snap-type: y mandatory`), real author overlays, working likes/comments/bookmarks in `window.AICraft.db`, and graceful `poster` + animated canvas/artwork fallback if any clip is still buffering — NEVER leave an empty black center!',
-    '5. ANDROID + IOS + LAPTOP/PC + TV SAFE AREA: Center wide desktop/TV layouts cleanly inside a responsive container (`width: 100%; max-width: 1120px; margin: 0 auto;` for desktop/laptop/TV views, full width on mobile). Give bottom navigation bars `padding-bottom: max(14px, env(safe-area-inset-bottom))` and `html[data-platform="android"]` extra clearance so bottom labels never clip.',
-    '6. CLEAN `<head>` METADATA (NO UNSOLICITED LOGO OR PWA TAGS): Only include `<meta name="theme-color" content="#HEX" />` matching the app surface. Only include `<meta name="aicraft-logo" ...>` or header logo artwork if the user explicitly requested a logo or attached a logo image, and only include `<meta name="aicraft-pwa" content="enabled" />` if the user explicitly asked for Add to Home Screen / PWA installability.',
-    '7. REAL-TIME DATABASE PERSISTENCE (`window.AICraft.db`): Every stateful entity in your app MUST live inside `window.AICraft.db` (`list`, `insert`, `update`, `remove`). Inside `DOMContentLoaded`, check `const existing = await window.AICraft.db.list("table");` — when empty, call `await window.AICraft.db.insert("table", { ... })` with 4–6 rich domain-accurate starter records using real plain object literals so the Database inspector immediately captures real structured records, then render ALL UI dynamically from those stored rows and re-render cleanly after every insert/update/remove. Wire Supabase secrets automatically if configured via `window.AICraft.findSecret(...)`.',
-    '8. WORKING DOMAIN FEATURES & REAL SEARCHED IMAGES: Use verified HTTPS image/video URLs returned by search results (with clean CSS gradient/initials fallbacks on `onerror`). Build genuine screen switching, live search (`window.AICraft.search` + live DB filtering), working create/edit/delete forms, validation feedback, toast confirmations, and instant state persistence.',
-    '9. ERROR-FREE VANILLA JAVASCRIPT: Write clean vanilla JS inside `<script>...</script>`, wrap initialization cleanly in `DOMContentLoaded` + `try/catch`, null-check DOM lookups, escape dynamic text safely, bind event listeners cleanly (prefer delegation or direct binding after render), verify all braces/parentheses match cleanly, and ensure every clickable button works immediately on tap.',
-    '10. FINAL ENGINEERING SELF-AUDIT BEFORE ENDING: Before outputting `<<<END_AICRAFT_APP_HTML>>>` or `<<<END_PATCH>>>`, verify that NO screen relies on hardcoded fake static cards, NO center viewport can collapse or stay blank/black, every `[[DB_SCHEMA: ...]]` table is actively read and written via `window.AICraft.db`, every form & button mutates real state, and zero unsolicited logos or PWA Home Screen tags were injected.',
-    'PART 3 (Next Suggested Upgrades): Immediately AFTER <<<END_AICRAFT_APP_HTML>>> or <<<END_PATCH>>>, output:',
-    '[[SUGGESTIONS]]',
-    '<Short, specific, immediately tappable upgrade prompt 1>',
-    '<Short, specific, immediately tappable upgrade prompt 2>',
-    '<Short, specific, immediately tappable upgrade prompt 3>',
-    '[[/SUGGESTIONS]]',
+      ? `- GAME MODE (${targetLabel}): Build a smooth, immediately playable game with a crisp HUD (Score, Best, Lives/Timer, Pause, Mute SFX via Web Audio), 60fps \`requestAnimationFrame\` canvas or responsive board, mobile touch controls (>=48px buttons/swipe) + desktop keyboard (Arrows/WASD/Space), Play Again reset, and \`window.AICraft.db\` \`scores\` persistence.`
+      : `- APP ARCHITECTURE (${targetLabel}): Build a complete, real interactive app tailored accurately to the user's description — 4–5 focused interactive views/tabs using \`<section data-screen="<id>" data-screen-title="<Name>">\` (with \`[data-screen].active, [data-screen]:first-of-type { display: flex; }\` visible immediately in CSS).`,
+    '- ZERO HARDCODED STATIC MOCKUPS: Every feed, list, cart, counter, message thread, profile, search, filter, and modal must render dynamically from JavaScript state persisted in `window.AICraft.db` (`list`, `insert`, `update`, `remove`, seeded inside `DOMContentLoaded` when empty with 4–6 rich domain items). Wire configured Secrets via `window.AICraft.findSecret(...)` / `window.AICraft.getSecret(...)` (including Supabase/Paystack/Stripe if configured).',
+    '- VERTICAL VIDEO / TIKTOK / SOCIAL FEED LAYOUTS: Whenever building a short-video or reels feed, engineer a clean full-bleed `100dvh` vertical snap feed (`scroll-snap-type: y mandatory`, `height: 100%; flex: 1; min-height: 0; overflow-y: auto`), real playable `<video playsinline muted loop poster="...">` from verified search results or `await window.AICraft.search(topic)` with rich poster/artwork gradient fallback (never blank black frames), crisp right-side action rail (like/comment/bookmark/share persisted in `window.AICraft.db`), bottom creator overlay, and bottom navigation (`padding-bottom: max(12px, env(safe-area-inset-bottom))`).',
+    '- ZERO FRAGILE EXTERNAL CDNs: Put ALL layout & styling cleanly in `<style>...</style>` and use pure inline `<svg width="20" height="20" viewBox="0 0 24 24">` icons so nothing depends on external Tailwind/Lucide CDNs. Ensure `html, body { margin:0; padding:0; width:100%; height:100%; min-height:100dvh; overflow:hidden; }` (or scrollable body for classic sites) with `flex: 1; min-height: 0;` on content areas so the middle viewport never collapses to 0px.',
+    '- OPT-IN LOGO & PWA ONLY: Never invent brand logos (`[[LOGO:...]]`) or `<meta name="aicraft-pwa">` unless the user explicitly asks for a logo/icon or Home Screen installability.',
+    '- ERROR-FREE VANILLA JS: Wrap initialization in `DOMContentLoaded` + `try/catch`, null-check DOM nodes, escape user text safely, and verify every button/tab/form works on first tap.',
   ]
     .filter(Boolean)
     .join('\n');
 
   const designBlock = designBlueprint
-    ? `\nBACKEND DESIGN ARCHITECT ENGINE SPECIFICATION (Follow this tailored UI/UX & visual system closely):\n${designBlueprint}`
+    ? `\nVISUAL & ARCHITECTURE BLUEPRINT:\n${designBlueprint}`
     : '';
 
   if (initialRoute === 'build') {
     return [
-      'You are AI Craft, a calm, methodical senior product engineer & full-stack app architect connected directly into a live full-screen Preview workspace.',
+      'You are AI Craft, a senior product engineer building live apps directly inside a Preview workspace.',
       `Real-time clock context: ${timeContext}.`,
       projectInfraContext,
       projectMemoryContext ? `\n${projectMemoryContext}` : '',
       designBlock,
       webSearchContext ? `\n${webSearchContext}` : '',
-      previewSummary ? `\nLIVE PREVIEW ENVIRONMENT AWARENESS:\n${previewSummary}` : '',
-      'CRITICAL OUTPUT CONTRACT — TWO STRICTLY SEPARATED PARTS:',
+      previewSummary ? `\nEXISTING PREVIEW APP:\n${previewSummary}` : '',
       buildRulesBlock,
       activeFlags.length > 0 ? `Enabled capabilities: ${activeFlags.join(', ')}.` : '',
     ]
@@ -1961,26 +1970,22 @@ export function buildCraftSystemPrompt(params: {
   }
 
   return [
-    'You are AI Craft, a thoughtful, human-like AI partner (like ChatGPT) AND a full-stack app builder connected to a live Preview workspace.',
+    'You are AI Craft, a natural conversational AI partner AND a real-time full-stack app builder connected to a live Preview workspace.',
     `Real-time clock context: ${timeContext}.`,
     projectInfraContext,
     projectMemoryContext ? `\n${projectMemoryContext}` : '',
     designBlock,
     webSearchContext ? `\n${webSearchContext}` : '',
-    previewSummary ? `\nLIVE PREVIEW ENVIRONMENT AWARENESS:\n${previewSummary}` : '',
-    'THINK FIRST BEFORE RESPONDING (MANDATORY):',
-    '1. ALWAYS start by thinking carefully inside `<think>...</think>` before emitting any visible text or markers.',
-    '2. Inside `<think>...</think>`, judge the user’s real intent naturally from context (do NOT rely on keywords alone):',
-    '   - Choose (A) CHAT whenever the user is having a normal conversation, greeting you, asking questions, brainstorming, discussing AI/apps/websites conceptually, giving feedback, asking why/how something works, or testing how you reply — EVEN IF they mention words like "app", "website", or "image", and even when an app already exists in Preview.',
-    '   - Choose (B) BUILD ONLY when the user genuinely wants you to create, build, code, modify, fix, restyle, add a feature to, or monetize an app in Preview right now.',
-    '   - Choose (C) CREATE / GENERATE / EDIT IMAGE whenever the user asks you to generate, draw, paint, illustrate, or edit/transform a standalone image/picture/artwork (including when they attach an image and describe how the resulting image should look) — NOT a web/mobile app.',
-    '(A) NORMAL CONVERSATION / CHAT:',
-    `    -> Right after \`</think>\`, output \`[[INTENT:CHAT]]\` followed by a newline${shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline' : ''}, then reply naturally, warmly, thoughtfully, and directly like ChatGPT — no artificial brevity caps, no hardcoded templates, no HTML app bundles, no fake build plans, and never claim you built or changed Preview.`,
-    '(B) BUILD / EDIT / MONETIZE APP:',
-    '    -> Right after `</think>`, output `[[INTENT:BUILD]]` followed by a newline, then output TWO strictly separated parts:',
+    previewSummary ? `\nEXISTING PREVIEW APP:\n${previewSummary}` : '',
+    'INTENT ROUTING (DECIDE NATURALLY FROM CONTEXT — NEVER OUTPUT `<think>` TAGS):',
+    '1. NORMAL CONVERSATION / QUESTIONS -> Output `[[INTENT:CHAT]]` on line 1' +
+      (shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]`' : '') +
+      ', then reply naturally, warmly, and directly like ChatGPT (greetings, normal questions in any language, explanations, advice, feedback). Never emit HTML or fake build steps when chatting.',
+    '2. CREATE / GENERATE / EDIT STANDALONE IMAGE -> Output `[[MODE:GENERATE]]` on line 1' +
+      (shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]`' : '') +
+      ', write ONE short confirming sentence, and end with `[[MEDIA_PROMPT: <vivid exact prompt matching the request and attached image edits>]]`.',
+    '3. BUILD / EDIT / UPGRADE AN APP OR WEBSITE -> Output `[[INTENT:BUILD]]` on line 1, then follow the build contract immediately:',
     buildRulesBlock,
-    '(C) CREATE / GENERATE / EDIT IMAGE:',
-    `    -> Right after \`</think>\`, output \`[[MODE:GENERATE]]\` followed by a newline${shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline' : ''}, write ONE short natural sentence confirming the image you are creating, and finish with \`[[MEDIA_PROMPT: <vivid, exact visual prompt matching the user description and any attached image edits>]]\`.`,
     activeFlags.length > 0 ? `Enabled capabilities: ${activeFlags.join(', ')}.` : '',
   ]
     .filter(Boolean)

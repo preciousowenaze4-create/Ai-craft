@@ -223,5 +223,45 @@ assert(
   `expected Gemini error when quota exhausted, got: ${String(quotaError)}`
 );
 
+// --- 8: streaming marker & reasoning tag holdback ------------------------
+const {
+  getSafeStreamingProse,
+  hasOpenReasoningTag,
+  stripReasoningTags,
+} = await import('../api/_builderCore.js');
+
+assert(
+  hasOpenReasoningTag('<thinkt Architectural Summary): planning now'),
+  'hasOpenReasoningTag must detect open <thinkt tail'
+);
+assert(
+  !hasOpenReasoningTag('<thinkt>done</thinkt>Building now...'),
+  'hasOpenReasoningTag must clear once closed'
+);
+assert(
+  stripReasoningTags('<thinkt>hidden</thinkt>Building feed now.') === 'Building feed now.',
+  'stripReasoningTags must strip <thinkt> blocks'
+);
+assert(
+  stripReasoningTags('<thinkt Architectural Summary):\nBuilding feed now.\n<<<AICRAFT_APP_HTML>>><html></html>') ===
+    'Building feed now.\n<<<AICRAFT_APP_HTML>>><html></html>',
+  'stripReasoningTags must strip malformed <thinkt line without dropping HTML'
+);
+assert(
+  getSafeStreamingProse('Building your short-video feed now.\n<<<AIC') ===
+    'Building your short-video feed now.',
+  'getSafeStreamingProse must hold back partial <<<AIC prefix'
+);
+assert(
+  getSafeStreamingProse('Building your app.\n<thinkt Arch') === 'Building your app.',
+  'getSafeStreamingProse must hold back partial <thinkt prefix'
+);
+assert(
+  getSafeStreamingProse(
+    'Building your app.\n<<<AICRAFT_APP_HTML>>>\n<!DOCTYPE html><html></html>'
+  ) === 'Building your app.',
+  'getSafeStreamingProse must keep pre-code prose clean once HTML starts'
+);
+
 console.log('ALL GEMINI ENGINE TESTS PASSED');
 process.exit(0);

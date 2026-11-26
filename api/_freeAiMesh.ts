@@ -30,6 +30,7 @@ import {
   markApiKeyInvalidCooldown,
   markGatewayCandidateCooldown,
   parseGatewayModelIdentifier,
+  scoreDiscoveredGeminiModel,
 } from './_aiGateways.js';
 import {
   FREE_MODEL_CATALOG,
@@ -249,7 +250,7 @@ export async function refreshGeminiModelsIfConfigured(): Promise<string[]> {
   return resolveGeminiModels();
 }
 
-function resolveGeminiModels(): string[] {
+function resolveGeminiModels(taskKind: 'chat' | 'build' = 'build'): string[] {
   const singleOverride = (process.env.GEMINI_MODEL || '').trim();
   const csvOverride = readEnvCsv('GEMINI_MODELS');
   const envModels = [
@@ -263,7 +264,9 @@ function resolveGeminiModels(): string[] {
     return envModels.slice(0, 12);
   }
 
-  const live = geminiModelsCache?.models || [];
+  const live = [...(geminiModelsCache?.models || [])].sort(
+    (a, b) => scoreDiscoveredGeminiModel(b, taskKind) - scoreDiscoveredGeminiModel(a, taskKind)
+  );
   const baseList =
     live.length > 0
       ? [
@@ -337,10 +340,12 @@ function budgetFor(taskKind: 'chat' | 'build'): MeshWalkBudget {
   return { firstByteMs: 55_000, idleMs: 65_000, walkMs: 140_000, maxAttempts: 8 };
 }
 
-function enumerateMeshCandidates(): Array<{ candidate: MeshCandidate; coolingMs: number }> {
+function enumerateMeshCandidates(
+  taskKind: 'chat' | 'build' = 'build'
+): Array<{ candidate: MeshCandidate; coolingMs: number }> {
   const keys = getServerGeminiApiKeys();
   if (keys.length === 0) return [];
-  const models = resolveGeminiModels().slice(0, MAX_MODELS_PER_KEY);
+  const models = resolveGeminiModels(taskKind).slice(0, MAX_MODELS_PER_KEY);
   const all: Array<{ candidate: MeshCandidate; coolingMs: number }> = [];
 
   for (const model of models) {
@@ -364,9 +369,9 @@ function enumerateMeshCandidates(): Array<{ candidate: MeshCandidate; coolingMs:
   return all;
 }
 
-function buildMeshCandidates(): MeshCandidate[] {
+function buildMeshCandidates(taskKind: 'chat' | 'build' = 'build'): MeshCandidate[] {
   const out: MeshCandidate[] = [];
-  for (const entry of enumerateMeshCandidates()) {
+  for (const entry of enumerateMeshCandidates(taskKind)) {
     if (entry.coolingMs > 0) continue;
     out.push(entry.candidate);
     if (out.length >= MAX_ATTEMPTS_PER_WALK) break;
@@ -962,13 +967,20 @@ async function runMeshStreamAttempt(params: {
 }
 
 export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStreamResult> {
+  if (!geminiModelsCache && isGeminiConfigured()) {
+    await Promise.race([
+      refreshGeminiModelsIfConfigured().catch(() => undefined),
+      sleepWithSignal(1_800, params.signal).catch(() => undefined),
+    ]);
+  }
+
   const budget = budgetFor(params.taskKind);
   let cooldownWaits = 0;
 
   const tryWaitForCooldowns = async (): Promise<boolean> => {
     if (cooldownWaits >= 1) return false;
     if (!getFreeAiMeshStatus().hasAny) return false;
-    if (buildMeshCandidates().length > 0) return false;
+    if (buildMeshCandidates(params.taskKind).length > 0) return false;
     const earliest = earliestMeshCooldownMs();
     if (earliest <= 0) return false;
     const capMs = readEnvNumber('MESH_COOLDOWN_WAIT_MS', 8_000);
@@ -977,18 +989,18 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
     await sleepWithSignal(Math.min(earliest + 300, capMs + 300), params.signal).catch(
       () => undefined
     );
-    return buildMeshCandidates().length > 0;
+    return buildMeshCandidates(params.taskKind).length > 0;
   };
 
   let candidates = prioritizeCandidatesForRequestedModel(
-    buildMeshCandidates(),
+    buildMeshCandidates(params.taskKind),
     params.requestedModel
   );
   if (candidates.length === 0) {
     if (getFreeAiMeshStatus().hasAny) {
       if (await tryWaitForCooldowns()) {
         candidates = prioritizeCandidatesForRequestedModel(
-          buildMeshCandidates(),
+          buildMeshCandidates(params.taskKind),
           params.requestedModel
         );
       } else {
