@@ -88,6 +88,7 @@ export interface PrepareRealtimeInput {
   visualHints?: VisualHintsSpec | null;
   reactEnabled?: boolean;
   backendEnabled?: boolean;
+  testMode?: boolean;
   projectMemoryContext?: string;
   projectMemoryPromise?: Promise<{ brainContext: string; memory?: unknown }>;
   onStage?: (stage: PrepareRealtimeStageEvent) => void;
@@ -101,6 +102,7 @@ export interface PreparedRealtimePrompt {
   shouldGenerateTitle: boolean;
   isPatchMode?: boolean;
   isGameBuild?: boolean;
+  testMode?: boolean;
   systemPrompt: string;
   userPrompt: string;
   historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -116,15 +118,20 @@ export interface PreparedRealtimePrompt {
 
 export function detectNaturalMediaRequest(
   message: string,
-  _hasPreviousHtml: boolean,
+  hasPreviousHtml: boolean,
   hasAttachment = false
 ): 'image' | 'music' | 'video' | null {
   const msg = String(message || '').trim();
   if (!msg) return null;
 
-  // Never intercept requests to build or modify an app, website, dashboard, or game.
+  // Never generate standalone images inside an active app/preview session — keep evolving the app in real time.
+  if (hasPreviousHtml) {
+    return null;
+  }
+
+  // Never intercept requests to build or modify an app, website, preview, UI, database, or game.
   if (
-    /\b(?:build|code|create|make|design|update|add)\s+(?:an?\s+|the\s+|me\s+an?\s+)?(?:mobile\s+|web\s+|full[- ]?stack\s+|react\s+)?(?:app|application|website|web\s*app|site|dashboard|game|platform|store|shop|portal|gallery\s+app|photo\s+editor\s+app)\b/i.test(
+    /\b(?:preview|app|application|website|web\s*app|site|dashboard|game|platform|store|shop|portal|screen|page|feed|layout|card|component|database|schema|ui|ux|test\s*mode|gallery\s+app|photo\s+editor\s+app)\b/i.test(
       msg
     )
   ) {
@@ -143,7 +150,7 @@ export function detectNaturalMediaRequest(
     return null;
   }
 
-  // Direct text-to-image requests.
+  // Direct standalone text-to-image requests only.
   if (
     /\b(?:generate|create|make|draw|paint|render|sketch|illustrate|design|produce)\s+(?:an?\s+|me\s+an?\s+|the\s+)?(?:ultra[- ]?(?:realistic|hd)|realistic|4k|2k|high[- ]?(?:quality|res)|cinematic|anime|3d|cartoon|digital|minimalist|futuristic|neon|cyberpunk|cute|fantasy|studio)?\s*(?:image|picture|photo|photograph|artwork|illustration|wallpaper|portrait|poster|cover\s*art|icon|emblem|banner)\b/i.test(
       msg
@@ -152,7 +159,7 @@ export function detectNaturalMediaRequest(
     return 'image';
   }
 
-  // Image-to-image / editing requests when user attached an image.
+  // Image-to-image / editing requests when user attached an image outside app building.
   if (
     hasAttachment &&
     /\b(?:edit|transform|turn|convert|recreate|reimagine|restyle|enhance|upscale|change|replace|remove|add|put|place|make|generate|create|bring\s+out|render)\b.*\b(?:image|picture|photo|background|style|look\s+like|into|exactly\s+like)\b/i.test(
@@ -234,9 +241,12 @@ export async function prepareRealtimePrompt(
     input.attachmentDataUrl && input.attachmentDataUrl.startsWith('data:image/')
   );
   const mediaKind = executionPlan.requestedMediaKind;
+  const testMode = Boolean(input.testMode);
   const naturalMediaIntent =
     mediaKind ??
-    (input.forceChat ? null : detectNaturalMediaRequest(message, hasPreviousHtml, hasAttachment));
+    (input.forceChat || testMode
+      ? null
+      : detectNaturalMediaRequest(message, hasPreviousHtml, hasAttachment));
 
   // Let Gemini naturally decide between normal chat, image creation, or building an app,
   // unless the caller explicitly forces chat or resumes an interrupted build.
@@ -353,9 +363,11 @@ export async function prepareRealtimePrompt(
     secretHints,
     secretKeys,
     databaseTables,
+    testMode,
   });
 
   const activeFlags: string[] = [];
+  if (testMode) activeFlags.push('Test Mode ON (isolated __test server database)');
   if (input.reactEnabled) activeFlags.push('Rich interactive SPA views');
   if (input.backendEnabled) activeFlags.push('Persistent real-time database (`window.AICraft.db`)');
   if (input.webSearchEnabled !== false && !skipBuildSearch) {
@@ -379,6 +391,8 @@ export async function prepareRealtimePrompt(
     mode: input.mode,
     activeFlags,
     isGameBuild,
+    hasPreviousHtml,
+    testMode,
   });
 
   const historyMessages: Array<{ role: 'user' | 'assistant'; content: string }> = history
@@ -524,7 +538,10 @@ export function finalizeRealtimeOutput(
   );
   const logo = allowLogoOrPwa ? extractedLogo : null;
 
-  if (/\[\[\s*MODE\s*:\s*GENERATE\s*\]\]/i.test(cleanedRaw)) {
+  const previousHtml = typeof input.previousHtml === 'string' ? input.previousHtml : '';
+  const hasPreviousApp = previousHtml.trim().length > 150;
+
+  if (!hasPreviousApp && /\[\[\s*MODE\s*:\s*GENERATE\s*\]\]/i.test(cleanedRaw)) {
     const mediaPromptMatch = /\[\[\s*MEDIA_PROMPT\s*:\s*([^\]]+?)\s*\]\]/i.exec(cleanedRaw);
     const aiText = sanitizeBuildProse(cleanedRaw) || `Creating ${input.message}...`;
     return {
@@ -547,8 +564,6 @@ export function finalizeRealtimeOutput(
       provider,
     };
   }
-
-  const previousHtml = typeof input.previousHtml === 'string' ? input.previousHtml : '';
   const hasPatchDirective =
     previousHtml.trim().length > 0 && /<<<\s*AICRAFT_PATCH\s*>>>/i.test(cleanedRaw);
   let extractedHtml = '';

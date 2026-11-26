@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Check,
   ChevronDown,
@@ -840,6 +840,7 @@ interface ProjectDatabaseModalProps {
   secrets?: ProjectSecret[];
   codeParts?: Array<{ id: string; label: string; content: string }>;
   latestBuildFiles?: string[];
+  testMode?: boolean;
   onApplyHtmlEdit?: (nextHtml: string) => void | Promise<void>;
   onClose: () => void;
 }
@@ -866,6 +867,7 @@ export function ProjectDatabaseModal({
   databaseConfig,
   secrets = [],
   codeParts = [],
+  testMode = false,
   onApplyHtmlEdit,
   onClose,
 }: ProjectDatabaseModalProps) {
@@ -881,6 +883,52 @@ export function ProjectDatabaseModal({
   const [newRowDraft, setNewRowDraft] = useState<Record<string, string>>({});
   const [feedback, setFeedback] = useState<string | null>(null);
   const [dataRefreshTick, setDataRefreshTick] = useState(0);
+  const [serverTablesMap, setServerTablesMap] = useState<
+    Record<string, Record<string, unknown>[]>
+  >({});
+  const [serverStorageMode, setServerStorageMode] = useState<'supabase' | 'disk' | 'tmp' | null>(
+    null
+  );
+  const [syncingDb, setSyncingDb] = useState(false);
+
+  const effectiveDbAppId = testMode ? `${projectId}__test` : projectId;
+
+  const syncServerDb = useCallback(async () => {
+    if (!effectiveDbAppId) return;
+    setSyncingDb(true);
+    try {
+      const res = await fetch(
+        `/api/app-data/${encodeURIComponent(effectiveDbAppId)}`,
+        { cache: 'no-store' }
+      );
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        ok?: boolean;
+        tables?: Record<string, Record<string, unknown>[]>;
+        storageMode?: 'supabase' | 'disk' | 'tmp';
+      };
+      if (data.ok && data.tables && typeof data.tables === 'object') {
+        setServerTablesMap(data.tables);
+        if (data.storageMode) setServerStorageMode(data.storageMode);
+        try {
+          for (const [tblName, rows] of Object.entries(data.tables)) {
+            const clean = sanitizeTableName(tblName);
+            if (!clean || !Array.isArray(rows)) continue;
+            window.localStorage.setItem(
+              `aicraft_db_${effectiveDbAppId}_${clean}`,
+              JSON.stringify(rows)
+            );
+          }
+        } catch {
+          // ignore localStorage mirror errors
+        }
+      }
+    } catch {
+      // keep existing snapshot if temporarily offline
+    } finally {
+      setSyncingDb(false);
+    }
+  }, [effectiveDbAppId]);
 
   useEffect(() => {
     if (open && initialTab) {
@@ -894,11 +942,18 @@ export function ProjectDatabaseModal({
 
   useEffect(() => {
     if (!open) return;
+    void syncServerDb();
     setDataRefreshTick((n) => n + 1);
     const handleDbUpdate = (evt: Event) => {
-      const detail = (evt as CustomEvent<{ projectId?: string }>).detail;
-      if (!detail?.projectId || detail.projectId === projectId) {
+      const detail = (evt as CustomEvent<{ projectId?: string; effectiveDbAppId?: string }>)
+        .detail;
+      if (
+        !detail?.projectId ||
+        detail.projectId === projectId ||
+        detail.effectiveDbAppId === effectiveDbAppId
+      ) {
         setDataRefreshTick((n) => n + 1);
+        void syncServerDb();
       }
     };
     const handleStorage = () => {
@@ -908,13 +963,13 @@ export function ProjectDatabaseModal({
     window.addEventListener('storage', handleStorage);
     const poll = window.setInterval(() => {
       setDataRefreshTick((n) => n + 1);
-    }, 1000);
+    }, 1500);
     return () => {
       window.removeEventListener('aicraft:db-updated', handleDbUpdate);
       window.removeEventListener('storage', handleStorage);
       window.clearInterval(poll);
     };
-  }, [open, projectId]);
+  }, [open, projectId, effectiveDbAppId, syncServerDb]);
 
   useEffect(() => {
     if (!feedback) return;
@@ -940,7 +995,20 @@ export function ProjectDatabaseModal({
   const liveStoredMap = useMemo(() => {
     const map = new Map<string, { storageKey: string; rows: Record<string, unknown>[] }>();
     if (!open) return map;
-    const prefix = `aicraft_db_${projectId}_`;
+    const prefix = `aicraft_db_${effectiveDbAppId}_`;
+
+    // Real backend file/cloud rows first
+    for (const [tblName, rows] of Object.entries(serverTablesMap)) {
+      const cleanName = sanitizeTableName(tblName);
+      if (!cleanName || !Array.isArray(rows)) continue;
+      map.set(cleanName, {
+        storageKey: `${prefix}${cleanName}`,
+        rows: rows.filter(
+          (item): item is Record<string, unknown> =>
+            Boolean(item && typeof item === 'object' && !Array.isArray(item))
+        ),
+      });
+    }
 
     try {
       for (let i = 0; i < window.localStorage.length; i += 1) {
@@ -950,13 +1018,17 @@ export function ProjectDatabaseModal({
         let tableName = '';
         if (key.startsWith(prefix)) {
           tableName = sanitizeTableName(key.slice(prefix.length));
-        } else if (detected.storageKeys.includes(key)) {
+        } else if (!testMode && detected.storageKeys.includes(key)) {
           tableName = sanitizeTableName(key);
         } else {
           continue;
         }
 
         if (!tableName) continue;
+        // Prefer live server table snapshot when already fetched unless server table is empty while local has rows
+        const existingServer = map.get(tableName);
+        if (existingServer && existingServer.rows.length > 0) continue;
+
         const raw = window.localStorage.getItem(key);
         let parsed: unknown = [];
         try {
@@ -974,13 +1046,15 @@ export function ProjectDatabaseModal({
             ? (item as Record<string, unknown>)
             : { id: `row_${idx + 1}`, value: item }
         );
-        map.set(tableName, { storageKey: key, rows: normalizedRows });
+        if (!existingServer || normalizedRows.length > 0) {
+          map.set(tableName, { storageKey: key, rows: normalizedRows });
+        }
       }
     } catch {
       // ignore localStorage read failure
     }
     return map;
-  }, [open, projectId, detected.storageKeys, dataRefreshTick]);
+  }, [open, effectiveDbAppId, testMode, detected.storageKeys, serverTablesMap, dataRefreshTick]);
 
   const structuredTables = useMemo(() => {
     const merged = new Map<string, ProjectDatabaseTable>();
@@ -1174,27 +1248,48 @@ export function ProjectDatabaseModal({
     }
   };
 
-  const handleDeleteRow = (tableName: string, storageKey: string, rowId: unknown, rowIndex: number) => {
+  const handleDeleteRow = async (
+    tableName: string,
+    storageKey: string,
+    rowId: unknown,
+    rowIndex: number
+  ) => {
     try {
       const store = liveStoredMap.get(tableName);
       if (!store) return;
+      const targetId =
+        rowId !== undefined && rowId !== null ? String(rowId) : '';
       const nextRows = store.rows.filter((r, idx) =>
-        rowId !== undefined && rowId !== null ? r.id !== rowId : idx !== rowIndex
+        targetId ? String(r.id ?? '') !== targetId : idx !== rowIndex
       );
       window.localStorage.setItem(storageKey, JSON.stringify(nextRows));
+      setServerTablesMap((prev) => ({ ...prev, [tableName]: nextRows }));
       setDataRefreshTick((n) => n + 1);
+
+      if (targetId) {
+        await fetch(
+          `/api/app-data/${encodeURIComponent(effectiveDbAppId)}/${encodeURIComponent(
+            tableName
+          )}/${encodeURIComponent(targetId)}`,
+          { method: 'DELETE' }
+        ).catch(() => null);
+      }
+
       window.dispatchEvent(
-        new CustomEvent('aicraft:db-updated', { detail: { projectId, table: tableName } })
+        new CustomEvent('aicraft:db-updated', {
+          detail: { projectId, effectiveDbAppId, table: tableName },
+        })
       );
-      setFeedback(`Deleted record from "${tableName}".`);
+      setFeedback(`Deleted record from "${tableName}" on server DB.`);
     } catch {
       // ignore storage error
     }
   };
 
-  const handleInsertRow = (table: ProjectDatabaseTable) => {
+  const handleInsertRow = async (table: ProjectDatabaseTable) => {
     const storageKey =
-      liveStoredMap.get(table.name)?.storageKey || `aicraft_db_${projectId}_${table.name}`;
+      liveStoredMap.get(table.name)?.storageKey ||
+      `aicraft_db_${effectiveDbAppId}_${table.name}`;
     try {
       const existing = liveStoredMap.get(table.name)?.rows ?? [];
       const row: Record<string, unknown> = {
@@ -1214,28 +1309,67 @@ export function ProjectDatabaseModal({
           row[col.name] = rawVal;
         }
       }
-      const nextRows = [row, ...existing];
+
+      let savedRow = row;
+      try {
+        const res = await fetch(
+          `/api/app-data/${encodeURIComponent(effectiveDbAppId)}/${encodeURIComponent(
+            table.name
+          )}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ row }),
+          }
+        );
+        if (res.ok) {
+          const json = (await res.json()) as {
+            ok?: boolean;
+            row?: Record<string, unknown>;
+          };
+          if (json.ok && json.row) savedRow = json.row;
+        }
+      } catch {
+        // keep optimistic local copy if offline
+      }
+
+      const nextRows = [
+        savedRow,
+        ...existing.filter((r) => String(r.id ?? '') !== String(savedRow.id ?? '')),
+      ];
       window.localStorage.setItem(storageKey, JSON.stringify(nextRows));
+      setServerTablesMap((prev) => ({ ...prev, [table.name]: nextRows }));
       setAddingRowTable(null);
       setNewRowDraft({});
       setDataRefreshTick((n) => n + 1);
       window.dispatchEvent(
-        new CustomEvent('aicraft:db-updated', { detail: { projectId, table: table.name } })
+        new CustomEvent('aicraft:db-updated', {
+          detail: { projectId, effectiveDbAppId, table: table.name },
+        })
       );
-      setFeedback(`Added record to "${table.name}".`);
+      setFeedback(`Saved record to "${table.name}" on real backend DB.`);
     } catch {
       // ignore storage error
     }
   };
 
-  const handleClearTableRows = (tableName: string, storageKey: string) => {
+  const handleClearTableRows = async (tableName: string, storageKey: string) => {
     try {
       window.localStorage.setItem(storageKey, JSON.stringify([]));
+      setServerTablesMap((prev) => ({ ...prev, [tableName]: [] }));
       setDataRefreshTick((n) => n + 1);
+      await fetch(
+        `/api/app-data/${encodeURIComponent(effectiveDbAppId)}/${encodeURIComponent(
+          tableName
+        )}`,
+        { method: 'DELETE' }
+      ).catch(() => null);
       window.dispatchEvent(
-        new CustomEvent('aicraft:db-updated', { detail: { projectId, table: tableName } })
+        new CustomEvent('aicraft:db-updated', {
+          detail: { projectId, effectiveDbAppId, table: tableName },
+        })
       );
-      setFeedback(`Cleared records in "${tableName}".`);
+      setFeedback(`Cleared records in "${tableName}" on server DB.`);
     } catch {
       // ignore storage error
     }
@@ -1331,28 +1465,38 @@ export function ProjectDatabaseModal({
                     <span
                       aria-hidden="true"
                       className={`w-2 h-2 rounded-full shrink-0 ${
-                        isStreaming ? 'bg-[#6D4AFF] animate-pulse' : 'bg-emerald-500'
+                        isStreaming || syncingDb
+                          ? 'bg-[#6D4AFF] animate-pulse'
+                          : 'bg-emerald-500'
                       }`}
                     />
                     <span className="text-[12.5px] font-semibold text-[#0B0B0F] tabular-nums truncate">
                       {structuredTables.length}{' '}
                       {structuredTables.length === 1 ? 'table' : 'tables'} ·{' '}
                       {totalLiveRows} {totalLiveRows === 1 ? 'record' : 'records'}
+                      {testMode ? ' · Test Mode DB' : ''}
                     </span>
                   </div>
                   <span className="text-[11px] text-[#71717A] truncate pl-4">
-                    {hasSupabaseConfigured
-                      ? 'Connected to Supabase Secret + Hosted App DB'
-                      : 'Live Preview DB · Auto-persists to Hosted API when published'}
+                    {serverStorageMode === 'supabase' || hasSupabaseConfigured
+                      ? `Connected to Real Supabase + Server File DB${testMode ? ' (Test Sandbox)' : ''}`
+                      : serverStorageMode === 'disk'
+                        ? `Real Server File DB (.aicraft-data)${testMode ? ' · Isolated Test Store' : ' · Persistent'}`
+                        : `Real Server Backend DB (/api/app-data)${testMode ? ' · Isolated Test Store' : ''}`}
                   </span>
                 </div>
 
                 <button
                   type="button"
-                  onClick={() => setDataRefreshTick((n) => n + 1)}
+                  onClick={() => {
+                    void syncServerDb();
+                    setDataRefreshTick((n) => n + 1);
+                  }}
                   className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg border border-black/[0.08] bg-white hover:bg-black/[0.03] text-[12px] font-medium text-[#3F3F46] active:scale-95 transition-all shrink-0"
                 >
-                  <RefreshCw className="w-3.5 h-3.5 text-[#6D4AFF]" />
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 text-[#6D4AFF] ${syncingDb ? 'animate-spin' : ''}`}
+                  />
                   <span>Sync</span>
                 </button>
               </div>
@@ -1361,7 +1505,8 @@ export function ProjectDatabaseModal({
               <div className="flex flex-col gap-3">
                 {structuredTables.map((table) => {
                   const store = liveStoredMap.get(table.name);
-                  const storageKey = store?.storageKey || `aicraft_db_${projectId}_${table.name}`;
+                  const storageKey =
+                    store?.storageKey || `aicraft_db_${effectiveDbAppId}_${table.name}`;
                   const rows = store?.rows ?? [];
                   const isCollapsed = Boolean(collapsedTables[table.name]);
                   const isAdding = addingRowTable === table.name;

@@ -1803,8 +1803,9 @@ export function buildProjectInfraContext(params: {
   secretHints: Array<{ key: string; hint: string }>;
   secretKeys: string[];
   databaseTables: string[];
+  testMode?: boolean;
 }): string {
-  const { secretHints, secretKeys, databaseTables } = params;
+  const { secretHints, secretKeys, databaseTables, testMode = false } = params;
   const effectiveKeysSummary =
     secretHints.length > 0
       ? secretHints.map((s) => `${s.key} (${s.hint})`).join(', ')
@@ -1812,6 +1813,9 @@ export function buildProjectInfraContext(params: {
 
   return [
     'PROJECT SECRETS & REAL-TIME DATABASE INFRASTRUCTURE (CRITICAL — READ CAREFULLY):',
+    testMode
+      ? '- TEST MODE ACTIVE (`window.AICraft.testMode === true`): All Preview runtime database writes go to the isolated real server Test Mode database (`__test`), and the app should use safe test/sandbox behavior without touching live production records.'
+      : '- LIVE MODE (`window.AICraft.testMode === false`): Preview runtime database writes persist directly to the real server file & cloud project database.',
     secretHints.length > 0
       ? `- Saved project Secrets configured in this project right now (values are securely injected at runtime in Preview — NEVER ask the user to paste keys into chat): ${effectiveKeysSummary}.`
       : '- No project Secret keys saved yet. Users add any API key/token anytime via the "Secrets" button in the bottom composer toolbar (+ Add secret -> Apply changes).',
@@ -1821,9 +1825,9 @@ export function buildProjectInfraContext(params: {
       ? `- Existing structured project Database tables: ${databaseTables.join('; ')}.`
       : '- The project Database drawer automatically captures and structures real-time tables as the app is built and used.',
     '- REAL SUPABASE + GOOGLE LOGIN + REAL DATABASE WIRING: When Supabase secrets are configured in Secrets OR requested by the user: load `@supabase/supabase-js@2` via `<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>`, initialize `window.supabase.createClient(sbUrl, sbKey)` using Secrets (`getSecret` + `findSecret` fallback), wire `supabaseClient.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } })` + `onAuthStateChange` + real `supabaseClient.from(table).select/insert/update/delete`, AND sync records into `window.AICraft.db` while emitting `[[DB_SCHEMA: ...]]` lines.',
-    '- BUILT-IN REAL-TIME DATABASE API: For every app with data persistence, wire ALL views cleanly to `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, and `await window.AICraft.db.remove("table", id)`. Re-render the DOM immediately after every mutation — NEVER hardcode static mock cards that bypass the database.',
+    '- BUILT-IN REAL-TIME SERVER DATABASE API: Every app with data persistence MUST wire ALL views cleanly to `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, and `await window.AICraft.db.remove("table", id)` (which syncs straight to the real backend server file + Supabase cloud database). Re-render the DOM immediately after every mutation — NEVER hardcode static mock cards that bypass the database.',
     '- CLEAN WEB/APP DELIVERY & OPT-IN LOGO / PWA: Deliver clean, responsive apps inside the browser by default WITHOUT injecting any unsolicited app logo, custom SVG emblem, or PWA "Add to Home Screen" manifest/install UI. ONLY create a brand logo (`[[LOGO:...]]`) or enable PWA Home Screen installability (`<meta name="aicraft-pwa" content="enabled" />`) when the user explicitly asks for a logo/icon, snaps/attaches a logo picture to add to the app, or explicitly asks to make the app installable / Add to Home Screen.',
-    '- LIVE SEARCH & MEDIA GENERATION IN APPS: Inside generated apps, you can call `await window.AICraft.search(query)` (returns `{ query, results, images, videos }` with real web facts, HTTPS images, AND playable HTTPS MP4/WebM video URLs + poster images!), `await window.AICraft.ask(prompt)`, `await window.AICraft.generateImage(prompt)`, or `await window.AICraft.generateMusic(prompt)`.',
+    '- NO IMAGE GENERATION IN PREVIEW: Never invoke or depend on AI image generation inside Preview or generated apps (`window.AICraft.generateImage` is disabled in Preview). Build clean, real interactive components with inline SVGs, CSS styling, and verified real web data via `await window.AICraft.search(query)` or `await window.AICraft.ask(prompt)`.',
   ].join('\n');
 }
 
@@ -1842,6 +1846,8 @@ export function buildCraftSystemPrompt(params: {
   mode: 'mobile' | 'web';
   activeFlags: string[];
   isGameBuild?: boolean;
+  hasPreviousHtml?: boolean;
+  testMode?: boolean;
 }): string {
   const {
     mediaKind,
@@ -1858,6 +1864,8 @@ export function buildCraftSystemPrompt(params: {
     mode,
     activeFlags,
     isGameBuild = false,
+    hasPreviousHtml = false,
+    testMode = false,
   } = params;
 
   const targetLabel =
@@ -1925,9 +1933,10 @@ export function buildCraftSystemPrompt(params: {
   const buildRulesBlock = [
     'OUTPUT FORMAT & STREAMING SPEED (CRITICAL):',
     '- Never output `<think>` or XML thought tags in your text response.',
-    '- Ship working, clean, responsive apps immediately instead of writing long essays before code.',
+    '- NEVER generate standalone images inside Preview builds — focus 100% on building real, functional, interactive apps step-by-step in real time as the user requests.',
+    '- Build calmly and accurately to completion, wiring a genuine real-time backend database (`window.AICraft.db`) instead of fake static cards.',
     titleRuleForBuild,
-    '- Output 2–3 concise `[[PLAN: <step>]]` lines (e.g. `[[PLAN: Designing layout & data tables]]`, `[[PLAN: Building interactive UI & live state]]`).',
+    '- Output 2–3 concise `[[PLAN: <step>]]` lines (e.g. `[[PLAN: Designing layout & real database tables]]`, `[[PLAN: Building interactive UI & live state]]`).',
     '- Output `[[DB_SCHEMA: table(col:type, ...)]]` lines for each domain table (types: `text`, `number`, `boolean`, `timestamp`, `json`).',
     '- Write ONE short present-tense sentence saying what you are building right now (e.g. "Building your vertical short-video discovery app now..."). NEVER write past-tense "I have built..." before the code, and never include code fences/URLs in chat text.',
     '- Immediately start the app code:',
@@ -1940,7 +1949,7 @@ export function buildCraftSystemPrompt(params: {
     isGameBuild
       ? `- GAME MODE (${targetLabel}): Build a smooth, immediately playable game with a crisp HUD (Score, Best, Lives/Timer, Pause, Mute SFX via Web Audio), 60fps \`requestAnimationFrame\` canvas or responsive board, mobile touch controls (>=48px buttons/swipe) + desktop keyboard (Arrows/WASD/Space), Play Again reset, and \`window.AICraft.db\` \`scores\` persistence.`
       : `- APP ARCHITECTURE (${targetLabel}): Build a complete, real interactive app tailored accurately to the user's description — 4–5 focused interactive views/tabs using \`<section data-screen="<id>" data-screen-title="<Name>">\` (with \`[data-screen].active, [data-screen]:first-of-type { display: flex; }\` visible immediately in CSS).`,
-    '- ZERO HARDCODED STATIC MOCKUPS: Every feed, list, cart, counter, message thread, profile, search, filter, and modal must render dynamically from JavaScript state persisted in `window.AICraft.db` (`list`, `insert`, `update`, `remove`, seeded inside `DOMContentLoaded` when empty with 4–6 rich domain items). Wire configured Secrets via `window.AICraft.findSecret(...)` / `window.AICraft.getSecret(...)` (including Supabase/Paystack/Stripe if configured).',
+    '- ZERO HARDCODED STATIC MOCKUPS: Every feed, list, cart, counter, message thread, profile, search, filter, and modal must render dynamically from JavaScript state persisted in `window.AICraft.db` (`list`, `insert`, `update`, `remove`, seeded inside `DOMContentLoaded` ONLY when `await window.AICraft.db.list(table)` returns empty). Wire configured Secrets via `window.AICraft.findSecret(...)` / `window.AICraft.getSecret(...)` (including Supabase/Paystack/Stripe if configured).',
     '- VERTICAL VIDEO / TIKTOK / SOCIAL FEED LAYOUTS: Whenever building a short-video or reels feed, engineer a clean full-bleed `100dvh` vertical snap feed (`scroll-snap-type: y mandatory`, `height: 100%; flex: 1; min-height: 0; overflow-y: auto`), real playable `<video playsinline muted loop poster="...">` from verified search results or `await window.AICraft.search(topic)` with rich poster/artwork gradient fallback (never blank black frames), crisp right-side action rail (like/comment/bookmark/share persisted in `window.AICraft.db`), bottom creator overlay, and bottom navigation (`padding-bottom: max(12px, env(safe-area-inset-bottom))`).',
     '- ZERO FRAGILE EXTERNAL CDNs: Put ALL layout & styling cleanly in `<style>...</style>` and use pure inline `<svg width="20" height="20" viewBox="0 0 24 24">` icons so nothing depends on external Tailwind/Lucide CDNs. Ensure `html, body { margin:0; padding:0; width:100%; height:100%; min-height:100dvh; overflow:hidden; }` (or scrollable body for classic sites) with `flex: 1; min-height: 0;` on content areas so the middle viewport never collapses to 0px.',
     '- OPT-IN LOGO & PWA ONLY: Never invent brand logos (`[[LOGO:...]]`) or `<meta name="aicraft-pwa">` unless the user explicitly asks for a logo/icon or Home Screen installability.',
@@ -1957,6 +1966,9 @@ export function buildCraftSystemPrompt(params: {
     return [
       'You are AI Craft, a senior product engineer building live apps directly inside a Preview workspace.',
       `Real-time clock context: ${timeContext}.`,
+      testMode
+        ? 'ACTIVE RUNTIME MODE: TEST MODE ON (`window.AICraft.testMode === true`). Wire sandbox/test-friendly logic connected to the real backend test database.'
+        : '',
       projectInfraContext,
       projectMemoryContext ? `\n${projectMemoryContext}` : '',
       designBlock,
@@ -1972,6 +1984,9 @@ export function buildCraftSystemPrompt(params: {
   return [
     'You are AI Craft, a natural conversational AI partner AND a real-time full-stack app builder connected to a live Preview workspace.',
     `Real-time clock context: ${timeContext}.`,
+    testMode
+      ? 'ACTIVE RUNTIME MODE: TEST MODE ON (`window.AICraft.testMode === true`). Keep built apps connected to the isolated real Test Mode backend database and safe for live interactive testing.'
+      : '',
     projectInfraContext,
     projectMemoryContext ? `\n${projectMemoryContext}` : '',
     designBlock,
@@ -1981,10 +1996,12 @@ export function buildCraftSystemPrompt(params: {
     '1. NORMAL CONVERSATION / QUESTIONS -> Output `[[INTENT:CHAT]]` on line 1' +
       (shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]`' : '') +
       ', then reply naturally, warmly, and directly like ChatGPT (greetings, normal questions in any language, explanations, advice, feedback). Never emit HTML or fake build steps when chatting.',
-    '2. CREATE / GENERATE / EDIT STANDALONE IMAGE -> Output `[[MODE:GENERATE]]` on line 1' +
-      (shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]`' : '') +
-      ', write ONE short confirming sentence, and end with `[[MEDIA_PROMPT: <vivid exact prompt matching the request and attached image edits>]]`.',
-    '3. BUILD / EDIT / UPGRADE AN APP OR WEBSITE -> Output `[[INTENT:BUILD]]` on line 1, then follow the build contract immediately:',
+    !hasPreviousHtml && !testMode
+      ? '2. EXPLICIT STANDALONE IMAGE ART ONLY (NEVER FOR APPS OR PREVIEW) -> Only if the user explicitly asks to draw/generate a standalone artwork image (NOT an app, UI, screen, or preview), output `[[MODE:GENERATE]]` on line 1' +
+        (shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]`' : '') +
+        ', write ONE short confirming sentence, and end with `[[MEDIA_PROMPT: <vivid exact prompt matching the request>]]`.'
+      : '',
+    `${!hasPreviousHtml && !testMode ? '3' : '2'}. BUILD / EDIT / UPGRADE AN APP OR WEBSITE -> Output \`[[INTENT:BUILD]]\` on line 1, then follow the build contract immediately:`,
     buildRulesBlock,
     activeFlags.length > 0 ? `Enabled capabilities: ${activeFlags.join(', ')}.` : '',
   ]

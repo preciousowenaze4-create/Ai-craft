@@ -61,6 +61,7 @@ export async function POST(request: Request): Promise<Response> {
       databaseTables?: string[];
       clientCreditsRemaining?: number;
       needsTitle?: boolean;
+      testMode?: boolean;
       visualHints?: VisualHintsSpec | null;
     };
   };
@@ -234,6 +235,7 @@ export async function POST(request: Request): Promise<Response> {
           needsTitle: Boolean(options.needsTitle),
           reactEnabled: Boolean(options.reactEnabled),
           backendEnabled: Boolean(options.backendEnabled),
+          testMode: Boolean(options.testMode),
           attachmentName: options.attachmentName ?? null,
           attachmentDataUrl,
           attachmentText,

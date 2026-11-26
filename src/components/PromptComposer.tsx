@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUp, Globe, Paperclip, ShieldAlert, X } from 'lucide-react';
+import { ArrowUp, FlaskConical, Globe, Paperclip, ShieldAlert, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useVoiceDictation } from '../hooks/useVoiceDictation';
 import {
@@ -36,6 +36,8 @@ interface PromptComposerProps {
   modelsLoading: boolean;
   modelsError: string | null;
   isRestricted?: boolean;
+  testMode?: boolean;
+  onToggleTestMode?: () => void;
   onSelectModel: (modelId: string) => void;
   onRetryModels: () => void;
   onSubmit: (options: ComposerOptions) => void;
@@ -50,6 +52,8 @@ export function PromptComposer({
   modelsLoading,
   modelsError,
   isRestricted = false,
+  testMode = false,
+  onToggleTestMode,
   onSelectModel,
   onRetryModels,
   onSubmit,
@@ -105,6 +109,7 @@ export function PromptComposer({
       reactEnabled,
       backendEnabled,
       webSearchEnabled,
+      testMode,
       attachmentName: attachment?.name ?? null,
       attachmentDataUrl: attachment?.dataUrl ?? null,
       attachmentMimeType: attachment?.mimeType ?? null,
@@ -142,7 +147,7 @@ export function PromptComposer({
           : '0 6px 24px rgba(15, 15, 30, 0.045)',
       }}
     >
-      {models.length > 0 && (
+      {(models.length > 0 || onToggleTestMode) && (
         <div className="flex items-center justify-between gap-2 pb-1.5 mb-1 border-b border-black/[0.05]">
           <div className="flex items-center gap-2 min-w-0">
             <ProviderLogo
@@ -155,22 +160,62 @@ export function PromptComposer({
               {activeModel?.name ??
                 (modelsLoading ? 'Connecting Gemini...' : 'Gemini 4 Hydrogen')}
             </span>
-            <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10.5px] font-semibold text-indigo-700 shrink-0">
+            <span className="hidden sm:inline-flex items-center gap-1 rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10.5px] font-semibold text-indigo-700 shrink-0">
               <span className="w-1.5 h-1.5 rounded-full bg-indigo-500" />
               Gemini
             </span>
           </div>
 
           <div className="flex items-center gap-1.5 -mr-1 shrink-0">
-            <ModelSelectorPopover
-              mode={mode}
-              models={models}
-              selectedModel={selectedModel}
-              modelsLoading={modelsLoading}
-              modelsError={modelsError}
-              onSelectModel={onSelectModel}
-              onRetryModels={onRetryModels}
-            />
+            {onToggleTestMode && (
+              <button
+                type="button"
+                role="switch"
+                aria-checked={testMode}
+                aria-label="Toggle Gemini Test Mode"
+                title={
+                  testMode
+                    ? 'Test Mode ON — Isolated test database & sandboxed app runs'
+                    : 'Turn on Test Mode for isolated testing with Gemini'
+                }
+                onClick={onToggleTestMode}
+                className={`h-8 px-2 rounded-full border inline-flex items-center gap-1.5 text-[11.5px] font-medium transition-all active:scale-95 ${
+                  testMode
+                    ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                    : 'bg-white/85 border-black/[0.08] text-[#52525B] hover:bg-black/[0.03]'
+                }`}
+              >
+                <FlaskConical
+                  className={`w-3.5 h-3.5 shrink-0 ${
+                    testMode ? 'text-emerald-600' : 'text-[#71717A]'
+                  }`}
+                />
+                <span>Test</span>
+                <span
+                  aria-hidden="true"
+                  className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
+                    testMode ? 'bg-emerald-500' : 'bg-zinc-300'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${
+                      testMode ? 'translate-x-3.5' : 'translate-x-0.5'
+                    }`}
+                  />
+                </span>
+              </button>
+            )}
+            {models.length > 0 && (
+              <ModelSelectorPopover
+                mode={mode}
+                models={models}
+                selectedModel={selectedModel}
+                modelsLoading={modelsLoading}
+                modelsError={modelsError}
+                onSelectModel={onSelectModel}
+                onRetryModels={onRetryModels}
+              />
+            )}
           </div>
         </div>
       )}

@@ -12,6 +12,7 @@ import {
   Download,
   Eye,
   Film,
+  FlaskConical,
   Globe,
   Image as ImageIcon,
   KeyRound,
@@ -223,6 +224,8 @@ interface BuilderWorkspaceProps {
   onOpenUpgrade: () => void;
   autoReadEnabled?: boolean;
   isOwner?: boolean;
+  testMode?: boolean;
+  onToggleTestMode?: () => void;
 }
 
 export function BuilderWorkspace({
@@ -265,8 +268,11 @@ export function BuilderWorkspace({
   onOpenUpgrade,
   autoReadEnabled = true,
   isOwner = false,
+  testMode = false,
+  onToggleTestMode,
 }: BuilderWorkspaceProps) {
   const theme = MODE_THEMES[mode];
+  const effectiveDbAppId = testMode ? `${projectId}__test` : projectId;
   const activeTurn = turns.length > 0 ? turns[turns.length - 1] : null;
   const meshAgents = activeTurn?.agents ?? [];
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -323,6 +329,17 @@ export function BuilderWorkspace({
       // ignore iframe postMessage error
     }
   }, [visualInspectMode, previewKey]);
+
+  useEffect(() => {
+    try {
+      previewIframeRef.current?.contentWindow?.postMessage(
+        { type: 'aicraft:setTestMode', enabled: testMode },
+        '*'
+      );
+    } catch {
+      // ignore iframe postMessage error
+    }
+  }, [testMode, previewKey]);
 
   const hasWorkingTurn = useMemo(
     () => turns.some((t) => t.phase === 'understanding' || t.phase === 'building'),
@@ -481,11 +498,12 @@ export function BuilderWorkspace({
   const databaseConfigRef = useRef(databaseConfig);
   databaseConfigRef.current = databaseConfig;
 
-  // Real-time pre-hydration: extract AICraft.db tables and literal starter inserts from generated HTML
-  // so opening Database directly from the chat tab immediately reflects real built tables & records.
+  // Real-time backend file/cloud DB hydration + starter table seed sync.
+  // Mirrors server tables under effectiveDbAppId (live vs __test) and extracts any new schema/seed records.
   useEffect(() => {
-    if (!latestPreviewHtml || !projectId) return;
+    if (!effectiveDbAppId) return;
     if (isStreaming) return;
+    let cancelled = false;
 
     const cleanIdent = (raw: string) =>
       raw
@@ -496,7 +514,7 @@ export function BuilderWorkspace({
 
     const tryParseObjectLiteral = (objText: string): Record<string, unknown> | null => {
       try {
-        let jsonish = objText
+        const jsonish = objText
           .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')
           .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')
           .replace(/'((?:\\.|[^'\\])*)'/g, (_, inner: string) =>
@@ -538,325 +556,210 @@ export function BuilderWorkspace({
       colMap.set(col, { name: col, type: inferredType, required: col === 'id' });
     };
 
-    // Match direct AICraft.db.insert('table', { ... }) calls
-    const insertRegex = /AICraft\.db\.insert\(\s*['"`]([a-zA-Z0-9_-]+)['"`]\s*,\s*\{/g;
-    let m: RegExpExecArray | null;
-    while ((m = insertRegex.exec(latestPreviewHtml)) !== null) {
-      const tableName = cleanIdent(m[1] || '');
-      if (!tableName) continue;
-      const startBrace = m.index + m[0].length - 1;
-      let depth = 0;
-      let endIdx = -1;
-      let inStr: string | null = null;
-      for (let i = startBrace; i < Math.min(latestPreviewHtml.length, startBrace + 2500); i += 1) {
-        const ch = latestPreviewHtml[i];
-        if (inStr) {
-          if (ch === '\\') {
-            i += 1;
+    if (latestPreviewHtml) {
+      const insertRegex = /AICraft\.db\.insert\(\s*['"`]([a-zA-Z0-9_-]+)['"`]\s*,\s*\{/g;
+      let m: RegExpExecArray | null;
+      while ((m = insertRegex.exec(latestPreviewHtml)) !== null) {
+        const tableName = cleanIdent(m[1] || '');
+        if (!tableName) continue;
+        const startBrace = m.index + m[0].length - 1;
+        let depth = 0;
+        let endIdx = -1;
+        let inStr: string | null = null;
+        for (
+          let i = startBrace;
+          i < Math.min(latestPreviewHtml.length, startBrace + 2500);
+          i += 1
+        ) {
+          const ch = latestPreviewHtml[i];
+          if (inStr) {
+            if (ch === '\\') {
+              i += 1;
+              continue;
+            }
+            if (ch === inStr) inStr = null;
             continue;
           }
-          if (ch === inStr) inStr = null;
-          continue;
-        }
-        if (ch === '"' || ch === "'" || ch === '`') {
-          inStr = ch;
-          continue;
-        }
-        if (ch === '{') depth += 1;
-        else if (ch === '}') {
-          depth -= 1;
-          if (depth === 0) {
-            endIdx = i;
-            break;
+          if (ch === '"' || ch === "'" || ch === '`') {
+            inStr = ch;
+            continue;
+          }
+          if (ch === '{') depth += 1;
+          else if (ch === '}') {
+            depth -= 1;
+            if (depth === 0) {
+              endIdx = i;
+              break;
+            }
           }
         }
-      }
-      if (endIdx === -1) continue;
-      const rawObj = latestPreviewHtml.slice(startBrace, endIdx + 1);
-      const parsedObj = tryParseObjectLiteral(rawObj);
-      recordColumn(tableName, 'id', 'text');
-      if (parsedObj) {
-        for (const [k, v] of Object.entries(parsedObj)) {
-          recordColumn(tableName, k, v);
-        }
-        const list = tableSeeds.get(tableName) ?? [];
-        list.push({
-          id:
-            typeof parsedObj.id === 'string' && parsedObj.id
-              ? parsedObj.id
-              : `seed_${tableName}_${list.length + 1}`,
-          created_at:
-            typeof parsedObj.created_at === 'string' && parsedObj.created_at
-              ? parsedObj.created_at
-              : new Date().toISOString(),
-          ...parsedObj,
-        });
-        tableSeeds.set(tableName, list);
-      }
-      recordColumn(tableName, 'created_at', 'timestamp');
-    }
-
-    // Also capture any AICraft.db.list/update/remove table schemas
-    const callRegex = /AICraft\.db\.\w+\(\s*['"`]([a-zA-Z0-9_-]+)['"`]/g;
-    for (const callMatch of latestPreviewHtml.matchAll(callRegex)) {
-      const tableName = cleanIdent(callMatch[1] || '');
-      if (!tableName) continue;
-      recordColumn(tableName, 'id', 'text');
-      recordColumn(tableName, 'created_at', 'timestamp');
-    }
-
-    let dbMutated = false;
-    try {
-      for (const [tableName, rows] of tableSeeds.entries()) {
-        if (rows.length === 0) continue;
-        const storageKey = `aicraft_db_${projectId}_${tableName}`;
-        const existingRaw = window.localStorage.getItem(storageKey);
-        const existingParsed = existingRaw ? (JSON.parse(existingRaw) as unknown) : null;
-        if (!Array.isArray(existingParsed) || existingParsed.length === 0) {
-          window.localStorage.setItem(storageKey, JSON.stringify(rows));
-          dbMutated = true;
-        }
-      }
-    } catch {
-      // ignore storage quota errors
-    }
-
-    if (detectedColsByTable.size > 0) {
-      const currentDb = databaseConfigRef.current;
-      let changed = false;
-      const nextTables = [...currentDb.tables];
-      for (const [tableName, colMap] of detectedColsByTable.entries()) {
-        const existingIdx = nextTables.findIndex((t) => t.name === tableName);
-        if (existingIdx === -1) {
-          nextTables.push({
-            id: `tbl-${tableName}`,
-            name: tableName,
-            columns: Array.from(colMap.values()),
+        if (endIdx === -1) continue;
+        const rawObj = latestPreviewHtml.slice(startBrace, endIdx + 1);
+        const parsedObj = tryParseObjectLiteral(rawObj);
+        recordColumn(tableName, 'id', 'text');
+        if (parsedObj) {
+          for (const [k, v] of Object.entries(parsedObj)) {
+            recordColumn(tableName, k, v);
+          }
+          const list = tableSeeds.get(tableName) ?? [];
+          list.push({
+            id:
+              typeof parsedObj.id === 'string' && parsedObj.id
+                ? parsedObj.id
+                : `seed_${tableName}_${list.length + 1}`,
+            created_at:
+              typeof parsedObj.created_at === 'string' && parsedObj.created_at
+                ? parsedObj.created_at
+                : new Date().toISOString(),
+            ...parsedObj,
           });
-          changed = true;
-        } else {
-          const existing = nextTables[existingIdx];
-          const seen = new Set(existing.columns.map((c) => c.name));
-          const extra = Array.from(colMap.values()).filter((c) => !seen.has(c.name));
-          if (extra.length > 0) {
-            nextTables[existingIdx] = {
-              ...existing,
-              columns: [...existing.columns, ...extra],
-            };
-            changed = true;
-          }
+          tableSeeds.set(tableName, list);
         }
+        recordColumn(tableName, 'created_at', 'timestamp');
       }
-      if (changed) {
-        onUpdateDatabase({
-          ...currentDb,
-          enabled: true,
-          tables: nextTables,
-          updatedAt: new Date().toISOString(),
-        });
+
+      const callRegex = /AICraft\.db\.\w+\(\s*['"`]([a-zA-Z0-9_-]+)['"`]/g;
+      for (const callMatch of latestPreviewHtml.matchAll(callRegex)) {
+        const tableName = cleanIdent(callMatch[1] || '');
+        if (!tableName) continue;
+        recordColumn(tableName, 'id', 'text');
+        recordColumn(tableName, 'created_at', 'timestamp');
       }
     }
 
-    if (dbMutated) {
-      window.dispatchEvent(new CustomEvent('aicraft:db-updated', { detail: { projectId } }));
-    }
-  }, [latestPreviewHtml, projectId, isStreaming, onUpdateDatabase]);
+    const syncBackendAndSeed = async () => {
+      let dbMutated = false;
 
-  // Real-time pre-hydration: extract AICraft.db tables and literal starter inserts from generated HTML
-  // so opening Database directly from the chat tab immediately reflects real built tables & records.
-  useEffect(() => {
-    if (!latestPreviewHtml || !projectId) return;
-    if (isStreaming) return;
-
-    const cleanIdent = (raw: string) =>
-      raw
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9_]+/g, '_')
-        .replace(/^_+|_+$/g, '');
-
-    const tryParseObjectLiteral = (objText: string): Record<string, unknown> | null => {
+      // 1) Mirror starter literal seeds locally if empty
+      const seedPayload: Record<string, Record<string, unknown>[]> = {};
       try {
-        let jsonish = objText
-          .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')
-          .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')
-          .replace(/'((?:\\.|[^'\\])*)'/g, (_, inner: string) =>
-            JSON.stringify(inner.replace(/\\'/g, "'"))
-          )
-          .replace(/,\s*([}\]])/g, '$1');
-        const parsed = JSON.parse(jsonish) as unknown;
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          return parsed as Record<string, unknown>;
+        for (const [tableName, rows] of tableSeeds.entries()) {
+          if (rows.length === 0) continue;
+          seedPayload[tableName] = rows;
+          const storageKey = `aicraft_db_${effectiveDbAppId}_${tableName}`;
+          const existingRaw = window.localStorage.getItem(storageKey);
+          const existingParsed = existingRaw ? (JSON.parse(existingRaw) as unknown) : null;
+          if (!Array.isArray(existingParsed) || existingParsed.length === 0) {
+            window.localStorage.setItem(storageKey, JSON.stringify(rows));
+            dbMutated = true;
+          }
         }
       } catch {
-        // Ignore dynamic JS expressions that require runtime iframe execution
+        // ignore storage quota errors
       }
-      return null;
-    };
 
-    const tableSeeds = new Map<string, Record<string, unknown>[]>();
-    const detectedColsByTable = new Map<string, Map<string, ProjectDatabaseColumn>>();
-
-    const recordColumn = (tableName: string, key: string, sampleVal?: unknown) => {
-      const col = cleanIdent(key);
-      if (!col) return;
-      let colMap = detectedColsByTable.get(tableName);
-      if (!colMap) {
-        colMap = new Map();
-        detectedColsByTable.set(tableName, colMap);
-      }
-      if (colMap.has(col)) return;
-      const inferredType: ProjectDatabaseColumn['type'] =
-        typeof sampleVal === 'number'
-          ? 'number'
-          : typeof sampleVal === 'boolean'
-            ? 'boolean'
-            : sampleVal !== null && typeof sampleVal === 'object'
-              ? 'json'
-              : col === 'created_at' || col === 'updated_at' || col.endsWith('_at')
-                ? 'timestamp'
-                : 'text';
-      colMap.set(col, { name: col, type: inferredType, required: col === 'id' });
-    };
-
-    // Match direct AICraft.db.insert('table', { ... }) calls
-    const insertRegex = /AICraft\.db\.insert\(\s*['"`]([a-zA-Z0-9_-]+)['"`]\s*,\s*\{/g;
-    let m: RegExpExecArray | null;
-    while ((m = insertRegex.exec(latestPreviewHtml)) !== null) {
-      const tableName = cleanIdent(m[1] || '');
-      if (!tableName) continue;
-      const startBrace = m.index + m[0].length - 1;
-      let depth = 0;
-      let endIdx = -1;
-      let inStr: string | null = null;
-      for (let i = startBrace; i < Math.min(latestPreviewHtml.length, startBrace + 2500); i += 1) {
-        const ch = latestPreviewHtml[i];
-        if (inStr) {
-          if (ch === '\\') {
-            i += 1;
-            continue;
-          }
-          if (ch === inStr) inStr = null;
-          continue;
+      // 2) Seed empty tables in real backend file/cloud store + fetch canonical tables
+      try {
+        if (Object.keys(seedPayload).length > 0) {
+          await fetch(`/api/app-data/${encodeURIComponent(effectiveDbAppId)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ seedTables: seedPayload }),
+          }).catch(() => null);
         }
-        if (ch === '"' || ch === "'" || ch === '`') {
-          inStr = ch;
-          continue;
-        }
-        if (ch === '{') depth += 1;
-        else if (ch === '}') {
-          depth -= 1;
-          if (depth === 0) {
-            endIdx = i;
-            break;
+        const res = await fetch(
+          `/api/app-data/${encodeURIComponent(effectiveDbAppId)}`,
+          { cache: 'no-store' }
+        );
+        if (!cancelled && res.ok) {
+          const data = (await res.json()) as {
+            ok?: boolean;
+            tables?: Record<string, Record<string, unknown>[]>;
+          };
+          if (data.ok && data.tables && typeof data.tables === 'object') {
+            for (const [tblName, rows] of Object.entries(data.tables)) {
+              const clean = cleanIdent(tblName);
+              if (!clean || !Array.isArray(rows)) continue;
+              recordColumn(clean, 'id', 'text');
+              recordColumn(clean, 'created_at', 'timestamp');
+              for (const row of rows.slice(0, 8)) {
+                if (row && typeof row === 'object') {
+                  for (const [rk, rv] of Object.entries(row)) {
+                    recordColumn(clean, rk, rv);
+                  }
+                }
+              }
+              const storageKey = `aicraft_db_${effectiveDbAppId}_${clean}`;
+              const prevRaw = window.localStorage.getItem(storageKey);
+              const nextRaw = JSON.stringify(rows);
+              if (prevRaw !== nextRaw) {
+                window.localStorage.setItem(storageKey, nextRaw);
+                dbMutated = true;
+              }
+            }
           }
         }
+      } catch {
+        // offline or fallback to cached rows
       }
-      if (endIdx === -1) continue;
-      const rawObj = latestPreviewHtml.slice(startBrace, endIdx + 1);
-      const parsedObj = tryParseObjectLiteral(rawObj);
-      recordColumn(tableName, 'id', 'text');
-      if (parsedObj) {
-        for (const [k, v] of Object.entries(parsedObj)) {
-          recordColumn(tableName, k, v);
-        }
-        const list = tableSeeds.get(tableName) ?? [];
-        list.push({
-          id:
-            typeof parsedObj.id === 'string' && parsedObj.id
-              ? parsedObj.id
-              : `seed_${tableName}_${list.length + 1}`,
-          created_at:
-            typeof parsedObj.created_at === 'string' && parsedObj.created_at
-              ? parsedObj.created_at
-              : new Date().toISOString(),
-          ...parsedObj,
-        });
-        tableSeeds.set(tableName, list);
-      }
-      recordColumn(tableName, 'created_at', 'timestamp');
-    }
 
-    // Also capture any AICraft.db.list/update/remove table schemas
-    const callRegex = /AICraft\.db\.\w+\(\s*['"`]([a-zA-Z0-9_-]+)['"`]/g;
-    for (const callMatch of latestPreviewHtml.matchAll(callRegex)) {
-      const tableName = cleanIdent(callMatch[1] || '');
-      if (!tableName) continue;
-      recordColumn(tableName, 'id', 'text');
-      recordColumn(tableName, 'created_at', 'timestamp');
-    }
+      if (cancelled) return;
 
-    let dbMutated = false;
-    try {
-      for (const [tableName, rows] of tableSeeds.entries()) {
-        if (rows.length === 0) continue;
-        const storageKey = `aicraft_db_${projectId}_${tableName}`;
-        const existingRaw = window.localStorage.getItem(storageKey);
-        const existingParsed = existingRaw ? (JSON.parse(existingRaw) as unknown) : null;
-        if (!Array.isArray(existingParsed) || existingParsed.length === 0) {
-          window.localStorage.setItem(storageKey, JSON.stringify(rows));
-          dbMutated = true;
-        }
-      }
-    } catch {
-      // ignore storage quota errors
-    }
-
-    if (detectedColsByTable.size > 0) {
-      const currentDb = databaseConfigRef.current;
-      let changed = false;
-      const nextTables = [...currentDb.tables];
-      for (const [tableName, colMap] of detectedColsByTable.entries()) {
-        const existingIdx = nextTables.findIndex((t) => t.name === tableName);
-        if (existingIdx === -1) {
-          nextTables.push({
-            id: `tbl-${tableName}`,
-            name: tableName,
-            columns: Array.from(colMap.values()),
-          });
-          changed = true;
-        } else {
-          const existing = nextTables[existingIdx];
-          const seen = new Set(existing.columns.map((c) => c.name));
-          const extra = Array.from(colMap.values()).filter((c) => !seen.has(c.name));
-          if (extra.length > 0) {
-            nextTables[existingIdx] = {
-              ...existing,
-              columns: [...existing.columns, ...extra],
-            };
+      if (detectedColsByTable.size > 0) {
+        const currentDb = databaseConfigRef.current;
+        let changed = false;
+        const nextTables = [...currentDb.tables];
+        for (const [tableName, colMap] of detectedColsByTable.entries()) {
+          const existingIdx = nextTables.findIndex((t) => t.name === tableName);
+          if (existingIdx === -1) {
+            nextTables.push({
+              id: `tbl-${tableName}`,
+              name: tableName,
+              columns: Array.from(colMap.values()),
+            });
             changed = true;
+          } else {
+            const existing = nextTables[existingIdx];
+            const seen = new Set(existing.columns.map((c) => c.name));
+            const extra = Array.from(colMap.values()).filter((c) => !seen.has(c.name));
+            if (extra.length > 0) {
+              nextTables[existingIdx] = {
+                ...existing,
+                columns: [...existing.columns, ...extra],
+              };
+              changed = true;
+            }
           }
         }
+        if (changed) {
+          onUpdateDatabase({
+            ...currentDb,
+            enabled: true,
+            tables: nextTables,
+            updatedAt: new Date().toISOString(),
+          });
+        }
       }
-      if (changed) {
-        onUpdateDatabase({
-          ...currentDb,
-          enabled: true,
-          tables: nextTables,
-          updatedAt: new Date().toISOString(),
-        });
-      }
-    }
 
-    if (dbMutated) {
-      window.dispatchEvent(new CustomEvent('aicraft:db-updated', { detail: { projectId } }));
-    }
-  }, [latestPreviewHtml, projectId, isStreaming, onUpdateDatabase]);
+      if (dbMutated) {
+        window.dispatchEvent(
+          new CustomEvent('aicraft:db-updated', {
+            detail: { projectId, effectiveDbAppId },
+          })
+        );
+      }
+    };
+
+    void syncBackendAndSeed();
+    return () => {
+      cancelled = true;
+    };
+  }, [latestPreviewHtml, projectId, effectiveDbAppId, isStreaming, onUpdateDatabase]);
 
   const secretsFingerprint = useMemo(
     () => secrets.map((s) => `${s.key}:${s.updatedAt}`).join('|'),
     [secrets]
   );
 
-  // Inject window.AICraft bridge, per-project secrets, and scoped database runtime into Preview
+  // Inject window.AICraft bridge, per-project secrets, and scoped real database runtime into Preview
   const connectedPreviewHtml = useMemo(() => {
     if (!latestPreviewHtml) return '';
     const envMap: Record<string, string> = {};
     for (const s of secrets) {
       if (s.key) envMap[s.key] = s.value;
     }
-    const dbPrefix = `aicraft_db_${projectId}_`;
-    const kvPrefix = `aicraft_kv_${projectId}_`;
+    const dbPrefix = `aicraft_db_${effectiveDbAppId}_`;
+    const kvPrefix = `aicraft_kv_${effectiveDbAppId}_`;
     const initialDbMap: Record<string, unknown[]> = {};
     const initialKvMap: Record<string, string> = {};
     try {
@@ -886,9 +789,11 @@ export function BuilderWorkspace({
     const safeInitialDbJson = JSON.stringify(initialDbMap).replace(/</g, '\\u003c');
     const safeInitialKvJson = JSON.stringify(initialKvMap).replace(/</g, '\\u003c');
     const safeDbPrefix = JSON.stringify(dbPrefix).replace(/</g, '\\u003c');
+    const safeTestModeJson = JSON.stringify(Boolean(testMode));
     const safeDbMeta = JSON.stringify({
       enabled: databaseConfigRef.current.enabled,
       tables: databaseConfigRef.current.tables.map((t) => t.name),
+      testMode: Boolean(testMode),
     }).replace(/</g, '\\u003c');
 
     const bridgeScript = `<script>
@@ -899,6 +804,7 @@ export function BuilderWorkspace({
   var sessionKvCache = {};
   var dbPrefix = ${safeDbPrefix};
   var dbMeta = ${safeDbMeta};
+  var isTestMode = ${safeTestModeJson};
 
   // Prevent DOMException: SecurityError when generated code accesses localStorage/sessionStorage inside sandboxed srcDoc iframe
   function installSafeStorage(propName, storeObj, syncToParent) {
@@ -1035,6 +941,9 @@ export function BuilderWorkspace({
         if (document.documentElement) {
           document.documentElement.style.cursor = inspectActive ? 'crosshair' : '';
         }
+      } else if (ev.data && ev.data.type === 'aicraft:setTestMode') {
+        isTestMode = Boolean(ev.data.enabled);
+        if (window.AICraft) window.AICraft.testMode = isTestMode;
       }
     });
     document.addEventListener('mousemove', function(ev) {
@@ -1141,6 +1050,8 @@ export function BuilderWorkspace({
     window.AICraft.getSecret = getSecretFn;
     window.AICraft.hasSecret = function(key) { return Boolean(getSecretFn(key)); };
     window.AICraft.findSecret = findSecretFn;
+    window.AICraft.testMode = isTestMode;
+    window.AICraft.isTestMode = function() { return Boolean(window.AICraft && window.AICraft.testMode); };
     return;
   }
   function cleanTable(table) {
@@ -1199,7 +1110,7 @@ export function BuilderWorkspace({
           delete pending[id];
           resolve(fallbackValue);
         }
-      }, 600);
+      }, 2500);
       pending[id] = {
         timer: timer,
         resolve: function(val) { resolve(val); },
@@ -1223,7 +1134,14 @@ export function BuilderWorkspace({
     meta: dbMeta,
     list: function(table) {
       var t = cleanTable(table);
-      return Promise.resolve(readTable(t));
+      var cached = readTable(t);
+      return sendDbOp('list', { table: t }, cached).then(function(rows) {
+        if (Array.isArray(rows)) {
+          writeTable(t, rows);
+          return rows;
+        }
+        return cached;
+      });
     },
     insert: function(table, row) {
       var t = cleanTable(table);
@@ -1333,6 +1251,9 @@ export function BuilderWorkspace({
     });
   }
   function generateMedia(kind, prompt, model) {
+    if (kind === 'image') {
+      return Promise.reject(new Error('Image generation in Preview is disabled. Describe UI changes in Chat instead.'));
+    }
     return fetch('/api/media', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1417,13 +1338,17 @@ export function BuilderWorkspace({
     getSecret: getSecretFn,
     hasSecret: function(key) { return Boolean(getSecretFn(key)); },
     findSecret: findSecretFn,
+    testMode: isTestMode,
+    isTestMode: function() { return Boolean(window.AICraft && window.AICraft.testMode); },
     db: dbApi,
     pwa: pwaBridge,
     browser: browserBridge,
     ask: ask,
     chat: ask,
     search: search,
-    generateImage: function(prompt, model) { return generateMedia('image', prompt, model); },
+    generateImage: function() {
+      return Promise.reject(new Error('Image generation in Preview is disabled. Describe UI changes in Chat instead.'));
+    },
     generateMusic: function(prompt, model) { return generateMedia('music', prompt, model); },
     generateVideo: function(prompt, model) { return generateMedia('video', prompt, model); },
     edit: function(instruction) {
@@ -1436,7 +1361,7 @@ export function BuilderWorkspace({
       return latestPreviewHtml.replace(/<\/head>/i, `${bridgeScript}</head>`);
     }
     return `${bridgeScript}${latestPreviewHtml}`;
-  }, [latestPreviewHtml, secrets, projectId]);
+  }, [latestPreviewHtml, secrets, projectId, effectiveDbAppId, testMode]);
 
   // Live preview rendering: blob-URL iframe instead of srcDoc.
   // Blob documents have an opaque base URL, so we inject a <base href> to keep
@@ -1575,7 +1500,7 @@ export function BuilderWorkspace({
       }
 
       if (data.type === 'aicraft:kv' && data.op) {
-        const kvPrefix = `aicraft_kv_${projectId}_`;
+        const kvPrefix = `aicraft_kv_${effectiveDbAppId}_`;
         try {
           if (data.op === 'set' && typeof data.key === 'string') {
             window.localStorage.setItem(`${kvPrefix}${data.key}`, String(data.value ?? ''));
@@ -1601,6 +1526,7 @@ export function BuilderWorkspace({
           reactEnabled: mode === 'web',
           backendEnabled: false,
           webSearchEnabled,
+          testMode,
           attachmentName: null,
           secretKeys: secrets.map((s) => s.key),
           secretHints: buildProjectSecretHints(secrets),
@@ -1620,7 +1546,10 @@ export function BuilderWorkspace({
             .toLowerCase()
             .replace(/[^a-z0-9_]+/g, '_')
             .replace(/^_+|_+$/g, '') || 'items';
-        const storageKey = `aicraft_db_${projectId}_${cleanTable}`;
+        const storageKey = `aicraft_db_${effectiveDbAppId}_${cleanTable}`;
+        const tableEndpoint = `/api/app-data/${encodeURIComponent(
+          effectiveDbAppId
+        )}/${encodeURIComponent(cleanTable)}`;
 
         const readRows = (): Array<Record<string, unknown>> => {
           try {
@@ -1645,7 +1574,22 @@ export function BuilderWorkspace({
         let sampleRowForSchema: Record<string, unknown> | null = null;
 
         if (data.op === 'list') {
-          const rows = readRows();
+          let rows = readRows();
+          try {
+            const res = await fetch(tableEndpoint, { cache: 'no-store' });
+            if (res.ok) {
+              const json = (await res.json()) as {
+                ok?: boolean;
+                rows?: Array<Record<string, unknown>>;
+              };
+              if (json.ok && Array.isArray(json.rows)) {
+                rows = json.rows;
+                writeRows(rows);
+              }
+            }
+          } catch {
+            // fallback cleanly to local mirror if offline
+          }
           result = rows;
           if (rows.length > 0) sampleRowForSchema = rows[0];
         } else if (data.op === 'insert') {
@@ -1655,20 +1599,62 @@ export function BuilderWorkspace({
             created_at: new Date().toISOString(),
             ...(data.row && typeof data.row === 'object' ? data.row : {}),
           };
-          const deduped = rows.filter((r) => r.id !== item.id);
-          deduped.unshift(item);
+          let persistedItem = item;
+          try {
+            const res = await fetch(tableEndpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ row: item }),
+            });
+            if (res.ok) {
+              const json = (await res.json()) as {
+                ok?: boolean;
+                row?: Record<string, unknown>;
+              };
+              if (json.ok && json.row) persistedItem = json.row;
+            }
+          } catch {
+            // keep local mirror if offline
+          }
+          const deduped = rows.filter((r) => r.id !== persistedItem.id);
+          deduped.unshift(persistedItem);
           writeRows(deduped);
-          result = item;
-          sampleRowForSchema = item;
+          result = persistedItem;
+          sampleRowForSchema = persistedItem;
         } else if (data.op === 'update') {
+          const targetId = String(data.rowId || '').trim();
           let updated: Record<string, unknown> | null = null;
+          if (targetId) {
+            try {
+              const res = await fetch(
+                `${tableEndpoint}/${encodeURIComponent(targetId)}`,
+                {
+                  method: 'PATCH',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    patch: data.patch && typeof data.patch === 'object' ? data.patch : {},
+                  }),
+                }
+              );
+              if (res.ok) {
+                const json = (await res.json()) as {
+                  ok?: boolean;
+                  row?: Record<string, unknown> | null;
+                };
+                if (json.ok && json.row) updated = json.row;
+              }
+            } catch {
+              // keep local mirror if offline
+            }
+          }
           const nextRows = readRows().map((r) => {
             if (r.id === data.rowId) {
-              updated = {
+              const mergedRow = updated || {
                 ...r,
                 ...(data.patch && typeof data.patch === 'object' ? data.patch : {}),
               };
-              return updated;
+              updated = mergedRow;
+              return mergedRow;
             }
             return r;
           });
@@ -1676,11 +1662,18 @@ export function BuilderWorkspace({
           result = updated;
           if (updated) sampleRowForSchema = updated;
         } else if (data.op === 'remove') {
+          const targetId = String(data.rowId || '').trim();
           const nextRows = readRows().filter((r) => r.id !== data.rowId);
           writeRows(nextRows);
+          if (targetId) {
+            await fetch(`${tableEndpoint}/${encodeURIComponent(targetId)}`, {
+              method: 'DELETE',
+            }).catch(() => null);
+          }
           result = true;
         } else if (data.op === 'clear') {
           writeRows([]);
+          await fetch(tableEndpoint, { method: 'DELETE' }).catch(() => null);
           result = true;
         }
 
@@ -1743,7 +1736,9 @@ export function BuilderWorkspace({
         }
 
         window.dispatchEvent(
-          new CustomEvent('aicraft:db-updated', { detail: { projectId, table: cleanTable } })
+          new CustomEvent('aicraft:db-updated', {
+            detail: { projectId, effectiveDbAppId, table: cleanTable },
+          })
         );
         replyTarget?.postMessage(
           { type: 'aicraft:reply', id: data.id, data: result },
@@ -1914,6 +1909,7 @@ export function BuilderWorkspace({
   }, [
     authHeaders,
     credits,
+    effectiveDbAppId,
     mode,
     onCheckCanUseAi,
     onPaymentRequired,
@@ -1923,6 +1919,7 @@ export function BuilderWorkspace({
     projectId,
     secrets,
     selectedModel,
+    testMode,
     webSearchEnabled,
   ]);
 
@@ -2001,6 +1998,7 @@ export function BuilderWorkspace({
     reactEnabled: mode === 'web',
     backendEnabled: databaseConfig.enabled && databaseConfig.tables.length > 0,
     webSearchEnabled,
+    testMode,
     attachmentName: overrides?.attachmentName ?? null,
     attachmentDataUrl: overrides?.attachmentDataUrl ?? null,
     attachmentMimeType: overrides?.attachmentMimeType ?? null,
@@ -2197,6 +2195,44 @@ export function BuilderWorkspace({
                 <Smartphone className="w-4 h-4" />
               )}
             </button>
+
+            {/* Test Mode Switch */}
+            {onToggleTestMode && (
+              <button
+                type="button"
+                role="switch"
+                aria-checked={testMode}
+                onClick={onToggleTestMode}
+                aria-label="Toggle Gemini Test Mode"
+                title={
+                  testMode
+                    ? 'Test Mode ON — Using isolated test database'
+                    : 'Turn on Test Mode'
+                }
+                className={`h-8 px-2.5 rounded-full border flex items-center justify-center gap-1.5 text-[11.5px] font-semibold transition-all shrink-0 active:scale-95 ${
+                  testMode
+                    ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                    : 'bg-white border-black/[0.08] text-[#52525B] hover:bg-black/[0.04]'
+                }`}
+              >
+                <FlaskConical
+                  className={`w-3.5 h-3.5 ${testMode ? 'text-emerald-600' : 'text-[#71717A]'}`}
+                />
+                <span className="hidden sm:inline">Test</span>
+                <span
+                  aria-hidden="true"
+                  className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
+                    testMode ? 'bg-emerald-500' : 'bg-zinc-300'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${
+                      testMode ? 'translate-x-3.5' : 'translate-x-0.5'
+                    }`}
+                  />
+                </span>
+              </button>
+            )}
 
             {/* Visual Inspector Toggle */}
             <button
@@ -3488,7 +3524,7 @@ export function BuilderWorkspace({
               isRestricted ? 'border-amber-400/70' : 'border-black/[0.1]'
             }`}
           >
-            {models.length > 0 && (
+            {(models.length > 0 || onToggleTestMode) && (
               <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-black/[0.05]">
                 <div className="flex items-center gap-2 min-w-0">
                   <ProviderLogo
@@ -3502,21 +3538,63 @@ export function BuilderWorkspace({
                     {activeModel?.name ??
                       (modelsLoading ? 'Connecting Gemini...' : 'Gemini 4 Hydrogen')}
                   </span>
-                  <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10.5px] font-semibold text-indigo-700 shrink-0">
+                  <span className="hidden sm:inline-flex items-center gap-1 rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10.5px] font-semibold text-indigo-700 shrink-0">
                     <span className="w-1.5 h-1.5 rounded-full bg-indigo-500" />
                     Gemini
                   </span>
                 </div>
-                <ModelSelectorPopover
-                  mode={mode}
-                  models={models}
-                  selectedModel={selectedModel}
-                  modelsLoading={modelsLoading}
-                  modelsError={modelsError}
-                  isStreaming={isStreaming}
-                  onSelectModel={onSelectModel}
-                  onRetryModels={onRetryModels}
-                />
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {onToggleTestMode && (
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={testMode}
+                      aria-label="Toggle Gemini Test Mode"
+                      title={
+                        testMode
+                          ? 'Test Mode ON — Isolated test database & sandboxed app runs'
+                          : 'Turn on Test Mode for isolated testing with Gemini'
+                      }
+                      onClick={onToggleTestMode}
+                      className={`h-8 px-2 rounded-full border inline-flex items-center gap-1.5 text-[11.5px] font-medium transition-all active:scale-95 ${
+                        testMode
+                          ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                          : 'bg-white/85 border-black/[0.08] text-[#52525B] hover:bg-black/[0.03]'
+                      }`}
+                    >
+                      <FlaskConical
+                        className={`w-3.5 h-3.5 shrink-0 ${
+                          testMode ? 'text-emerald-600' : 'text-[#71717A]'
+                        }`}
+                      />
+                      <span>Test</span>
+                      <span
+                        aria-hidden="true"
+                        className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
+                          testMode ? 'bg-emerald-500' : 'bg-zinc-300'
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${
+                            testMode ? 'translate-x-3.5' : 'translate-x-0.5'
+                          }`}
+                        />
+                      </span>
+                    </button>
+                  )}
+                  {models.length > 0 && (
+                    <ModelSelectorPopover
+                      mode={mode}
+                      models={models}
+                      selectedModel={selectedModel}
+                      modelsLoading={modelsLoading}
+                      modelsError={modelsError}
+                      isStreaming={isStreaming}
+                      onSelectModel={onSelectModel}
+                      onRetryModels={onRetryModels}
+                    />
+                  )}
+                </div>
               </div>
             )}
 
@@ -3751,6 +3829,7 @@ export function BuilderWorkspace({
         secrets={secrets}
         codeParts={codeParts}
         latestBuildFiles={latestBuiltTurn?.files ?? []}
+        testMode={testMode}
         onApplyHtmlEdit={onUpdatePreviewHtml}
         onClose={() => setActiveDrawer(null)}
       />

@@ -10,12 +10,49 @@ export type AppTableRow = Record<string, unknown> & {
   updated_at?: string;
 };
 
-type AppTablesMap = Record<string, AppTableRow[]>;
+export type AppTablesMap = Record<string, AppTableRow[]>;
 
 const WORKSPACE_BUCKET = 'aicraft-user-data';
-const LOCAL_DATA_DIR = '/tmp/aicraft-app-data';
+const FALLBACK_TMP_DIR = '/tmp/aicraft-app-data';
 const memoryAppData = new Map<string, AppTablesMap>();
 const appWriteLocks = new Map<string, Promise<unknown>>();
+const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function resolveLocalDataDir(): string {
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    return FALLBACK_TMP_DIR;
+  }
+  const preferred = path.resolve(process.cwd(), '.aicraft-data', 'app-data');
+  try {
+    fs.mkdirSync(preferred, { recursive: true });
+    fs.accessSync(preferred, fs.constants.W_OK);
+    return preferred;
+  } catch {
+    return FALLBACK_TMP_DIR;
+  }
+}
+
+const LOCAL_DATA_DIR = resolveLocalDataDir();
+
+function resolveConfinedAppFilePath(appId: string): string {
+  const baseDir = path.resolve(LOCAL_DATA_DIR);
+  const safeId = sanitizeAppId(appId);
+  const targetPath = path.resolve(baseDir, `${safeId}.json`);
+  if (!targetPath.startsWith(baseDir + path.sep)) {
+    throw new Error('Invalid app database path.');
+  }
+  return targetPath;
+}
+
+function sanitizeRowPayload(raw: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw || {})) {
+    if (!key || FORBIDDEN_KEYS.has(key)) continue;
+    if (typeof value === 'function' || typeof value === 'symbol') continue;
+    out[key] = value;
+  }
+  return out;
+}
 
 function createSupabaseServiceClient() {
   const { url, serviceRoleKey } = getSupabaseConfig();
@@ -50,7 +87,7 @@ function withAppLock<T>(appId: string, fn: () => Promise<T>): Promise<T> {
 
 function readLocalAppData(appId: string): AppTablesMap | null {
   try {
-    const filePath = path.join(LOCAL_DATA_DIR, `${appId}.json`);
+    const filePath = resolveConfinedAppFilePath(appId);
     if (!fs.existsSync(filePath)) return null;
     const raw = fs.readFileSync(filePath, 'utf8');
     const parsed = raw ? (JSON.parse(raw) as unknown) : null;
@@ -63,29 +100,27 @@ function readLocalAppData(appId: string): AppTablesMap | null {
   }
 }
 
-function writeLocalAppData(appId: string, tables: AppTablesMap): void {
+function writeLocalAppData(appId: string, tables: AppTablesMap): boolean {
   try {
     fs.mkdirSync(LOCAL_DATA_DIR, { recursive: true });
-    fs.writeFileSync(
-      path.join(LOCAL_DATA_DIR, `${appId}.json`),
-      JSON.stringify(tables),
-      'utf8'
-    );
+    const filePath = resolveConfinedAppFilePath(appId);
+    fs.writeFileSync(filePath, JSON.stringify(tables, null, 2), 'utf8');
+    return true;
   } catch {
-    // ignore read-only fs
+    return false;
   }
 }
 
 async function loadAppDataMap(rawAppId: string): Promise<AppTablesMap> {
   const appId = sanitizeAppId(rawAppId);
-  const cached = memoryAppData.get(appId);
-  if (cached) return cached;
-
   const local = readLocalAppData(appId);
   if (local) {
     memoryAppData.set(appId, local);
     return local;
   }
+
+  const cached = memoryAppData.get(appId);
+  if (cached) return cached;
 
   try {
     const adminClient = createSupabaseServiceClient();
@@ -137,6 +172,81 @@ async function saveAppDataMap(rawAppId: string, tables: AppTablesMap): Promise<v
   }
 }
 
+export function getAppDataStorageMode(): string {
+  const hasCloud = Boolean(createSupabaseServiceClient());
+  const isEphemeral = LOCAL_DATA_DIR === FALLBACK_TMP_DIR;
+  if (hasCloud) {
+    return isEphemeral ? 'cloud+tmp-file' : 'file+cloud';
+  }
+  return isEphemeral ? 'tmp-file' : 'file';
+}
+
+export async function listAllAppTables(rawAppId: string): Promise<{
+  appId: string;
+  tables: AppTablesMap;
+  storageMode: string;
+}> {
+  const appId = sanitizeAppId(rawAppId);
+  const dataMap = await loadAppDataMap(appId);
+  const normalized: AppTablesMap = {};
+  for (const [tbl, rows] of Object.entries(dataMap)) {
+    const cleanTbl = sanitizeTableName(tbl);
+    normalized[cleanTbl] = Array.isArray(rows) ? rows.slice() : [];
+  }
+  return {
+    appId,
+    tables: normalized,
+    storageMode: getAppDataStorageMode(),
+  };
+}
+
+export async function seedAppTablesIfEmpty(
+  rawAppId: string,
+  seedTables: Record<string, Record<string, unknown>[]>
+): Promise<AppTablesMap> {
+  const appId = sanitizeAppId(rawAppId);
+  return withAppLock(appId, async () => {
+    const dataMap = await loadAppDataMap(appId);
+    let mutated = false;
+    const nowIso = new Date().toISOString();
+
+    for (const [rawTbl, rawRows] of Object.entries(seedTables || {})) {
+      if (!Array.isArray(rawRows) || rawRows.length === 0) continue;
+      const table = sanitizeTableName(rawTbl);
+      const existing = Array.isArray(dataMap[table]) ? dataMap[table] : [];
+      if (existing.length > 0) continue;
+
+      const normalizedRows: AppTableRow[] = [];
+      for (let i = 0; i < Math.min(rawRows.length, 200); i += 1) {
+        const rawRow = rawRows[i];
+        if (!rawRow || typeof rawRow !== 'object' || Array.isArray(rawRow)) continue;
+        const cleanPayload = sanitizeRowPayload(rawRow as Record<string, unknown>);
+        const id =
+          typeof cleanPayload.id === 'string' && cleanPayload.id.trim()
+            ? cleanPayload.id.trim().slice(0, 120)
+            : `seed_${table}_${i + 1}`;
+        normalizedRows.push({
+          ...cleanPayload,
+          id,
+          created_at:
+            typeof cleanPayload.created_at === 'string' && cleanPayload.created_at.trim()
+              ? cleanPayload.created_at
+              : nowIso,
+        });
+      }
+      if (normalizedRows.length > 0) {
+        dataMap[table] = normalizedRows;
+        mutated = true;
+      }
+    }
+
+    if (mutated) {
+      await saveAppDataMap(appId, dataMap);
+    }
+    return dataMap;
+  });
+}
+
 export async function listAppTableRows(
   rawAppId: string,
   rawTable: string
@@ -155,20 +265,21 @@ export async function insertAppTableRow(
 ): Promise<AppTableRow> {
   const appId = sanitizeAppId(rawAppId);
   const table = sanitizeTableName(rawTable);
+  const cleanPayload = sanitizeRowPayload(payload);
   return withAppLock(appId, async () => {
     const dataMap = await loadAppDataMap(appId);
     const existing = Array.isArray(dataMap[table]) ? dataMap[table].slice() : [];
     const providedId =
-      typeof payload.id === 'string' && payload.id.trim()
-        ? payload.id.trim().slice(0, 120)
+      typeof cleanPayload.id === 'string' && cleanPayload.id.trim()
+        ? cleanPayload.id.trim().slice(0, 120)
         : `rec_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const nowIso = new Date().toISOString();
     const row: AppTableRow = {
-      ...payload,
+      ...cleanPayload,
       id: providedId,
       created_at:
-        typeof payload.created_at === 'string' && payload.created_at.trim()
-          ? payload.created_at
+        typeof cleanPayload.created_at === 'string' && cleanPayload.created_at.trim()
+          ? cleanPayload.created_at
           : nowIso,
     };
     const nextRows = [row, ...existing.filter((r) => r && r.id !== row.id)].slice(0, 1000);
@@ -186,6 +297,7 @@ export async function updateAppTableRow(
 ): Promise<AppTableRow | null> {
   const appId = sanitizeAppId(rawAppId);
   const table = sanitizeTableName(rawTable);
+  const cleanPatch = sanitizeRowPayload(patch);
   return withAppLock(appId, async () => {
     const dataMap = await loadAppDataMap(appId);
     const existing = Array.isArray(dataMap[table]) ? dataMap[table] : [];
@@ -194,7 +306,7 @@ export async function updateAppTableRow(
       if (row && row.id === rowId) {
         updated = {
           ...row,
-          ...patch,
+          ...cleanPatch,
           id: row.id,
           created_at: row.created_at,
           updated_at: new Date().toISOString(),

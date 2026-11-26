@@ -160,6 +160,7 @@ export interface ComposerOptions {
   clientCreditsRemaining?: number;
   needsTitle?: boolean;
   forceChat?: boolean;
+  testMode?: boolean;
 }
 
 /** Live status of one of the 3 parallel build agents (free AI mesh). */

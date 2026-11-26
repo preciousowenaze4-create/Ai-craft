@@ -56,9 +56,12 @@ import {
 } from './api/_appsStore.js';
 import {
   clearAppTableRows,
+  getAppDataStorageMode,
   insertAppTableRow,
+  listAllAppTables,
   listAppTableRows,
   removeAppTableRow,
+  seedAppTablesIfEmpty,
   updateAppTableRow,
 } from './api/_appDataStore.js';
 
@@ -1777,10 +1780,35 @@ async function startServer() {
     });
   });
 
+  app.get('/api/app-data/:appId', async (req, res) => {
+    const result = await listAllAppTables(req.params.appId || '');
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      ok: true,
+      appId: result.appId,
+      storageMode: result.storageMode,
+      tables: result.tables,
+    });
+  });
+
+  app.post('/api/app-data/:appId', async (req, res) => {
+    const body =
+      req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+        ? (req.body as Record<string, unknown>)
+        : {};
+    const seedTables =
+      body.seedTables && typeof body.seedTables === 'object' && !Array.isArray(body.seedTables)
+        ? (body.seedTables as Record<string, Record<string, unknown>[]>)
+        : {};
+    const tables = await seedAppTablesIfEmpty(req.params.appId || '', seedTables);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, tables, storageMode: getAppDataStorageMode() });
+  });
+
   app.get('/api/app-data/:appId/:table', async (req, res) => {
     const rows = await listAppTableRows(req.params.appId || '', req.params.table || 'items');
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ ok: true, rows });
+    res.json({ ok: true, rows, storageMode: getAppDataStorageMode() });
   });
 
   app.post('/api/app-data/:appId/:table', async (req, res) => {
@@ -1794,7 +1822,7 @@ async function startServer() {
       payload
     );
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ ok: true, row });
+    res.json({ ok: true, row, storageMode: getAppDataStorageMode() });
   });
 
   app.patch('/api/app-data/:appId/:table/:rowId', async (req, res) => {
@@ -3003,6 +3031,7 @@ async function startServer() {
         databaseTables?: string[];
         clientCreditsRemaining?: number;
         needsTitle?: boolean;
+        testMode?: boolean;
         clientClassification?: Record<string, unknown> | null;
         visualHints?: VisualHintsSpec | null;
       };
@@ -3271,6 +3300,7 @@ async function startServer() {
         needsTitle: Boolean(options.needsTitle),
         reactEnabled: Boolean(options.reactEnabled),
         backendEnabled: Boolean(options.backendEnabled),
+        testMode: Boolean(options.testMode),
         attachmentName: options.attachmentName ?? null,
         attachmentDataUrl,
         attachmentText,

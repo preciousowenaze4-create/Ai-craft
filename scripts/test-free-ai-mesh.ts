@@ -263,5 +263,77 @@ assert(
   'getSafeStreamingProse must keep pre-code prose clean once HTML starts'
 );
 
+// --- 9: real server file DB, preview image guard, & test mode prompt ------
+const {
+  insertAppTableRow,
+  listAllAppTables,
+  listAppTableRows,
+  updateAppTableRow,
+  removeAppTableRow,
+  seedAppTablesIfEmpty,
+  clearAppTableRows,
+} = await import('../api/_appDataStore.js');
+const { buildCraftSystemPrompt, buildProjectInfraContext } = await import(
+  '../api/_builderCore.js'
+);
+const { detectNaturalMediaRequest, prepareRealtimePrompt } = await import(
+  '../api/_realtimeEngine.js'
+);
+
+const dbTestAppId = `unit_test_app_${Date.now()}__test`;
+const inserted = await insertAppTableRow(dbTestAppId, 'videos', {
+  title: 'Morning Run',
+  likes: 4,
+});
+assert(inserted.title === 'Morning Run', 'insertAppTableRow must persist row payload');
+const tablesSnapshot = await listAllAppTables(dbTestAppId);
+assert(
+  Array.isArray(tablesSnapshot.tables.videos) && tablesSnapshot.tables.videos.length === 1,
+  'listAllAppTables must read persisted disk table rows'
+);
+const updatedRow = await updateAppTableRow(dbTestAppId, 'videos', String(inserted.id), {
+  likes: 9,
+});
+assert(updatedRow?.likes === 9, 'updateAppTableRow must update persisted row');
+await seedAppTablesIfEmpty(dbTestAppId, {
+  videos: [{ title: 'Should not overwrite' }],
+  comments: [{ author: 'Ada', body: 'Nice clip' }],
+});
+const videosAfterSeed = await listAppTableRows(dbTestAppId, 'videos');
+const commentsAfterSeed = await listAppTableRows(dbTestAppId, 'comments');
+assert(videosAfterSeed.length === 1 && videosAfterSeed[0]?.likes === 9, 'seedAppTablesIfEmpty must preserve existing rows');
+assert(commentsAfterSeed.length === 1, 'seedAppTablesIfEmpty must seed empty tables');
+await removeAppTableRow(dbTestAppId, 'videos', String(inserted.id));
+await clearAppTableRows(dbTestAppId, 'videos');
+await clearAppTableRows(dbTestAppId, 'comments');
+
+assert(
+  detectNaturalMediaRequest('Generate an image for my TikTok app preview feed', false) === null,
+  'detectNaturalMediaRequest must ignore app/preview build prompts'
+);
+assert(
+  detectNaturalMediaRequest('Generate an image of a sunset', true) === null,
+  'detectNaturalMediaRequest must return null when an app already exists in Preview'
+);
+const testInfra = buildProjectInfraContext({
+  secretKeys: [],
+  secretHints: [],
+  databaseTables: ['videos(id:text,title:text)'],
+  testMode: true,
+});
+assert(/TEST MODE ACTIVE/i.test(testInfra), 'buildProjectInfraContext must inject Test Mode status');
+assert(/NO IMAGE GENERATION IN PREVIEW/i.test(testInfra), 'buildProjectInfraContext must forbid image generation in Preview');
+
+const testPromptPrep = await prepareRealtimePrompt({
+  message: 'Build a clean vertical video feed screen',
+  mode: 'mobile',
+  testMode: true,
+  previousHtml: '<html><body><main>existing</main></body></html>',
+});
+assert(
+  !/\[\[MODE:GENERATE\]\]/.test(testPromptPrep.systemPrompt),
+  'buildCraftSystemPrompt must omit [[MODE:GENERATE]] inside existing app/Test Mode builds'
+);
+
 console.log('ALL GEMINI ENGINE TESTS PASSED');
 process.exit(0);

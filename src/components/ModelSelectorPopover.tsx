@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Check, Loader2, RefreshCw } from 'lucide-react';
+import { Check, ChevronDown, Loader2, RefreshCw } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { BuildMode, MODE_THEMES, OpenRouterModel } from '../types/craft';
 import { ProviderLogo } from './ProviderLogo';
@@ -119,32 +119,31 @@ export function ModelSelectorPopover({
         aria-haspopup="listbox"
         aria-label={
           activeModel
-            ? `Switch AI Craft model (current: ${activeModel.name})`
-            : 'Switch AI Craft model'
+            ? `Switch Gemini AI model (current: ${activeModel.name})`
+            : 'Switch Gemini AI model'
         }
-        title={activeModel ? activeModel.name : 'Switch AI Craft model'}
-        className={`w-8 h-8 rounded-full flex items-center justify-center transition-all duration-150 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6] ${
+        title={activeModel ? `Switch model · ${activeModel.name}` : 'Switch Gemini AI model'}
+        className={`h-8 px-2.5 rounded-full border inline-flex items-center gap-1 text-[11.5px] font-medium transition-all duration-150 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6] ${
           open
-            ? 'text-[#0B0B0F]'
-            : 'text-[#52525B] hover:text-[#0B0B0F]'
+            ? 'border-black/[0.15] text-[#0B0B0F]'
+            : 'border-black/[0.08] bg-white/85 text-[#3F3F46] hover:bg-black/[0.03] hover:text-[#0B0B0F]'
         }`}
-        style={{
-          backgroundColor: open
-            ? mode === 'mobile'
-              ? 'rgba(253, 230, 138, 0.55)'
-              : 'rgba(245, 208, 254, 0.55)'
-            : 'transparent',
-        }}
+        style={
+          open
+            ? {
+                backgroundColor:
+                  mode === 'mobile'
+                    ? 'rgba(253, 230, 138, 0.55)'
+                    : 'rgba(245, 208, 254, 0.55)',
+              }
+            : undefined
+        }
       >
-        <span
+        <span>Switch</span>
+        <ChevronDown
           aria-hidden="true"
-          className="font-display font-semibold text-[16px] leading-none lowercase select-none -mt-0.5 transition-transform duration-150"
-          style={{
-            transform: open ? 'rotate(180deg)' : 'rotate(0deg)',
-          }}
-        >
-          v
-        </span>
+          className={`w-3.5 h-3.5 transition-transform duration-150 ${open ? 'rotate-180' : ''}`}
+        />
       </button>
 
       <AnimatePresence>
@@ -155,13 +154,13 @@ export function ModelSelectorPopover({
             exit={{ opacity: 0, y: 6, scale: 0.96 }}
             transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
             role="dialog"
-            aria-label="Choose AI Craft model"
+            aria-label="Choose Gemini AI model"
             style={dynamicPanelStyle}
-            className="absolute right-0 bottom-full mb-2 z-50 w-[min(284px,calc(100vw-3rem))] rounded-[18px] border backdrop-blur-xl overflow-hidden flex flex-col"
+            className="absolute right-0 bottom-full mb-2 z-50 w-[min(290px,calc(100vw-3rem))] rounded-[18px] border backdrop-blur-xl overflow-hidden flex flex-col"
           >
             <div className="px-2.5 pt-2.5 pb-2 border-b border-black/[0.08] flex items-center justify-between gap-2">
               <span className="font-display font-semibold text-[12.5px] text-[#0B0B0F] tracking-[-0.01em] px-0.5">
-                AI Craft Models
+                Switch Gemini Model
               </span>
               <div className="flex items-center gap-1.5">
                 <span className="text-[11px] text-[#52525B] tabular-nums">

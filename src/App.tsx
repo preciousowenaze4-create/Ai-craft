@@ -86,6 +86,7 @@ const STORAGE_AUTOREAD_KEY = 'aicraft_autoread_v1';
 const STORAGE_TRANSACTIONS_KEY = 'aicraft_transactions_v1';
 const STORAGE_CREDITED_REFS_KEY = 'aicraft_credited_refs_v1';
 const STORAGE_LAST_USER_KEY = 'aicraft_last_user_v1';
+const STORAGE_TEST_MODE_KEY = 'aicraft_test_mode_v1';
 
 function isProjectWorking(project: CraftProject | null | undefined): boolean {
   return Boolean(
@@ -435,6 +436,9 @@ export default function App() {
   const [autoReadEnabled, setAutoReadEnabled] = useState<boolean>(() =>
     loadSavedBoolean(STORAGE_AUTOREAD_KEY, true)
   );
+  const [testMode, setTestMode] = useState<boolean>(() =>
+    loadSavedBoolean(STORAGE_TEST_MODE_KEY, false)
+  );
   const [showProUpgrade, setShowProUpgrade] = useState(false);
   const [showTemplatesModal, setShowTemplatesModal] = useState(false);
   const [dynamicColorEnabled, setDynamicColorEnabled] = useState(true);
@@ -495,6 +499,14 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
     }, 6500);
     return () => window.clearTimeout(t);
   }, [inAppAlert]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STORAGE_TEST_MODE_KEY, testMode ? '1' : '0');
+    } catch {
+      // ignore storage write error
+    }
+  }, [testMode]);
 
   const isOwnerUser = Boolean(authUser?.isOwner || billing?.isOwner);
 
@@ -2541,6 +2553,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
             reactEnabled: project.mode === 'web',
             backendEnabled: false,
             webSearchEnabled: true,
+            testMode,
             attachmentName: turn.attachmentName,
             attachmentDataUrl: turn.attachmentDataUrl ?? null,
             secretKeys: projectSecrets.map((s) => s.key),
@@ -2889,6 +2902,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
       [],
       {
         ...options,
+        testMode: options.testMode ?? testMode,
         clientCreditsRemaining: credits,
         needsTitle: true,
       },
@@ -2969,6 +2983,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
         reactEnabled: template.mode === 'web',
         backendEnabled: true,
         webSearchEnabled: true,
+        testMode,
         attachmentName: null,
         clientCreditsRemaining: credits,
         needsTitle: false,
@@ -3142,6 +3157,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
     const projectSecrets = activeProject.secrets ?? [];
     const enrichedOptions: ComposerOptions = {
       ...options,
+      testMode: options.testMode ?? testMode,
       secretKeys: options.secretKeys ?? projectSecrets.map((s) => s.key),
       secretHints: options.secretHints ?? buildProjectSecretHints(projectSecrets),
       clientCreditsRemaining: options.clientCreditsRemaining ?? credits,
@@ -3221,6 +3237,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
       reactEnabled: activeProject.mode === 'web',
       backendEnabled: false,
       webSearchEnabled: true,
+      testMode,
       attachmentName: pausedTurn.attachmentName ?? null,
       attachmentDataUrl: pausedTurn.attachmentDataUrl ?? null,
       secretKeys: projectSecrets.map((s) => s.key),
@@ -3925,6 +3942,8 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
             isOwner={isOwnerUser}
             isVerified={Boolean(authUser?.verified)}
             isRestricted={Boolean(authUser?.restricted)}
+            testMode={testMode}
+            onToggleTestMode={() => setTestMode((v) => !v)}
           />
         </>
       ) : (
@@ -4027,6 +4046,8 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                   modelsLoading={modelsLoading}
                   modelsError={modelsError}
                   isRestricted={Boolean(authUser?.restricted)}
+                  testMode={testMode}
+                  onToggleTestMode={() => setTestMode((v) => !v)}
                   onSelectModel={setSelectedModel}
                   onRetryModels={() => void loadModels(true)}
                   onSubmit={handlePromptSubmit}
