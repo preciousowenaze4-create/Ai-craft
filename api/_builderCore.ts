@@ -664,16 +664,18 @@ export function stripReasoningTags(raw: string): string {
     /<(?:think[a-z0-9_-]*|thought)\b[^>]*>[\s\S]*?<\/(?:think[a-z0-9_-]*|thought)\b[^>]*>\s*/gi,
     ''
   );
-  // 2. Remove malformed single-line header variants like `<thinkt Architectural Summary):\n` (no `>`)
+  // 2. Remove malformed single-line header variants like `<thinkt Architectural Summary):\n`
   cleaned = cleaned.replace(
-    /<(?:think[a-z0-9_-]*|thought)\b(?![^>\n]*>)[^\n]*(?:\n+|$)/gi,
+    /<(?:think[a-z0-9_-]*|thought)\b[^\n]*\n?/gi,
     ''
   );
   // 3. Remove any trailing unclosed `<think...>` block started before output markers
-  const openThinkIdx = cleaned.search(/<(?:think[a-z0-9_-]*|thought)\b[^>]*>/i);
+  const openThinkIdx = cleaned.search(/<(?:think[a-z0-9_-]*|thought)\b/i);
   if (openThinkIdx !== -1) {
     cleaned = cleaned.slice(0, openThinkIdx);
   }
+  // 4. Remove any orphaned thinking prefixes like `[Thinking: ...]`
+  cleaned = cleaned.replace(/\[(?:thinking|thought)[^\]]*\]\s*/gi, '');
   return cleaned;
 }
 
@@ -1933,6 +1935,8 @@ export function buildCraftSystemPrompt(params: {
   const buildRulesBlock = [
     'OUTPUT FORMAT & STREAMING SPEED (CRITICAL):',
     '- Never output `<think>` or XML thought tags in your text response.',
+    '- ZERO FAKE "APP NOT READY" OR PLACEHOLDER SCREENS: NEVER output placeholder screens (such as "App Not Ready", "Your app is still building", "Under construction", "Coming Soon") or stock photos pretending the app is building. Build the real, working, interactive application screens immediately on render 1 with real functional buttons, snap feed, and data bindings.',
+    '- SURGICAL EDITS & REMOVING SECTIONS ("remove this place"): When the user asks to remove a specific place, button, banner, or screen (e.g. "remove this place"), or modify an existing feature, do NOT reset the app or start from a blank slate. Use `<<<AICRAFT_PATCH>>>` with exact `<<<SEARCH>>>...<<<REPLACE>>>...` targeting the specific element/script, OR output the full updated HTML preserving all other existing tabs, styling, and database tables intact.',
     '- NEVER generate standalone images inside Preview builds — focus 100% on building real, functional, interactive apps step-by-step in real time as the user requests.',
     '- Build calmly and accurately to completion, wiring a genuine real-time backend database (`window.AICraft.db`) instead of fake static cards.',
     titleRuleForBuild,

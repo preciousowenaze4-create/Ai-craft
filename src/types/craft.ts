@@ -172,6 +172,15 @@ export interface MeshAgentState {
   model?: string;
 }
 
+export interface BuildToolStep {
+  id: string;
+  label: string;
+  file?: string;
+  action?: string;
+  status: 'pending' | 'running' | 'complete';
+  durationSec?: number;
+}
+
 export interface BuilderTurn {
   id: string;
   jobId?: string;
@@ -186,6 +195,7 @@ export interface BuilderTurn {
   activeAction: string;
   activeFile: string;
   files: string[];
+  toolSteps?: BuildToolStep[];
   planSteps?: string[];
   suggestions?: string[];
   aiText: string;

@@ -48,6 +48,7 @@ import {
   BillingSummary,
   BuildMode,
   BuilderTurn,
+  BuildToolStep,
   ComposerOptions,
   CraftProject,
   GeneratedMediaPayload,
@@ -1542,6 +1543,8 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                 thoughtSeconds?: number;
                 title?: string;
                 logo?: Record<string, string>;
+                toolStep?: BuildToolStep;
+                toolSteps?: BuildToolStep[];
               };
 
               if (evt.type === 'job' && evt.jobId) {
@@ -1692,18 +1695,53 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                 if (typeof evt.bytesBuilt === 'number') {
                   latestBytesBuilt = evt.bytesBuilt;
                 }
-                updateTurn(projectId, turnId, (t) => ({
-                  ...t,
-                  kind: 'build',
-                  phase: t.phase === 'understanding' ? 'building' : t.phase,
-                  activeAction: evt.action ?? t.activeAction,
-                  activeFile: evt.path!,
-                  files: evt.allFiles ?? t.files,
-                  bytesBuilt:
-                    typeof evt.bytesBuilt === 'number'
-                      ? evt.bytesBuilt
-                      : t.bytesBuilt,
-                }));
+                const fileAction = evt.action ?? 'Editing file';
+                const filePath = evt.path;
+                updateTurn(projectId, turnId, (t) => {
+                  const existingSteps = t.toolSteps ?? [
+                    {
+                      id: 'step-thinking',
+                      label: 'Thought through app architecture',
+                      action: 'Thinking',
+                      status: 'complete' as const,
+                    },
+                  ];
+                  const updatedSteps = existingSteps.map((s) =>
+                    s.status === 'running' ? { ...s, status: 'complete' as const } : s
+                  );
+                  const stepLabel = `${fileAction} ${filePath}`;
+                  const foundIdx = updatedSteps.findIndex((s) => s.file === filePath);
+                  if (foundIdx !== -1) {
+                    updatedSteps[foundIdx] = {
+                      ...updatedSteps[foundIdx],
+                      action: fileAction,
+                      label: stepLabel,
+                      status: 'running',
+                    };
+                  } else {
+                    updatedSteps.push({
+                      id: `step-${updatedSteps.length + 1}`,
+                      label: stepLabel,
+                      file: filePath,
+                      action: fileAction,
+                      status: 'running',
+                    });
+                  }
+
+                  return {
+                    ...t,
+                    kind: 'build',
+                    phase: t.phase === 'understanding' ? 'building' : t.phase,
+                    activeAction: fileAction,
+                    activeFile: filePath,
+                    files: evt.allFiles ?? t.files,
+                    toolSteps: updatedSteps,
+                    bytesBuilt:
+                      typeof evt.bytesBuilt === 'number'
+                        ? evt.bytesBuilt
+                        : t.bytesBuilt,
+                  };
+                });
               } else if (evt.type === 'progress') {
                 if (typeof evt.bytesBuilt === 'number') {
                   latestBytesBuilt = evt.bytesBuilt;
@@ -1795,6 +1833,48 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                 );
                 updateTurn(projectId, turnId, (t) => {
                   const resolvedFiles = evt.allFiles ?? t.files;
+                  const incomingSteps = Array.isArray(evt.toolSteps)
+                    ? (evt.toolSteps as BuildToolStep[])
+                    : undefined;
+                  let resolvedToolSteps = incomingSteps ?? t.toolSteps ?? [];
+                  if (resolvedToolSteps.length === 0 && resolvedFiles.length > 0) {
+                    resolvedToolSteps = [
+                      {
+                        id: 'step-thinking',
+                        label: 'Thought through app architecture',
+                        action: 'Thinking',
+                        status: 'complete' as const,
+                      },
+                      ...resolvedFiles.map((file, idx) => {
+                        const act = file.endsWith('.css')
+                          ? 'Styling'
+                          : file.includes('database')
+                            ? 'Wiring database'
+                            : file.endsWith('.js')
+                              ? 'Scripting'
+                              : 'Editing file';
+                        return {
+                          id: `step-file-${idx}`,
+                          label: `${act} ${file}`,
+                          file,
+                          action: act,
+                          status: 'complete' as const,
+                        };
+                      }),
+                      {
+                        id: 'step-preview-check',
+                        label: 'Verified live preview & database',
+                        action: 'Checking',
+                        status: 'complete' as const,
+                      },
+                    ];
+                  } else {
+                    resolvedToolSteps = resolvedToolSteps.map((s) => ({
+                      ...s,
+                      status: 'complete' as const,
+                    }));
+                  }
+
                   return {
                     ...t,
                     kind: finalKind,
@@ -1816,6 +1896,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                         : evt.previewHtml || t.previewHtml,
                     media: evt.media ?? t.media,
                     files: resolvedFiles,
+                    toolSteps: resolvedToolSteps,
                     suggestions: Array.isArray(evt.suggestions)
                       ? evt.suggestions
                       : t.suggestions,

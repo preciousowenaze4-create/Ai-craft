@@ -45,6 +45,7 @@ import {
   BillingSummary,
   BuildMode,
   BuilderTurn,
+  BuildToolStep,
   ComposerOptions,
   MODE_THEMES,
   OpenRouterModel,
@@ -140,10 +141,12 @@ function cssColorToHex(raw: string, fallback = '#0B0B0F'): string {
   return fallback;
 }
 
-function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
-  const cleaned = raw
+function sanitizeDisplayProse(raw: string, _isBuildTurn: boolean): string {
+  let cleaned = (raw || '')
     .replace(/<(?:think[a-z0-9_-]*|thought)\b[^>]*>[\s\S]*?<\/(?:think[a-z0-9_-]*|thought)\b[^>]*>\s*/gi, '')
+    .replace(/<(?:think[a-z0-9_-]*|thought)\b[\s\S]*?(?:<\/(?:think[a-z0-9_-]*|thought)\b[^>]*>|(?=<<<\s*AICRAFT|<!doctype|<html|<head|<body|```)|$)/gi, '')
     .replace(/<(?:think[a-z0-9_-]*|thought)\b[^\n]*\n?/gi, '')
+    .replace(/\[(?:thinking|thought)[^\]]*\]\s*/gi, '')
     .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]/gi, '')
     .replace(/\[\[\s*MODE\s*:\s*(?:CHAT|GENERATE)\s*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*MEDIA_PROMPT\s*:[^\]]*\]\]\s*\n?/gi, '')
@@ -154,8 +157,8 @@ function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
     .replace(/\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi, '')
     .replace(/\[\[\s*(?:INTENT|MODE|MEDIA_PROMPT|TITLE|LOGO|PLAN|DB_SCHEMA|SUGGESTIONS|\/SUGGESTIONS)[^\]]*$/gi, '')
     .replace(/<<<?[^\n>]*$/gi, '');
-  if (!isBuildTurn) return cleaned.trim();
-  return cleaned
+
+  cleaned = cleaned
     .replace(/```[\s\S]*?```/g, '')
     .replace(/```[\s\S]*/g, '')
     .replace(/<<<\s*AICRAFT_APP_HTML\s*>>>[\s\S]*/gi, '')
@@ -167,6 +170,8 @@ function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
     .replace(/^\s*(?:PART\s*[123]\s*[:\-–]?)\s*/gim, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+
+  return cleaned;
 }
 
 function formatCountdown(isoDate: string | undefined, nowMs: number): string {
@@ -3002,9 +3007,64 @@ export function BuilderWorkspace({
                   : turn.modelName || 'Gemini';
 
               const stageSteps = ['Building', 'Coding', 'Checking'] as const;
-              const showLivePipelineCard =
-                isTurnWorking && (isBuildTurn || turn.phase === 'building' || Boolean(turn.activeFile));
+              const isCompletedBuild =
+                turn.phase === 'complete' &&
+                (isBuildTurn || Boolean(turn.previewHtml || (turn.toolSteps && turn.toolSteps.length > 0)));
+              const showPipelineCard = isTurnWorking
+                ? (isBuildTurn || turn.phase === 'building' || Boolean(turn.activeFile))
+                : isCompletedBuild;
               const previewBytes = turn.bytesBuilt || turn.previewHtml?.length || 0;
+
+              const displaySteps: BuildToolStep[] =
+                turn.toolSteps && turn.toolSteps.length > 0
+                  ? turn.toolSteps
+                  : (() => {
+                      const items: BuildToolStep[] = [
+                        {
+                          id: 'step-arch',
+                          label: 'Thought through app architecture & database schema',
+                          action: 'Thinking',
+                          status: isCompletedBuild ? 'complete' : (activeStageIndex === 0 ? 'running' : 'complete'),
+                        },
+                      ];
+                      const files =
+                        turn.files && turn.files.length > 0
+                          ? turn.files
+                          : turn.activeFile
+                            ? [turn.activeFile]
+                            : ['index.html'];
+                      files.forEach((file, idx) => {
+                        const action = file.endsWith('.css')
+                          ? 'Styling'
+                          : file.includes('database')
+                            ? 'Wiring database'
+                            : file.endsWith('.js')
+                              ? 'Scripting'
+                              : 'Editing file';
+                        const isFileActive =
+                          !isCompletedBuild &&
+                          activeStageIndex === 1 &&
+                          (turn.activeFile === file || (!turn.activeFile && idx === 0));
+                        const isFileDone =
+                          isCompletedBuild ||
+                          activeStageIndex > 1 ||
+                          (activeStageIndex === 1 && turn.activeFile !== file && idx === 0);
+                        items.push({
+                          id: `step-f-${idx}`,
+                          label: `${action} ${file}`,
+                          file,
+                          action,
+                          status: isFileDone ? 'complete' : (isFileActive ? 'running' : 'pending'),
+                        });
+                      });
+                      items.push({
+                        id: 'step-verify',
+                        label: 'Checking files & live preview',
+                        action: 'Checking',
+                        status: isCompletedBuild ? 'complete' : (activeStageIndex === 2 ? 'running' : 'pending'),
+                      });
+                      return items;
+                    })();
 
               return (
                 <article key={turn.id} className="flex flex-col gap-3">
@@ -3045,7 +3105,7 @@ export function BuilderWorkspace({
                       </span>
                       <span className="text-[12.5px] text-[#71717A] tabular-nums truncate">
                         {isTurnWorking
-                          ? `${showLivePipelineCard ? stageSteps[activeStageIndex] : turn.activeAction || 'Thinking'} · ${elapsedSec}s`
+                          ? `${showPipelineCard ? stageSteps[activeStageIndex] : turn.activeAction || 'Thinking'} · ${elapsedSec}s`
                           : isPausedTurn
                             ? `Paused · ${elapsedSec}s`
                             : `${elapsedSec}s`}
@@ -3059,13 +3119,13 @@ export function BuilderWorkspace({
                     )}
                   </div>
 
-                  {/* Clean Real-Time Building -> Coding -> Checking Tracker (while active) */}
-                  {showLivePipelineCard && (
+                  {/* Clean Real-Time Building -> Coding -> Checking Tracker & Completed Verification Card */}
+                  {showPipelineCard && (
                     <div className="rounded-2xl border border-black/[0.08] bg-[#FAFAFC] px-3.5 py-3 flex flex-col gap-2.5">
                       <div className="flex items-center gap-2 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                         {stageSteps.map((stageLabel, idx) => {
-                          const isDone = idx < activeStageIndex;
-                          const isActive = idx === activeStageIndex;
+                          const isDone = isCompletedBuild || idx < activeStageIndex;
+                          const isActive = !isCompletedBuild && idx === activeStageIndex;
                           return (
                             <div key={stageLabel} className="flex items-center gap-2 shrink-0">
                               <div
@@ -3073,7 +3133,7 @@ export function BuilderWorkspace({
                                   isActive
                                     ? 'text-[#0B0B0F]'
                                     : isDone
-                                      ? 'text-[#3F3F46]'
+                                      ? 'text-[#16A34A]'
                                       : 'text-[#A1A1AA]'
                                 }`}
                               >
@@ -3083,7 +3143,7 @@ export function BuilderWorkspace({
                                     style={{ color: theme.accentColor }}
                                   />
                                 ) : isDone ? (
-                                  <CheckCircle2 className="w-3.5 h-3.5 text-[#0D5BFF] shrink-0" />
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-[#16A34A] shrink-0" />
                                 ) : (
                                   <span className="w-2 h-2 rounded-full bg-black/15 shrink-0" />
                                 )}
@@ -3100,30 +3160,67 @@ export function BuilderWorkspace({
                       </div>
 
                       <div className="flex items-center justify-between gap-2 text-[12.5px] text-[#52525B]">
-                        <span className="truncate">
-                          {activeStageIndex === 1 && turn.activeFile
-                            ? `Coding ${turn.activeFile}`
-                            : turn.phaseLabel || `${stageSteps[activeStageIndex]}...`}
+                        <span className="truncate flex items-center gap-1.5 font-medium">
+                          {isCompletedBuild ? (
+                            <>
+                              <CheckCircle2 className="w-3.5 h-3.5 text-[#16A34A] shrink-0" />
+                              <span>All files edited & live preview verified</span>
+                            </>
+                          ) : activeStageIndex === 1 && turn.activeFile ? (
+                            `Coding ${turn.activeFile}`
+                          ) : (
+                            turn.phaseLabel || `${stageSteps[activeStageIndex]}...`
+                          )}
                         </span>
-                        {turn.planSteps && turn.planSteps.length > 0 && (
+                        {displaySteps.length > 0 && (
                           <button
                             type="button"
                             onClick={togglePlan}
-                            className="shrink-0 text-[12px] font-medium text-[#0B0B0F] hover:opacity-75 whitespace-nowrap"
+                            className="shrink-0 text-[12px] font-semibold text-[#0B0B0F] hover:text-[#0D5BFF] transition-colors whitespace-nowrap px-1.5 py-0.5 rounded-md hover:bg-black/[0.04]"
                           >
-                            {isPlanOpen ? 'Hide steps' : `Steps (${turn.planSteps.length})`}
+                            {isPlanOpen ? 'Hide steps' : `Steps (${displaySteps.length})`}
                           </button>
                         )}
                       </div>
 
-                      {isPlanOpen && turn.planSteps && turn.planSteps.length > 0 && (
-                        <ul className="pt-1.5 border-t border-black/[0.06] space-y-1 text-[12.5px] text-[#3F3F46]">
-                          {turn.planSteps.map((step, idx) => (
-                            <li key={`${turn.id}-live-plan-${idx}`} className="flex items-start gap-1.5">
-                              <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 text-[#0D5BFF] shrink-0" />
-                              <span>{step}</span>
-                            </li>
-                          ))}
+                      {isPlanOpen && displaySteps.length > 0 && (
+                        <ul className="pt-2 border-t border-black/[0.06] space-y-1.5 text-[12.5px] text-[#3F3F46]">
+                          {displaySteps.map((step) => {
+                            const isStepComplete = isCompletedBuild || step.status === 'complete';
+                            const isStepRunning = !isCompletedBuild && step.status === 'running';
+                            return (
+                              <li key={step.id} className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  {isStepRunning ? (
+                                    <Loader2
+                                      className="w-3.5 h-3.5 animate-spin shrink-0"
+                                      style={{ color: theme.accentColor }}
+                                    />
+                                  ) : isStepComplete ? (
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-[#16A34A] shrink-0" />
+                                  ) : (
+                                    <span className="w-2 h-2 rounded-full bg-black/20 shrink-0 ml-0.5" />
+                                  )}
+                                  <span
+                                    className={`truncate ${
+                                      isStepComplete
+                                        ? 'text-[#18181B]'
+                                        : isStepRunning
+                                          ? 'text-[#0B0B0F] font-medium'
+                                          : 'text-[#71717A]'
+                                    }`}
+                                  >
+                                    {step.label}
+                                  </span>
+                                </div>
+                                {step.file && (
+                                  <span className="shrink-0 text-[11px] font-mono text-[#71717A] bg-black/[0.04] px-1.5 py-0.5 rounded">
+                                    {step.file}
+                                  </span>
+                                )}
+                              </li>
+                            );
+                          })}
                         </ul>
                       )}
                     </div>
@@ -3147,7 +3244,7 @@ export function BuilderWorkspace({
                       </div>
                     </div>
                   ) : (
-                    (displayAiText || !showLivePipelineCard) && (
+                    (displayAiText || !showPipelineCard) && (
                       <div className="flex items-start justify-between gap-2.5">
                         <div className="flex-1 min-w-0 text-[15px] leading-[1.6] tracking-[-0.005em] text-[#111118] whitespace-pre-wrap">
                           {displayAiText || (

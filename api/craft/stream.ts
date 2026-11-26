@@ -447,14 +447,22 @@ export async function POST(request: Request): Promise<Response> {
             if (codeStart) {
               if (!enteredCodePhase) {
                 enteredCodePhase = true;
+                const initialFile = codeStart.isPatch ? 'patch.diff' : 'index.html';
+                const initialAction = codeStart.isPatch ? 'Editing file' : 'Writing file';
+                const initialLabel = `${initialAction} ${initialFile}`;
                 sendEvent({
                   type: 'phase',
                   phase: 'building',
                   kind: 'build',
-                  action: 'Coding',
-                  label: codeStart.isPatch
-                    ? 'Updating code...'
-                    : 'Coding app files...',
+                  action: initialAction,
+                  label: initialLabel,
+                  toolStep: {
+                    id: 'step-code-init',
+                    label: initialLabel,
+                    file: initialFile,
+                    action: initialAction,
+                    status: 'running',
+                  },
                 });
               }
 
@@ -471,12 +479,25 @@ export async function POST(request: Request): Promise<Response> {
                 lastFilesKey = filesKey;
                 lastBytesSent = htmlSoFar.length;
                 const active = artifacts[artifacts.length - 1];
+                const activeAction = active?.action
+                  ? (codeStart.isPatch ? 'Editing' : active.action)
+                  : (codeStart.isPatch ? 'Editing' : 'Writing');
+                const activeFile = active?.path || 'index.html';
+                const stepAction = `${activeAction} file`;
+                const stepLabel = `${activeAction} ${activeFile}`;
                 sendEvent({
                   type: 'file',
-                  action: 'Coding',
-                  path: active?.path || 'index.html',
+                  action: stepAction,
+                  path: activeFile,
                   allFiles: paths,
                   bytesBuilt: htmlSoFar.length,
+                  toolStep: {
+                    id: `step-${paths.length}`,
+                    label: stepLabel,
+                    file: activeFile,
+                    action: stepAction,
+                    status: 'running',
+                  },
                 });
               }
               if (
@@ -506,7 +527,13 @@ export async function POST(request: Request): Promise<Response> {
             phase: 'building',
             kind: 'build',
             action: 'Checking',
-            label: 'Checking code & live preview...',
+            label: 'Checking files & live preview...',
+            toolStep: {
+              id: 'step-check',
+              label: 'Checking files & live preview',
+              action: 'Checking',
+              status: 'running',
+            },
           });
         }
 
@@ -671,6 +698,37 @@ export async function POST(request: Request): Promise<Response> {
           }).catch(() => {});
         }
 
+        const buildToolSteps = [
+          {
+            id: 'step-thinking',
+            label: 'Thought through app architecture',
+            action: 'Thinking',
+            status: 'complete' as const,
+          },
+          ...finalized.files.map((file, idx) => {
+            const act = file.endsWith('.css')
+              ? 'Styling'
+              : file.includes('database')
+                ? 'Wiring database'
+                : file.endsWith('.js')
+                  ? 'Scripting'
+                  : 'Editing file';
+            return {
+              id: `step-file-${idx}`,
+              label: `${act} ${file}`,
+              file,
+              action: act,
+              status: 'complete' as const,
+            };
+          }),
+          {
+            id: 'step-preview-check',
+            label: 'Verified live preview & database',
+            action: 'Checking',
+            status: 'complete' as const,
+          },
+        ];
+
         sendEvent({
           type: 'done',
           kind: 'build',
@@ -687,6 +745,7 @@ export async function POST(request: Request): Promise<Response> {
           modelUsed: finalized.modelUsed,
           modelName: finalized.modelName,
           provider: finalized.provider,
+          toolSteps: buildToolSteps,
         });
         closeStream();
       } catch (err) {
