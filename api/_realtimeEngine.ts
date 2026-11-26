@@ -3,8 +3,6 @@ import {
   buildCraftSystemPrompt,
   buildFocusedSearchQuery,
   buildProjectInfraContext,
-  buildSmartFollowUpSuggestions,
-  classifyInitialRoute,
   deriveServerSessionTitle,
   extractDbSchemaFromHtml,
   extractDbSchemaFromRaw,
@@ -31,17 +29,9 @@ import {
   type SearchVideoItem,
 } from './_builderCore.js';
 import { GoogleGenAI } from '@google/genai';
-import {
-  buildGatewayExecutionPlan,
-  hasServerFreeAiKey,
-  markApiKeyInvalidCooldown,
-  markGatewayCandidateCooldown,
-  resolveDynamicGeminiExecutionMatrix,
-} from './_aiGateways.js';
-import { recordGeminiApiUsage } from './_geminiUsage.js';
+import { buildGatewayExecutionPlan } from './_aiGateways.js';
 import {
   completeFreeAiMesh,
-  isAgentRouterConfigured,
   isFreeAiMeshAvailable,
   isMeshParallelBuildsEnabled,
   streamFreeAiMesh,
@@ -56,87 +46,6 @@ export function createGeminiClient(apiKey: string): GoogleGenAI {
       },
     },
   });
-}
-
-function extractReadableErrorMessage(err: unknown): string {
-  let msg =
-    err instanceof Error
-      ? err.message
-      : typeof err === 'string'
-        ? err
-        : 'AI Craft engine request failed.';
-  for (let depth = 0; depth < 3; depth += 1) {
-    const trimmed = msg.trim();
-    if (!trimmed.startsWith('{')) break;
-    try {
-      const parsed = JSON.parse(trimmed) as {
-        message?: string;
-        error?: { message?: string } | string;
-      };
-      if (typeof parsed.error === 'string' && parsed.error.trim()) {
-        msg = parsed.error;
-        continue;
-      }
-      if (
-        parsed.error &&
-        typeof parsed.error === 'object' &&
-        typeof parsed.error.message === 'string' &&
-        parsed.error.message.trim()
-      ) {
-        msg = parsed.error.message;
-        continue;
-      }
-      if (typeof parsed.message === 'string' && parsed.message.trim()) {
-        msg = parsed.message;
-        continue;
-      }
-    } catch {
-      break;
-    }
-    break;
-  }
-  return msg.trim();
-}
-
-function isInvalidApiKeyError(rawLower: string): boolean {
-  return (
-    rawLower.includes('api_key_invalid') ||
-    rawLower.includes('api key not valid') ||
-    rawLower.includes('api key expired') ||
-    rawLower.includes('reported as leaked') ||
-    rawLower.includes('consumer_suspended') ||
-    rawLower.includes('project has been suspended')
-  );
-}
-
-function isModelRetiredOrUnavailableError(rawLower: string): boolean {
-  return (
-    rawLower.includes('not_found') ||
-    rawLower.includes('404') ||
-    rawLower.includes('not found') ||
-    rawLower.includes('no longer available') ||
-    rawLower.includes('is deprecated') ||
-    rawLower.includes('deprecated') ||
-    rawLower.includes('retired') ||
-    rawLower.includes('shut down') ||
-    rawLower.includes('shutdown') ||
-    rawLower.includes('update your code') ||
-    rawLower.includes('is not supported for') ||
-    rawLower.includes('permission_denied') ||
-    rawLower.includes('403') ||
-    rawLower.includes('paid tier') ||
-    rawLower.includes('billing')
-  );
-}
-
-function isThinkingConfigRejectedError(rawLower: string): boolean {
-  return (
-    rawLower.includes('thinking') ||
-    rawLower.includes('thinkinglevel') ||
-    rawLower.includes('thinkingbudget') ||
-    rawLower.includes('includethoughts') ||
-    (rawLower.includes('invalid_argument') && rawLower.includes('config'))
-  );
 }
 
 export interface VisualHintsSpec {
@@ -208,9 +117,7 @@ export function detectNaturalMediaRequest(
 }
 
 /**
- * Hidden Backend Design Architect Engine (powered by Gemini 2.5 Pro).
- * Runs automatically behind the scenes when building or designing an app,
- * producing a concise UI/UX visual blueprint for the active builder model.
+ * Backend UI/UX Design Architect pass powered by AgentRouter.
  */
 async function runBackendDesignArchitect(params: {
   message: string;
@@ -221,105 +128,36 @@ async function runBackendDesignArchitect(params: {
   visualHints?: VisualHintsSpec | null;
   searchQuery?: string;
 }): Promise<string> {
-  const hasGemini = hasServerFreeAiKey();
-  if (!hasGemini && !isFreeAiMeshAvailable()) return '';
-
-  const designerParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
-
-  if (params.attachmentDataUrl && params.attachmentDataUrl.startsWith('data:image/')) {
-    const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/.exec(
-      params.attachmentDataUrl
-    );
-    if (match?.[1] && match?.[2]) {
-      designerParts.push({
-        inlineData: {
-          mimeType: match[1],
-          data: match[2],
-        },
-      });
-    }
-  }
+  if (!isFreeAiMeshAvailable()) return '';
 
   const hintsText =
     params.visualHints?.dominantColor || params.visualHints?.surfaceTheme
       ? `Screenshot cues: dominant=${params.visualHints.dominantColor || 'auto'}, surface=${params.visualHints.surfaceTheme || 'auto'}, size=${params.visualHints.width || '?'}x${params.visualHints.height || '?'}.`
       : '';
 
-  designerParts.push({
-    text: [
-      `Target: ${params.mode === 'mobile' ? 'Mobile App (Android & iOS)' : 'Responsive Full-Stack Web App'}.`,
-      params.hasPreviousHtml && params.previewSummary
-        ? `Existing app context:\n${params.previewSummary.slice(0, 900)}`
-        : 'Brand new app build from scratch.',
-      hintsText,
-      params.searchQuery ? `Search topic: ${params.searchQuery}` : '',
-      `User goal: "${params.message.slice(0, 900)}"`,
-      'Produce a concise, production-ready UI/UX & data architecture blueprint in 8-10 tight bullet points covering: (1) Exact hex color tokens (background, card surface, primary accent, ink), (2) Typography & layout spacing rhythm, (3) Screen tabs/views (4-6 screens) or targeted surgical layer addition if updating an existing app, (4) Real `window.AICraft.db` tables & fields plus real interactive CRUD handlers (zero hardcoded static cards or dead buttons), (5) Do NOT invent a brand logo or PWA Home Screen setup unless the user explicitly requested one or attached a logo image. Write ONLY the blueprint — zero HTML or code blocks.',
-    ]
-      .filter(Boolean)
-      .join('\n'),
-  });
+  const userPrompt = [
+    `Target: ${params.mode === 'mobile' ? 'Mobile App (Android & iOS)' : 'Responsive Full-Stack Web App'}.`,
+    params.hasPreviousHtml && params.previewSummary
+      ? `Existing app context:\n${params.previewSummary.slice(0, 900)}`
+      : 'Brand new app build from scratch.',
+    hintsText,
+    params.searchQuery ? `Search topic: ${params.searchQuery}` : '',
+    `User goal: "${params.message.slice(0, 900)}"`,
+    'Produce a concise, production-ready UI/UX & data architecture blueprint in 8-10 tight bullet points covering: (1) Exact hex color tokens (background, card surface, primary accent, ink), (2) Typography & layout spacing rhythm, (3) Screen tabs/views (4-6 screens) or targeted surgical layer addition if updating an existing app, (4) Real `window.AICraft.db` tables & fields plus real interactive CRUD handlers (zero hardcoded static cards or dead buttons), (5) Do NOT invent a brand logo or PWA Home Screen setup unless the user explicitly requested one or attached a logo image. Write ONLY the blueprint — zero HTML or code blocks.',
+  ]
+    .filter(Boolean)
+    .join('\n');
 
   const timeoutPromise = new Promise<string>((resolve) => {
     setTimeout(() => resolve(''), 4200);
   });
 
   const generatePromise = (async () => {
-    if (hasGemini) {
-      const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'design' });
-      const clientMap = new Map<string, GoogleGenAI>();
-      const badKeys = new Set<string>();
-
-      for (const candidate of candidates.slice(0, 6)) {
-        if (badKeys.has(candidate.keyFingerprint)) continue;
-        let ai = clientMap.get(candidate.apiKey);
-        if (!ai) {
-          ai = createGeminiClient(candidate.apiKey);
-          clientMap.set(candidate.apiKey, ai);
-        }
-
-        try {
-          const response = await ai.models.generateContent({
-            model: candidate.upstreamModelId,
-            contents: [{ role: 'user', parts: designerParts }],
-            config: {
-              systemInstruction:
-                'You are the internal UI/UX Design Architect inside AI Craft. Produce a crisp, practical visual design blueprint (colors, layout hierarchy, components, multi-screen structure) with zero HTML or code fences.',
-            },
-          });
-          const textOut = (response.text || '').trim().slice(0, 1400);
-          const usage = response.usageMetadata;
-          void recordGeminiApiUsage({
-            modelId: candidate.upstreamModelId,
-            promptTokens: usage?.promptTokenCount,
-            candidatesTokens: usage?.candidatesTokenCount,
-            totalTokens: usage?.totalTokenCount ?? Math.max(120, Math.ceil(textOut.length / 4)),
-            source: 'design-architect',
-          });
-          if (textOut) return textOut;
-        } catch (err) {
-          const lower = extractReadableErrorMessage(err).toLowerCase();
-          if (isInvalidApiKeyError(lower)) {
-            markApiKeyInvalidCooldown(candidate.apiKey);
-            badKeys.add(candidate.keyFingerprint);
-          } else if (isModelRetiredOrUnavailableError(lower)) {
-            markGatewayCandidateCooldown(candidate.cooldownKey, 6 * 60 * 60_000, true);
-          } else {
-            markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
-          }
-        }
-      }
-    }
-
-    // Free AI mesh fallback so the design pre-pass also runs keyless.
     const meshText = await completeFreeAiMesh({
       taskKind: 'chat',
       systemPrompt:
         'You are the internal UI/UX Design Architect inside AI Craft. Produce a crisp, practical visual design blueprint (colors, layout hierarchy, components, multi-screen structure) with zero HTML or code fences.',
-      userPrompt: designerParts
-        .map((p) => p.text || '')
-        .filter(Boolean)
-        .join('\n'),
+      userPrompt,
       attachmentDataUrl: params.attachmentDataUrl ?? null,
       timeoutMs: 3800,
     });
@@ -347,14 +185,13 @@ export async function prepareRealtimePrompt(
   const naturalMediaIntent =
     mediaKind ?? (input.forceChat ? null : detectNaturalMediaRequest(message, hasPreviousHtml));
 
-  const initialRoute = input.forceChat
+  // Let AgentRouter naturally decide between normal chat vs building an app,
+  // unless the caller explicitly forces chat or resumes an interrupted build.
+  const initialRoute: 'chat' | 'build' | 'auto' = input.forceChat
     ? 'chat'
-    : classifyInitialRoute(
-        message,
-        previousHtml,
-        input.attachmentName,
-        Boolean(input.attachmentDataUrl)
-      );
+    : /\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(message)
+      ? 'build'
+      : 'auto';
 
   const isGameBuild = initialRoute === 'build' && isGameBuildPrompt(message);
   const focusedSearchQuery = buildFocusedSearchQuery(message);
@@ -364,7 +201,7 @@ export async function prepareRealtimePrompt(
   const wantsSearch =
     input.webSearchEnabled !== false &&
     !skipBuildSearch &&
-    (initialRoute !== 'chat' || shouldRunChatSearch(message, hasPreviousHtml));
+    (initialRoute === 'build' || shouldRunChatSearch(message, hasPreviousHtml));
 
   const previewSummary = extractPreviewStructureSummary(previousHtml);
   const wantsFullRedesign =
@@ -381,17 +218,16 @@ export async function prepareRealtimePrompt(
   const shouldRunDesignEngine =
     !input.forceChat &&
     !naturalMediaIntent &&
-    (hasServerFreeAiKey() || isFreeAiMeshAvailable()) &&
-    initialRoute === 'build' &&
+    isFreeAiMeshAvailable() &&
     (Boolean(input.attachmentDataUrl) || wantsFullRedesign);
 
   if (wantsSearch || shouldRunDesignEngine) {
     input.onStage?.({
       phase: 'understanding',
       kind: initialRoute === 'build' ? 'build' : 'chat',
-      action: 'Building',
+      action: initialRoute === 'build' ? 'Building' : 'Thinking',
       label: wantsSearch
-        ? 'Searching references...'
+        ? 'Searching live web...'
         : 'Analyzing layout & screenshot...',
     });
   }
@@ -430,9 +266,7 @@ export async function prepareRealtimePrompt(
           : isPatchMode
             ? 'Planning update...'
             : 'Planning app layout & database...'
-        : initialRoute === 'chat'
-          ? 'Thinking...'
-          : 'Understanding request...',
+        : 'Thinking...',
   });
 
   const timeContext = [
@@ -477,13 +311,10 @@ export async function prepareRealtimePrompt(
 
   const systemPrompt = buildCraftSystemPrompt({
     mediaKind,
-    requestedModel:
-      input.requestedModel ||
-      (isAgentRouterConfigured() ? 'agentrouter::auto' : 'mesh::auto'),
-    requestedModelLabel:
-      !input.requestedModel && isAgentRouterConfigured()
-        ? 'AgentRouter · Auto (Primary Brain)'
-        : executionPlan.requestedModelLabel,
+    requestedModel: input.requestedModel || 'agentrouter::auto',
+    requestedModelLabel: !input.requestedModel
+      ? 'AgentRouter · Auto'
+      : executionPlan.requestedModelLabel,
     initialRoute,
     shouldGenerateTitle,
     timeContext,
@@ -622,9 +453,9 @@ export function finalizeRealtimeOutput(
   const cleanedRaw = stripReasoningTags(input.rawOutput || '');
   const startedAt = typeof input.startedAt === 'number' ? input.startedAt : Date.now();
   const thoughtSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-  const modelUsed = input.modelUsed || 'mesh::auto';
-  const modelName = input.modelName || 'Free AI Mesh · Auto';
-  const provider = input.provider || 'free-mesh';
+  const modelUsed = input.modelUsed || 'agentrouter::auto';
+  const modelName = input.modelName || 'AgentRouter · Auto';
+  const provider = input.provider || 'agentrouter';
 
   const explicitTitleMatch = /\[\[\s*TITLE\s*:\s*([^\]]+?)\s*\]\]/i.exec(cleanedRaw);
   const title = explicitTitleMatch?.[1]?.trim()
@@ -725,11 +556,7 @@ export function finalizeRealtimeOutput(
     extractDbSchemaFromRaw(cleanedRaw),
     extractDbSchemaFromHtml(hardenedHtml)
   );
-  const rawSuggestions = extractSuggestionsFromRaw(cleanedRaw);
-  const suggestions =
-    rawSuggestions.length > 0
-      ? rawSuggestions
-      : buildSmartFollowUpSuggestions(input.message, hardenedHtml, input.mode);
+  const suggestions = extractSuggestionsFromRaw(cleanedRaw);
 
   let aiText = sanitizeBuildProse(cleanedRaw);
   if (!aiText) {
@@ -1105,31 +932,6 @@ export async function repairIncompleteBuildHtml(params: {
   };
 
   const repairPromise = (async () => {
-    if (hasServerFreeAiKey()) {
-      const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'repair' });
-      const clientMap = new Map<string, GoogleGenAI>();
-      for (const candidate of candidates.slice(0, 5)) {
-        let ai = clientMap.get(candidate.apiKey);
-        if (!ai) {
-          ai = createGeminiClient(candidate.apiKey);
-          clientMap.set(candidate.apiKey, ai);
-        }
-        try {
-          const res = await ai.models.generateContent({
-            model: candidate.upstreamModelId,
-            contents: [{ role: 'user', parts: [{ text: repairPrompt }] }],
-          });
-          const raw = (res.text || '').trim();
-          const hardened = extractAndHarden(raw);
-          if (hardened) return hardened;
-        } catch {
-          // try next fast repair candidate
-        }
-      }
-    }
-
-    // Free AI mesh fallback (self-hosted / free-tier providers / keyless
-    // Pollinations) so repair also works with zero Gemini keys configured.
     if (isFreeAiMeshAvailable()) {
       const meshRaw = await completeFreeAiMesh({
         taskKind: 'build',

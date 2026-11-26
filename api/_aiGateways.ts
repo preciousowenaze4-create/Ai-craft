@@ -158,13 +158,14 @@ export const BACKEND_GEMINI_FAILOVER_CHAIN: ReadonlyArray<{
   { upstreamModelId: 'gemini-2.5-flash-lite', label: 'AI Craft 2.5 Lite' },
 ];
 
-/** Display labels for the free-mesh selector ids (mesh is the only engine). */
+/** Display labels for AgentRouter selector ids. */
 export const FREE_MESH_MODEL_LABELS: Record<string, string> = {
-  'mesh::auto': 'Free AI Mesh · Auto (fastest lane)',
-  'mesh::fast': 'Free AI Mesh · Fast chat',
-  'mesh::coder': 'Free AI Mesh · Code specialist',
-  'mesh::reasoning': 'Free AI Mesh · Deep reasoning',
-  'mesh::creative': 'Free AI Mesh · Creative writing',
+  'agentrouter::auto': 'AgentRouter · Auto',
+  'agentrouter::gpt-6.2-sol': 'AgentRouter · gpt-6.2-sol',
+  'agentrouter::gpt-6.2-astra': 'AgentRouter · gpt-6.2-astra',
+  'agentrouter::gpt-5.6-sol': 'AgentRouter · gpt-5.6-sol',
+  'agentrouter::gpt-6.1-sol': 'AgentRouter · gpt-6.1-sol',
+  'agentrouter::claude-opus-5-5': 'AgentRouter · claude-opus-5-5',
 };
 
 /**
@@ -645,18 +646,14 @@ export function buildGatewayExecutionPlan(params: {
   requestedModelLabel: string;
 } {
   const requested = (params.requestedModel || '').trim();
-  if (requested.startsWith('agentrouter::')) {
-    const bare = requested.slice('agentrouter::'.length).trim();
+  if (!requested || requested.startsWith('agentrouter::') || requested.startsWith('mesh::')) {
+    const bare = requested.startsWith('agentrouter::')
+      ? requested.slice('agentrouter::'.length).trim()
+      : '';
     const label =
       !bare || bare === 'auto'
-        ? 'AgentRouter · Auto (Primary Brain)'
+        ? 'AgentRouter · Auto'
         : `AgentRouter · ${bare}`;
-    return { pollinationsCandidates: [], requestedMediaKind: null, requestedModelLabel: label };
-  }
-  // The mesh is the only engine: empty id and mesh::* selector ids both
-  // resolve to free-mesh labels. Legacy gemini::* ids keep their old names.
-  if (!requested || requested.startsWith('mesh::')) {
-    const label = FREE_MESH_MODEL_LABELS[requested] || 'Free AI Mesh · Auto';
     return { pollinationsCandidates: [], requestedMediaKind: null, requestedModelLabel: label };
   }
 
@@ -669,6 +666,6 @@ export function buildGatewayExecutionPlan(params: {
   return {
     pollinationsCandidates: [],
     requestedMediaKind: null,
-    requestedModelLabel: matched ? matched.name : 'Free AI Mesh · Auto',
+    requestedModelLabel: matched ? matched.name : 'AgentRouter · Auto',
   };
 }

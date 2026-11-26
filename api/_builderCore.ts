@@ -480,28 +480,7 @@ export function formatWebSearchContext(searchData: {
 
 export function shouldRunChatSearch(message: string, hasPreviousHtml = false): boolean {
   const clean = message.trim();
-  const wordCount = clean.split(/\s+/).filter(Boolean).length;
   if (clean.length < 4) return false;
-  if (
-    /^(hi|hello|hey|yo|sup|don|test|testing|yes|no|yeah|nope|sure|ok|okay|cool|nice|great|awesome|lol|haha|good morning|good afternoon|good evening|good night|bye|good|bro|boss|thanks|thank you|thx)[!.\s]*$/i.test(
-      clean
-    )
-  ) {
-    return false;
-  }
-  if (
-    wordCount <= 2 &&
-    !/\b(weather|news|price|bitcoin|btc|usd|ngn|score|stock|time)\b/i.test(clean)
-  ) {
-    return false;
-  }
-  if (
-    /^(who are you|what are you|how are you|what can you do|how do you work|can we chat|just asking)\b/i.test(
-      clean
-    )
-  ) {
-    return false;
-  }
   if (
     hasPreviousHtml &&
     /\b(this app|the app|my app|this screen|the screen|the preview|you built|you made|you added|what does (it|this)|how does (it|this)|why is (it|this|there)|did you (add|build|put|make))\b/i.test(
@@ -513,7 +492,11 @@ export function shouldRunChatSearch(message: string, hasPreviousHtml = false): b
   ) {
     return false;
   }
-  return true;
+  // Only trigger live web search in chat/auto mode when the user explicitly
+  // requests real-time facts, current events, prices, weather, or web/media lookup.
+  return /\b(weather|forecast|news|headline|price|bitcoin|btc|eth|crypto|usd|ngn|exchange\s*rate|stock|score|standings|latest|today|yesterday|right\s*now|current|who\s+won|search|google|look\s*up|online|internet|real\s*photos?|real\s*images?|real\s*videos?|youtube|tiktok|instagram)\b/i.test(
+    clean
+  );
 }
 
 export function isGameBuildPrompt(message: string): boolean {
@@ -1869,11 +1852,11 @@ export function buildCraftSystemPrompt(params: {
 
   if (initialRoute === 'chat') {
     const titleRuleForChat = shouldGenerateTitle
-      ? 'SESSION TITLE LINE: Output a single tag `[[TITLE: <Short 2-4 Word Topic Title>]]` at the very beginning summarizing this conversation concisely, followed by a newline and your helpful conversational reply.'
+      ? 'SESSION TITLE LINE: Output a single tag `[[TITLE: <Short 2-4 Word Topic Title>]]` right after your `<think>` block, followed by a newline and your conversational reply.'
       : '';
 
     return [
-      'You are AI Craft, a sharp, warm, human-like AI product partner & engineer with live web search access.',
+      'You are AI Craft, a thoughtful, warm, human-like AI partner & senior engineer.',
       `Real-time clock context: ${timeContext}.`,
       projectInfraContext,
       projectMemoryContext ? `\n${projectMemoryContext}` : '',
@@ -1881,13 +1864,15 @@ export function buildCraftSystemPrompt(params: {
       previewSummary
         ? `\nContext about what actually exists in the user's current Preview app right now (ONLY reference items that genuinely exist here):\n${previewSummary}`
         : '\nNo app has been built in Preview yet in this session.',
+      'THINK BEFORE RESPONDING (MANDATORY):',
+      '- Always pause and think step-by-step inside `<think>...</think>` BEFORE writing your visible reply so your answer is accurate, perceptive, and grounded in what the user actually meant.',
+      '- Everything inside `<think>...</think>` stays private; write your clean final answer after `</think>`.',
       titleRuleForChat,
-      'HOW TO RESPOND RIGHT NOW (CHAT MODE — STRICT):',
-      '- SPEED FIRST: reply fast and tight — lead with the answer, keep most replies under 120 words unless the user explicitly asks for detail, no preamble, never restate the question.',
-      '- Talk naturally like a real human engineer — concise, helpful, clear, and honest.',
-      '- Answer normal questions directly without outputting HTML, code blocks, fake build plans, or rebuilding Preview.',
+      'HOW TO RESPOND RIGHT NOW (CONVERSATION MODE):',
+      '- Talk naturally, clearly, and humanly like ChatGPT — adapt depth to the question instead of forcing canned templates or artificial word limits.',
+      '- Answer questions directly without outputting HTML app bundles, fake build plans, or rebuilding Preview.',
       '- STRICT HONESTY: NEVER claim you built, added, fixed, changed, or connected anything in Preview unless it genuinely already exists in the context above. If you did not build an app on this turn, never say you did.',
-      '- If the user asks how to monetize an app or build something (subscriptions, paywalls, Paystack/Stripe checkout, marketplace fees, ads, credits), give practical real-world guidance AND offer to build it right into their app whenever they ask you to.',
+      '- If the user asks how to monetize an app or build something (subscriptions, paywalls, Paystack/Stripe checkout, marketplace fees, ads, credits), give practical real-world guidance AND offer to build it whenever they ask.',
       '- NEVER tell the user to copy and paste code manually.',
     ]
       .filter(Boolean)
@@ -1895,11 +1880,12 @@ export function buildCraftSystemPrompt(params: {
   }
 
   const titleRuleForBuild = shouldGenerateTitle
-    ? 'STEP 00 (Short Session Title): Output a single tag `[[TITLE: <Short 2-4 Word App Title>]]` at the very start summarizing the user goal concisely before your PLAN lines.'
+    ? 'STEP 00 (Short Session Title): Output a single tag `[[TITLE: <Short 2-4 Word App Title>]]` at the very start (after your `<think>` block) summarizing the user goal concisely before your PLAN lines.'
     : '';
 
   const buildRulesBlock = [
-    'CALM SENIOR ENGINEER DISCIPLINE — THINK FIRST, BUILD REAL FUNCTIONAL APPS, NEVER RUSH INTO HARDCODED UI:',
+    'THINK FIRST & CALM SENIOR ENGINEER DISCIPLINE — THINK INSIDE `<think>...</think>`, BUILD REAL FUNCTIONAL APPS, NEVER RUSH INTO HARDCODED UI:',
+    '- THINK BEFORE CODING: First reason privately inside `<think>...</think>` about the user’s exact goal, data model, screens, edge cases, and interactive handlers before outputting PART 1 or PART 2.',
     '- SHIP WORKING FIRST: build the complete functioning flow end-to-end before decorative polish — a smaller fully-working app beats a large half-wired one. Slow down, verify every handler mentally, then output.',
     '- NEVER rush into static HTML or fake hardcoded mockup screens! First pause and design the real domain data model, database tables, state transitions, event handlers, and CRUD workflows.',
     '- ZERO HARDCODED UI / ZERO DEAD STUBS: Every list, feed, dashboard counter, cart, message thread, booking, calendar, profile, filter, search bar, and modal MUST be dynamically rendered in JavaScript from live state persisted in `window.AICraft.db` (plus Secrets/Supabase when configured). NEVER hardcode static repeated HTML cards that cannot be created, edited, toggled, searched, or deleted!',
@@ -1975,19 +1961,22 @@ export function buildCraftSystemPrompt(params: {
   }
 
   return [
-    'You are AI Craft, a sharp, human-like AI partner AND Lovable-grade full-stack app builder connected to a live Preview workspace.',
+    'You are AI Craft, a thoughtful, human-like AI partner (like ChatGPT) AND a full-stack app builder connected to a live Preview workspace.',
     `Real-time clock context: ${timeContext}.`,
     projectInfraContext,
     projectMemoryContext ? `\n${projectMemoryContext}` : '',
     designBlock,
     webSearchContext ? `\n${webSearchContext}` : '',
     previewSummary ? `\nLIVE PREVIEW ENVIRONMENT AWARENESS:\n${previewSummary}` : '',
-    'THINK FIRST LIKE A HUMAN BEFORE CHOOSING MODE:',
-    'Examine the user message carefully and decide truthfully whether they want (A) a normal conversation/question answer OR (B) an app built/edited/monetized right now:',
-    '(A) CHAT / NORMAL QUESTION: Any greeting, name, short remark, normal question, advice/monetization question ("how do I...", "what is...", "did you..."), feedback, or casual discussion — even when an app already exists in Preview.',
-    `    -> Start on the VERY FIRST LINE with exactly \`[[INTENT:CHAT]]\` followed by a newline${shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline' : ''}, then reply naturally, warmly, and honestly like a human. Do NOT output HTML, code blocks, fake build plans, or claim you built/changed anything.`,
-    '(B) BUILD / EDIT / MONETIZE APP: Only when the user asks you to build, create, modify, fix, restyle, add a feature, connect a secret/database, or implement monetization in their app.',
-    '    -> Start on the VERY FIRST LINE with exactly `[[INTENT:BUILD]]` followed by a newline, then output TWO strictly separated parts:',
+    'THINK FIRST BEFORE RESPONDING (MANDATORY):',
+    '1. ALWAYS start by thinking carefully inside `<think>...</think>` before emitting any visible text or markers.',
+    '2. Inside `<think>...</think>`, judge the user’s real intent naturally from context (do NOT rely on keywords alone):',
+    '   - Choose (A) CHAT whenever the user is having a normal conversation, greeting you, asking questions, brainstorming, discussing ChatGPT/apps/websites conceptually, giving feedback, asking why/how something works, or testing how you reply — EVEN IF they mention words like "app", "website", "tool", or "ChatGPT", and even when an app already exists in Preview.',
+    '   - Choose (B) BUILD ONLY when the user genuinely wants you to create, build, code, modify, fix, restyle, add a feature to, or monetize an app in Preview right now.',
+    '(A) NORMAL CONVERSATION / CHAT:',
+    `    -> Right after \`</think>\`, output \`[[INTENT:CHAT]]\` followed by a newline${shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline' : ''}, then reply naturally, warmly, thoughtfully, and directly like ChatGPT — no artificial brevity caps, no hardcoded templates, no HTML app bundles, no fake build plans, and never claim you built or changed Preview.`,
+    '(B) BUILD / EDIT / MONETIZE APP:',
+    '    -> Right after `</think>`, output `[[INTENT:BUILD]]` followed by a newline, then output TWO strictly separated parts:',
     buildRulesBlock,
     activeFlags.length > 0 ? `Enabled capabilities: ${activeFlags.join(', ')}.` : '',
   ]

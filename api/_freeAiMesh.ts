@@ -1,55 +1,20 @@
 /**
- * AI Craft — Free AI Mesh (the ONLY chat/build engine — zero API keys needed)
+ * AI Craft — AgentRouter Brain Engine
  *
- * One ordered multi-provider failover layer over every free AI endpoint we know:
+ * Routes every chat and build request directly to the user's configured
+ * AgentRouter backend (`AGENTROUTER_API_KEY` + `AGENTROUTER_BASE_URL`).
+ * All built-in free/keyless providers (Pollinations, Groq, Cerebras, OpenRouter,
+ * Mistral, HuggingFace, GitHub, Together, DeepInfra, etc.) have been removed.
  *
- *   1. Self-hosted GPU (SELF_HOSTED_LLM_* — OpenAI-compatible / Ollama / TGI)
- *   2. Generic OpenAI-compatible (OPENAI_COMPATIBLE_BASE_URL / KEY / MODEL)
- *   3. Groq, Cerebras, OpenRouter (:free models), Mistral, HuggingFace router,
- *      GitHub Models, Together, DeepInfra — free tiers (activate when their key
- *      or an ambient token happens to exist; never required)
- *   4. Pollinations — keyless text lane, on by default with zero configuration
- *
- * The old Gemini-first path was removed: chat and build always run through
- * this mesh. Providers cooperate through the shared cooldown registry in
- * `_aiGateways` (keys `mesh:<provider>:<fp>:<model>`): a provider that
- * rate-limits is skipped instantly by every later request.
- *
- * Daily quotas: every (provider, model) pair gets `MESH_DAILY_LIMIT_PER_MODEL`
- * requests per UTC day (default 400). Quota keys are date-stamped, so limits
- * reset automatically at 00:00 UTC and an exhausted model is skipped while the
- * rest of the pool keeps serving — "if one hits limit, another continues".
- *
- * Speed:
- *  - chat walks race the top-3 candidates concurrently — first response with
- *    content wins (tight budgets: 6s first byte, 20s idle, 30s walk).
- *  - build walks stream one lane live (10s first byte, 45s idle, 65s walk);
- *    fresh builds additionally fan out to 3 parallel agents (architect +
- *    designer + engineer) inside `_realtimeEngine`.
- *
- * Concurrency & self-heal:
- *  - every HTTP call acquires a per-provider single-flight slot first
- *    (Pollinations Classic = 1 request per IP, env MESH_POLLINATIONS_CONCURRENCY),
- *    so races and parallel agents queue instead of colliding;
- *  - the chat race cancels losing lanes the moment the winner settles;
- *  - "previous request is still running" busy errors cool for ~6s only, and
- *    a walk whose candidates are ALL briefly cooling waits (bounded, env
- *    MESH_COOLDOWN_WAIT_MS) for the earliest one instead of erroring —
- *    cooldowns always expire; nothing is ever permanent.
- *
- * Design rules:
- *  - Never throws for "no provider configured" silently — callers gate on
- *    `isFreeAiMeshAvailable()`; `streamFreeAiMesh` throws typed friendly errors.
- *  - `completeFreeAiMesh` (non-streaming, repair/design/agents) never throws —
- *    null on failure, so optional sub-passes degrade instead of breaking.
- *  - Partial output already streamed ⇒ rethrow immediately (caller finalizes
- *    partial HTML exactly like the previous path did).
+ * Supports all 3 AgentRouter wire protocols seen in AgentRouter model badges:
+ *  - `/v1/chat/completions` (OpenAI Chat Completions)
+ *  - `/v1/responses` (OpenAI Responses API fallback)
+ *  - `/v1/messages` (Anthropic Claude native for `claude-*` models)
  */
 
 import {
   buildCandidateCooldownKey,
   gatewayCandidateCooldownRemainingMs,
-  isGatewayCandidateCoolingDown,
   markGatewayCandidateCooldown,
 } from './_aiGateways.js';
 import {
@@ -82,7 +47,7 @@ export class FreeAiMeshUnavailableError extends Error {
   readonly code = 'mesh_unavailable' as const;
   constructor() {
     super(
-      'No free AI engine is reachable right now. The keyless Pollinations lane is enabled by default — please retry in a few seconds.'
+      'AgentRouter API key is not configured on the backend. Add AGENTROUTER_API_KEY in your project Secrets.'
     );
     this.name = 'FreeAiMeshUnavailableError';
   }
@@ -92,15 +57,12 @@ export class FreeAiMeshAllFailedError extends Error {
   readonly code = 'mesh_all_failed' as const;
   readonly details: string[];
   constructor(details: string[]) {
-    // Keep the user-facing bubble SHORT: each detail is already capped by
-    // normalizeMeshError, but three long provider messages still made a wall
-    // of red text on mobile. Show the last two, hard-truncated.
     const tail = details
       .slice(-2)
-      .map((d) => (d.length > 110 ? `${d.slice(0, 110)}...` : d))
+      .map((d) => (d.length > 140 ? `${d.slice(0, 140)}...` : d))
       .join('; ');
     super(
-      `All free AI engines are busy or unreachable right now${tail ? ` (${tail})` : ''}. Please retry in a few seconds.`
+      `AgentRouter request failed${tail ? ` (${tail})` : ''}. Check your AgentRouter API key and try again.`
     );
     this.name = 'FreeAiMeshAllFailedError';
     this.details = details;
@@ -134,7 +96,9 @@ function cleanPastedSecret(rawValue: string | undefined): {
   if (hadAssignPrefix) {
     s = s.replace(/^(?:export\s+)?[A-Z0-9_]+\s*=\s*/i, '').trim();
   }
-  const strippedQuotes = s.replace(/^[`"'\u201c\u201d\u2018\u2019]+|[`"'\u201c\u201d\u2018\u2019;,]+$/g, '').trim();
+  const strippedQuotes = s
+    .replace(/^[`"'\u201c\u201d\u2018\u2019]+|[`"'\u201c\u201d\u2018\u2019;,]+$/g, '')
+    .trim();
   const hadQuotes = strippedQuotes !== s;
   s = strippedQuotes;
   const hadBearerPrefix = /^bearer\s+/i.test(s);
@@ -143,8 +107,6 @@ function cleanPastedSecret(rawValue: string | undefined): {
   }
   const hadWhitespace = /\s/.test(s);
   if (hadWhitespace) {
-    // If someone pasted a multi-line snippet or wrapped key, prefer an sk-... token if present,
-    // otherwise collapse internal line breaks/whitespace.
     const skMatch = s.match(/sk-[A-Za-z0-9._-]+/);
     s = skMatch ? skMatch[0] : s.replace(/\s+/g, '');
   }
@@ -157,22 +119,6 @@ function cleanPastedSecret(rawValue: string | undefined): {
     hadWhitespace,
     looksLikeUrl,
   };
-}
-
-function readEnvKey(...names: string[]): string {
-  for (const name of names) {
-    const { cleaned, looksLikeUrl } = cleanPastedSecret(process.env[name]);
-    if (!cleaned || looksLikeUrl) continue;
-    if (/^(my[_-]|your[_-]|xxx+|<|change[-_]?me|placeholder)/i.test(cleaned)) continue;
-    return cleaned;
-  }
-  return '';
-}
-
-function readEnvFlag(name: string, defaultValue = true): boolean {
-  const raw = (process.env[name] || '').trim().toLowerCase();
-  if (!raw) return defaultValue;
-  return !(raw === 'false' || raw === '0' || raw === 'off' || raw === 'no');
 }
 
 function readEnvCsv(name: string): string[] {
@@ -190,7 +136,6 @@ function readEnvNumber(name: string, defaultValue: number): number {
   return Math.floor(parsed);
 }
 
-/** Normalize a base URL to a full OpenAI-style chat-completions endpoint. */
 function toChatCompletionsUrl(rawBase: string): string {
   const base = rawBase.trim().replace(/\/+$/, '');
   if (/\/chat\/completions$/i.test(base)) return base;
@@ -198,17 +143,18 @@ function toChatCompletionsUrl(rawBase: string): string {
   return `${base}/v1/chat/completions`;
 }
 
+function toResponsesUrl(v1Origin: string): string {
+  const base = v1Origin.trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
+  return /\/v1$/i.test(base) ? `${base}/responses` : `${base}/v1/responses`;
+}
+
+function toMessagesUrl(v1Origin: string): string {
+  const base = v1Origin.trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
+  return /\/v1$/i.test(base) ? `${base}/messages` : `${base}/v1/messages`;
+}
+
 // ---------------------------------------------------------------------------
-// Abortable sleep + per-provider single-flight slots.
-//
-// Pollinations' Classic API answers ONE request at a time per IP — firing the
-// chat race (or 3 parallel build agents) at it concurrently is exactly what
-// produced "Your previous request is still running" on every attempt, which
-// then cooled every model and surfaced "all configured engines are cooling
-// down". Every mesh HTTP call now acquires its provider's slot first, so
-// concurrent walks queue instead of colliding; busy errors additionally get
-// a SHORT cooldown (see cooldownForMeshError) so the next attempt recovers
-// in seconds — cooldowns are never permanent.
+// Abortable sleep + per-provider concurrency slot
 // ---------------------------------------------------------------------------
 
 function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
@@ -231,11 +177,7 @@ function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
 
 const providerInFlight = new Map<string, number>();
 
-function providerConcurrencyLimit(providerId: string): number {
-  if (providerId === 'pollinations') {
-    // Pollinations Classic = 1 request at a time per IP (keyless).
-    return Math.max(1, readEnvNumber('MESH_POLLINATIONS_CONCURRENCY', 1));
-  }
+function providerConcurrencyLimit(): number {
   return Math.max(1, readEnvNumber('MESH_PROVIDER_CONCURRENCY', 6));
 }
 
@@ -243,7 +185,7 @@ async function acquireProviderSlot(
   providerId: string,
   signal?: AbortSignal
 ): Promise<void> {
-  const limit = providerConcurrencyLimit(providerId);
+  const limit = providerConcurrencyLimit();
   const startedAt = Date.now();
   const maxWaitMs = 120_000;
   for (;;) {
@@ -254,7 +196,7 @@ async function acquireProviderSlot(
       return;
     }
     if (Date.now() - startedAt > maxWaitMs) {
-      throw new MeshHttpError('timed out waiting for provider slot', null);
+      throw new MeshHttpError('Timed out waiting for AgentRouter slot', null);
     }
     await sleepWithSignal(120, signal);
   }
@@ -267,81 +209,8 @@ function releaseProviderSlot(providerId: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Provider registry (ordered — first healthy candidate wins)
+// AgentRouter credentials, model discovery & diagnostics
 // ---------------------------------------------------------------------------
-
-interface ResolvedMeshProvider {
-  baseUrl: string;
-  apiKey: string;
-  models: string[];
-  headers?: Record<string, string>;
-}
-
-interface MeshProviderDef {
-  id: string;
-  label: string;
-  keyless: boolean;
-  /** Reads env on every call so tests can inject config after import. */
-  resolve(): ResolvedMeshProvider | null;
-}
-
-const POLLINATIONS_FALLBACK_MODELS = FREE_MODEL_CATALOG.pollinations;
-
-let pollinationsModelsCache: { models: string[]; at: number } | null = null;
-let pollinationsRefreshInFlight = false;
-
-function schedulePollinationsModelsRefresh(baseUrl: string): void {
-  if (pollinationsRefreshInFlight) return;
-  pollinationsRefreshInFlight = true;
-  const origin = baseUrl.replace(/\/openai\/?$/i, '').replace(/\/+$/, '');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4000);
-  fetch(`${origin}/models`, { signal: controller.signal })
-    .then((res) => (res.ok ? res.json() : null))
-    .then((data: unknown) => {
-      if (!Array.isArray(data)) return;
-      const names: string[] = [];
-      for (const entry of data) {
-        const name =
-          typeof entry === 'string'
-            ? entry
-            : entry && typeof entry === 'object' && 'name' in entry
-              ? String((entry as { name: unknown }).name || '')
-              : '';
-        if (!name) continue;
-        const lower = name.toLowerCase();
-        if (/nsfw|porn|xxx|hentai|uncensored|erotic/.test(lower)) continue;
-        if (/^(true|1)$/i.test(String((entry as { nsfw?: unknown }).nsfw ?? ''))) continue;
-        names.push(name);
-        if (names.length >= 40) break;
-      }
-      if (names.length > 0) {
-        pollinationsModelsCache = { models: names, at: Date.now() };
-      }
-    })
-    .catch(() => undefined)
-    .finally(() => {
-      pollinationsRefreshInFlight = false;
-      clearTimeout(timer);
-    });
-}
-
-function resolvePollinationsModels(baseUrl: string): string[] {
-  const override = readEnvCsv('POLLINATIONS_MODELS');
-  if (override.length > 0) return override;
-  const cacheFresh =
-    pollinationsModelsCache && Date.now() - pollinationsModelsCache.at < 10 * 60_000;
-  if (!cacheFresh) {
-    // Non-blocking: serve the static list now, refresh in background for next time.
-    schedulePollinationsModelsRefresh(baseUrl);
-    return POLLINATIONS_FALLBACK_MODELS;
-  }
-  const cached = pollinationsModelsCache!.models;
-  // Prefer well-known stable names first, then the rest of the live list.
-  const preferred = POLLINATIONS_FALLBACK_MODELS.filter((m) => cached.includes(m));
-  const rest = cached.filter((m) => !preferred.includes(m));
-  return [...preferred, ...rest].slice(0, 40);
-}
 
 const AGENTROUTER_DEFAULT_BASE = 'https://co.agentrouter.org/v1';
 
@@ -401,7 +270,9 @@ function getAgentRouterCredentials(): {
   for (const name of keyNames) {
     const info = cleanPastedSecret(process.env[name]);
     if (!info.cleaned) continue;
-    if (/^(my[_-]|your[_-]|xxx+|<|change[-_]?me|placeholder)/i.test(info.cleaned)) continue;
+    if (/^(my[_-]|your[_-]|xxx+|<|change[-_]?me|placeholder)/i.test(info.cleaned)) {
+      continue;
+    }
     matchedKeyName = name;
     keyInfo = info;
     break;
@@ -434,7 +305,7 @@ function getAgentRouterCredentials(): {
       hadWhitespace: keyInfo.hadWhitespace,
       looksLikeUrl: keyInfo.looksLikeUrl,
       looksLikeSkToken: /^sk-/i.test(keyInfo.cleaned),
-      lengthOk: keyInfo.cleaned.length >= 16,
+      lengthOk: keyInfo.cleaned.length >= 12,
     },
   };
 }
@@ -531,7 +402,9 @@ function scheduleAgentRouterModelsRefresh(v1Origin: string, apiKey: string): voi
               ? String((entry as { id: unknown }).id || '').trim()
               : '';
         if (!id || names.includes(id)) continue;
-        if (/^(whisper|tts|dall-e|gpt-image|text-embedding|embedding|moderation)/i.test(id)) {
+        if (
+          /^(whisper|tts|dall-e|gpt-image|text-embedding|embedding|moderation)/i.test(id)
+        ) {
           continue;
         }
         names.push(id);
@@ -608,7 +481,9 @@ export async function refreshAgentRouterModelsIfConfigured(): Promise<string[]> 
             ? String((entry as { id: unknown }).id || '').trim()
             : '';
       if (!id || names.includes(id)) continue;
-      if (/^(whisper|tts|dall-e|gpt-image|text-embedding|embedding|moderation)/i.test(id)) {
+      if (
+        /^(whisper|tts|dall-e|gpt-image|text-embedding|embedding|moderation)/i.test(id)
+      ) {
         continue;
       }
       names.push(id);
@@ -653,6 +528,21 @@ function resolveAgentRouterModels(v1Origin: string, apiKey: string): string[] {
   return baseList.slice(0, 24);
 }
 
+interface ResolvedMeshProvider {
+  baseUrl: string;
+  v1Origin: string;
+  apiKey: string;
+  models: string[];
+  headers?: Record<string, string>;
+}
+
+interface MeshProviderDef {
+  id: string;
+  label: string;
+  keyless: boolean;
+  resolve(): ResolvedMeshProvider | null;
+}
+
 const MESH_PROVIDERS: MeshProviderDef[] = [
   {
     id: 'agentrouter',
@@ -663,6 +553,7 @@ const MESH_PROVIDERS: MeshProviderDef[] = [
       if (!creds) return null;
       return {
         baseUrl: creds.baseUrl,
+        v1Origin: creds.v1Origin,
         apiKey: creds.apiKey,
         models: resolveAgentRouterModels(creds.v1Origin, creds.apiKey),
         headers: {
@@ -672,173 +563,10 @@ const MESH_PROVIDERS: MeshProviderDef[] = [
       };
     },
   },
-  {
-    id: 'self-hosted',
-    label: 'Self-Hosted GPU',
-    keyless: false,
-    resolve() {
-      const url = (process.env.SELF_HOSTED_LLM_URL || '').trim();
-      if (!url || !/^https?:\/\//i.test(url)) return null;
-      const model =
-        (process.env.SELF_HOSTED_LLM_MODEL || '').trim() || 'self-hosted/open-source-coder';
-      const apiKey = readEnvKey('SELF_HOSTED_LLM_API_KEY');
-      return { baseUrl: toChatCompletionsUrl(url), apiKey, models: [model] };
-    },
-  },
-  {
-    id: 'openai-compatible',
-    label: 'OpenAI-Compatible',
-    keyless: false,
-    resolve() {
-      const url = (process.env.OPENAI_COMPATIBLE_BASE_URL || '').trim();
-      if (!url || !/^https?:\/\//i.test(url)) return null;
-      const model =
-        (process.env.OPENAI_COMPATIBLE_MODEL || '').trim() || 'gpt-4o-mini';
-      const apiKey = readEnvKey('OPENAI_COMPATIBLE_API_KEY', 'OPENAI_COMPATIBLE_KEY');
-      return { baseUrl: toChatCompletionsUrl(url), apiKey, models: [model] };
-    },
-  },
-  {
-    id: 'groq',
-    label: 'Groq',
-    keyless: false,
-    resolve() {
-      const apiKey = readEnvKey('GROQ_API_KEY');
-      if (!apiKey) return null;
-      return {
-        baseUrl: 'https://api.groq.com/openai/v1/chat/completions',
-        apiKey,
-        models: FREE_MODEL_CATALOG.groq,
-      };
-    },
-  },
-  {
-    id: 'cerebras',
-    label: 'Cerebras',
-    keyless: false,
-    resolve() {
-      const apiKey = readEnvKey('CEREBRAS_API_KEY');
-      if (!apiKey) return null;
-      return {
-        baseUrl: 'https://api.cerebras.ai/v1/chat/completions',
-        apiKey,
-        models: FREE_MODEL_CATALOG.cerebras,
-      };
-    },
-  },
-  {
-    id: 'openrouter',
-    label: 'OpenRouter',
-    keyless: false,
-    resolve() {
-      const apiKey = readEnvKey('OPENROUTER_API_KEY');
-      if (!apiKey) return null;
-      const override = readEnvCsv('OPENROUTER_MODELS');
-      const appUrl = (process.env.APP_URL || '').trim();
-      return {
-        baseUrl: 'https://openrouter.ai/api/v1/chat/completions',
-        apiKey,
-        models: override.length > 0 ? override : FREE_MODEL_CATALOG.openrouter,
-        headers: appUrl
-          ? { 'HTTP-Referer': appUrl, 'X-Title': 'AI Craft' }
-          : { 'X-Title': 'AI Craft' },
-      };
-    },
-  },
-  {
-    id: 'mistral',
-    label: 'Mistral',
-    keyless: false,
-    resolve() {
-      const apiKey = readEnvKey('MISTRAL_API_KEY');
-      if (!apiKey) return null;
-      return {
-        baseUrl: 'https://api.mistral.ai/v1/chat/completions',
-        apiKey,
-        models: FREE_MODEL_CATALOG.mistral,
-      };
-    },
-  },
-  {
-    id: 'huggingface',
-    label: 'HuggingFace',
-    keyless: false,
-    resolve() {
-      const apiKey = readEnvKey('HF_TOKEN', 'HUGGINGFACE_API_TOKEN');
-      if (!apiKey) return null;
-      const override = readEnvCsv('HUGGINGFACE_MODELS');
-      return {
-        baseUrl: 'https://router.huggingface.co/v1/chat/completions',
-        apiKey,
-        models: override.length > 0 ? override : FREE_MODEL_CATALOG.huggingface,
-      };
-    },
-  },
-  {
-    id: 'github',
-    label: 'GitHub Models',
-    keyless: false,
-    resolve() {
-      const apiKey = readEnvKey('GITHUB_TOKEN', 'GH_TOKEN');
-      if (!apiKey) return null;
-      const override = readEnvCsv('GITHUB_MODELS');
-      return {
-        baseUrl: 'https://models.github.ai/inference/chat/completions',
-        apiKey,
-        models: override.length > 0 ? override : FREE_MODEL_CATALOG.github,
-      };
-    },
-  },
-  {
-    id: 'together',
-    label: 'Together',
-    keyless: false,
-    resolve() {
-      const apiKey = readEnvKey('TOGETHER_API_KEY');
-      if (!apiKey) return null;
-      const override = readEnvCsv('TOGETHER_MODELS');
-      return {
-        baseUrl: 'https://api.together.xyz/v1/chat/completions',
-        apiKey,
-        models: override.length > 0 ? override : FREE_MODEL_CATALOG.together,
-      };
-    },
-  },
-  {
-    id: 'deepinfra',
-    label: 'DeepInfra',
-    keyless: false,
-    resolve() {
-      const apiKey = readEnvKey('DEEPINFRA_API_KEY');
-      if (!apiKey) return null;
-      const override = readEnvCsv('DEEPINFRA_MODELS');
-      return {
-        baseUrl: 'https://api.deepinfra.com/v1/openai/chat/completions',
-        apiKey,
-        models: override.length > 0 ? override : FREE_MODEL_CATALOG.deepinfra,
-      };
-    },
-  },
-  {
-    id: 'pollinations',
-    label: 'Pollinations',
-    keyless: true,
-    resolve() {
-      if (!readEnvFlag('POLLINATIONS_ENABLED', true)) return null;
-      const baseUrl =
-        (process.env.POLLINATIONS_BASE_URL || '').trim() ||
-        'https://text.pollinations.ai/openai';
-      if (!/^https?:\/\//i.test(baseUrl)) return null;
-      const apiKey = readEnvKey('POLLINATIONS_API_KEY');
-      const models = resolvePollinationsModels(baseUrl);
-      if (models.length === 0) return null;
-      return { baseUrl, apiKey, models };
-    },
-  },
 ];
 
 // ---------------------------------------------------------------------------
-// Candidates, cooldowns, error classification
+// Candidates, cooldowns, quotas & budgets
 // ---------------------------------------------------------------------------
 
 interface MeshCandidate {
@@ -846,6 +574,7 @@ interface MeshCandidate {
   providerLabel: string;
   keyless: boolean;
   baseUrl: string;
+  v1Origin: string;
   apiKey: string;
   headers?: Record<string, string>;
   model: string;
@@ -853,13 +582,8 @@ interface MeshCandidate {
 }
 
 const MAX_MODELS_PER_PROVIDER = 8;
-const MAX_ATTEMPTS_PER_WALK = 12;
+const MAX_ATTEMPTS_PER_WALK = 8;
 
-// ---------------------------------------------------------------------------
-// Daily quotas (reset automatically at 00:00 UTC) + walk budgets
-// ---------------------------------------------------------------------------
-
-/** Successful responses per (provider, model) per UTC day. */
 const dailyUsage = new Map<string, number>();
 
 function dailyQuotaKey(providerId: string, model: string): string {
@@ -880,19 +604,17 @@ function recordDailyUsage(providerId: string, model: string): void {
   dailyUsage.set(key, (dailyUsage.get(key) ?? 0) + 1);
 }
 
-/** Test/diagnostics hook: current quota-day usage counts. */
 export function getMeshDailyUsage(): Record<string, number> {
   return Object.fromEntries(dailyUsage);
 }
 
-/** Test hook: clear quota counters (quota day itself rolls over at 00:00 UTC). */
 export function resetMeshDailyUsage(): void {
   dailyUsage.clear();
 }
 
-/** Fresh full builds fan out to 3 parallel agents unless opted out. */
+/** Single-brain AgentRouter execution (never spawns 3 competing free AIs). */
 export function isMeshParallelBuildsEnabled(): boolean {
-  return readEnvFlag('MESH_PARALLEL_BUILDS', true);
+  return false;
 }
 
 interface MeshWalkBudget {
@@ -902,21 +624,13 @@ interface MeshWalkBudget {
   maxAttempts: number;
 }
 
-/** Chat = fast (raced when keyless); build = roomier (single live stream / agents). */
 function budgetFor(taskKind: 'chat' | 'build'): MeshWalkBudget {
-  const hasPrimaryRouter = isAgentRouterConfigured();
   if (taskKind === 'chat') {
-    return hasPrimaryRouter
-      ? { firstByteMs: 15_000, idleMs: 25_000, walkMs: 50_000, maxAttempts: 8 }
-      : { firstByteMs: 6_000, idleMs: 20_000, walkMs: 30_000, maxAttempts: 8 };
+    return { firstByteMs: 30_000, idleMs: 35_000, walkMs: 75_000, maxAttempts: 6 };
   }
-  return hasPrimaryRouter
-    ? { firstByteMs: 24_000, idleMs: 55_000, walkMs: 90_000, maxAttempts: 12 }
-    : { firstByteMs: 10_000, idleMs: 45_000, walkMs: 65_000, maxAttempts: 12 };
+  return { firstByteMs: 45_000, idleMs: 60_000, walkMs: 120_000, maxAttempts: 8 };
 }
 
-/** Every candidate the walk may consider, with its remaining cooldown
- *  (0 = usable right now). Quota-exhausted models are excluded entirely. */
 function enumerateMeshCandidates(): Array<{ candidate: MeshCandidate; coolingMs: number }> {
   const all: Array<{ candidate: MeshCandidate; coolingMs: number }> = [];
   for (const def of MESH_PROVIDERS) {
@@ -928,7 +642,6 @@ function enumerateMeshCandidates(): Array<{ candidate: MeshCandidate; coolingMs:
     }
     if (!resolved) continue;
     for (const model of resolved.models.slice(0, MAX_MODELS_PER_PROVIDER)) {
-      // Daily quota exhausted → this AI rests until 00:00 UTC; walk the rest.
       if (isDailyQuotaExhausted(def.id, model)) continue;
       const cooldownKey = buildCandidateCooldownKey(
         `mesh:${def.id}`,
@@ -941,6 +654,7 @@ function enumerateMeshCandidates(): Array<{ candidate: MeshCandidate; coolingMs:
           providerLabel: def.label,
           keyless: def.keyless,
           baseUrl: resolved.baseUrl,
+          v1Origin: resolved.v1Origin,
           apiKey: resolved.apiKey,
           headers: resolved.headers,
           model,
@@ -968,26 +682,18 @@ function prioritizeCandidatesForRequestedModel(
   requestedModel?: string
 ): MeshCandidate[] {
   const req = (requestedModel || '').trim();
-  if (!req || candidates.length <= 1) return candidates;
+  if (!req) return candidates;
 
   if (req.startsWith('agentrouter::')) {
     const targetModel = req.slice('agentrouter::'.length).trim();
     if (!targetModel || targetModel === 'auto') {
-      const ar = candidates.filter((c) => c.providerId === 'agentrouter');
-      const rest = candidates.filter((c) => c.providerId !== 'agentrouter');
-      return [...ar, ...rest];
+      return candidates;
     }
-    const exact = candidates.filter(
-      (c) => c.providerId === 'agentrouter' && c.model === targetModel
-    );
-    const sameProvider = candidates.filter(
-      (c) => c.providerId === 'agentrouter' && c.model !== targetModel
-    );
-    const others = candidates.filter((c) => c.providerId !== 'agentrouter');
+    const exact = candidates.filter((c) => c.model === targetModel);
+    const sameProvider = candidates.filter((c) => c.model !== targetModel);
     if (exact.length > 0) {
-      return [...exact, ...sameProvider, ...others];
+      return [...exact, ...sameProvider];
     }
-    // Requested a specific upstream AgentRouter model ID not in top slice — prepend an on-demand candidate if configured
     const creds = getAgentRouterCredentials();
     if (creds) {
       const cooldownKey = buildCandidateCooldownKey(
@@ -995,13 +701,17 @@ function prioritizeCandidatesForRequestedModel(
         creds.apiKey,
         targetModel
       );
-      if (gatewayCandidateCooldownRemainingMs(cooldownKey) <= 0 && !isDailyQuotaExhausted('agentrouter', targetModel)) {
+      if (
+        gatewayCandidateCooldownRemainingMs(cooldownKey) <= 0 &&
+        !isDailyQuotaExhausted('agentrouter', targetModel)
+      ) {
         return [
           {
             providerId: 'agentrouter',
             providerLabel: 'AgentRouter',
             keyless: false,
             baseUrl: creds.baseUrl,
+            v1Origin: creds.v1Origin,
             apiKey: creds.apiKey,
             headers: {
               'User-Agent': 'codex_cli_rs/0.34.0',
@@ -1011,36 +721,19 @@ function prioritizeCandidatesForRequestedModel(
             cooldownKey,
           },
           ...sameProvider,
-          ...others,
         ];
       }
     }
-    return [...sameProvider, ...others];
-  }
-
-  if (req === 'mesh::reasoning') {
-    const isReasoning = (m: string) => /r1|reason|opus|gpt-5|kimi|qwq/i.test(m);
-    const preferred = candidates.filter((c) => isReasoning(c.model));
-    const rest = candidates.filter((c) => !isReasoning(c.model));
-    return [...preferred, ...rest];
-  }
-
-  if (req === 'mesh::coder') {
-    const isCoder = (m: string) => /coder|sonnet|claude|gpt-5|deepseek|glm/i.test(m);
-    const preferred = candidates.filter((c) => isCoder(c.model));
-    const rest = candidates.filter((c) => !isCoder(c.model));
-    return [...preferred, ...rest];
+    return sameProvider;
   }
 
   return candidates;
 }
 
-/** Smallest remaining cooldown across every cooling candidate — 0 when at
- *  least one candidate is usable or nothing is cooling at all. */
 function earliestMeshCooldownMs(): number {
   let earliest = 0;
   for (const entry of enumerateMeshCandidates()) {
-    if (entry.coolingMs <= 0) return 0; // someone is usable
+    if (entry.coolingMs <= 0) return 0;
     if (earliest === 0 || entry.coolingMs < earliest) earliest = entry.coolingMs;
   }
   return earliest;
@@ -1061,11 +754,8 @@ export function getFreeAiMeshStatus(): {
   pollinationsEnabled: boolean;
   pollinationsConfigured: boolean;
   modelPool: {
-    /** Candidates usable right now (configured, not cooling, not quota-capped). */
     activeModels: number;
-    /** Total free models cataloged across every known provider. */
     catalogSize: number;
-    /** When every daily quota resets (next 00:00 UTC). */
     dailyResetsAt: string;
     dailyLimitPerModel: number;
   };
@@ -1090,9 +780,9 @@ export function getFreeAiMeshStatus(): {
   return {
     providers,
     hasAny,
-    hasKeyless: providers.some((p) => p.configured && p.keyless),
-    pollinationsEnabled: readEnvFlag('POLLINATIONS_ENABLED', true),
-    pollinationsConfigured: Boolean(providers.find((p) => p.id === 'pollinations')?.configured),
+    hasKeyless: false,
+    pollinationsEnabled: false,
+    pollinationsConfigured: false,
     modelPool: {
       activeModels: (() => {
         try {
@@ -1120,102 +810,41 @@ export interface FreeMeshModelOption {
   category?: 'router' | 'code' | 'image' | 'music' | 'video' | 'chat';
 }
 
-/**
- * Selector entries for the model picker — the mesh auto-routes to the
- * fastest healthy free lane regardless of which entry is picked, so these
- * are preference profiles, not hard bindings. Zero API keys, zero config.
- */
 export function getFreeMeshModelOptions(): FreeMeshModelOption[] {
-  const pool = getFreeAiMeshStatus().modelPool;
-  const resetLabel = 'Daily reset 00:00 UTC';
   const creds = getAgentRouterCredentials();
-  const options: FreeMeshModelOption[] = [];
+  const arModels = creds
+    ? resolveAgentRouterModels(creds.v1Origin, creds.apiKey)
+    : FREE_MODEL_CATALOG.agentrouter;
 
-  if (creds) {
-    const arModels = resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
-    options.push({
+  const options: FreeMeshModelOption[] = [
+    {
       id: 'agentrouter::auto',
-      name: 'AgentRouter · Auto (Primary Brain)',
+      name: 'AgentRouter · Auto',
       provider: 'agentrouter',
       contextLength: 262144,
       isFree: false,
       gateway: 'auto',
-      tierLabel: 'Primary Brain',
-      capabilities: ['Chat', 'Code', 'Vision'],
+      tierLabel: 'Thinking · Auto',
+      capabilities: ['Thinking', 'Chat', 'Code'],
+      category: 'code',
+    },
+  ];
+
+  for (const modelId of arModels.slice(0, 12)) {
+    const isClaudeNative = /^claude/i.test(modelId);
+    options.push({
+      id: `agentrouter::${modelId}`,
+      name: `AgentRouter · ${modelId}`,
+      provider: 'agentrouter',
+      contextLength: 262144,
+      isFree: false,
+      gateway: 'auto',
+      tierLabel: isClaudeNative ? 'Claude Native' : 'Chat · Responses',
+      capabilities: ['Thinking', 'Chat', 'Code'],
       category: 'code',
     });
-    for (const modelId of arModels.slice(0, 8)) {
-      options.push({
-        id: `agentrouter::${modelId}`,
-        name: `AgentRouter · ${modelId}`,
-        provider: 'agentrouter',
-        contextLength: 262144,
-        isFree: false,
-        gateway: 'auto',
-        tierLabel: 'AgentRouter API',
-        capabilities: ['Chat', 'Code'],
-        category: 'code',
-      });
-    }
   }
 
-  options.push(
-    {
-      id: 'mesh::auto',
-      name: 'Free AI Mesh · Auto (fastest lane)',
-      provider: 'free-mesh',
-      contextLength: 262144,
-      isFree: true,
-      gateway: 'auto',
-      tierLabel: `Auto · ${pool.catalogSize}+ free models`,
-      capabilities: ['Chat', 'Code', 'Vision'],
-      category: 'code',
-    },
-    {
-      id: 'mesh::fast',
-      name: 'Free AI Mesh · Fast chat',
-      provider: 'free-mesh',
-      contextLength: 131072,
-      isFree: true,
-      gateway: 'auto',
-      tierLabel: `Racing lanes · ${resetLabel}`,
-      capabilities: ['Chat'],
-      category: 'chat',
-    },
-    {
-      id: 'mesh::coder',
-      name: 'Free AI Mesh · Code specialist',
-      provider: 'free-mesh',
-      contextLength: 262144,
-      isFree: true,
-      gateway: 'auto',
-      tierLabel: `Builder lanes · ${resetLabel}`,
-      capabilities: ['Code'],
-      category: 'code',
-    },
-    {
-      id: 'mesh::reasoning',
-      name: 'Free AI Mesh · Deep reasoning',
-      provider: 'free-mesh',
-      contextLength: 262144,
-      isFree: true,
-      gateway: 'auto',
-      tierLabel: `Reasoning lanes · ${resetLabel}`,
-      capabilities: ['Chat', 'Code'],
-      category: 'chat',
-    },
-    {
-      id: 'mesh::creative',
-      name: 'Free AI Mesh · Creative writing',
-      provider: 'free-mesh',
-      contextLength: 131072,
-      isFree: true,
-      gateway: 'auto',
-      tierLabel: `Creative lanes · ${resetLabel}`,
-      capabilities: ['Chat'],
-      category: 'chat',
-    }
-  );
   return options;
 }
 
@@ -1246,8 +875,9 @@ function normalizeMeshError(err: unknown): MeshErrorInfo {
         const parsed = JSON.parse(text) as {
           error?: { message?: string; code?: string; type?: string };
           message?: string;
+          msg?: string;
         };
-        message = parsed?.error?.message || parsed?.message || message;
+        message = parsed?.error?.message || parsed?.message || parsed?.msg || message;
       } catch {
         // keep original message
       }
@@ -1257,9 +887,6 @@ function normalizeMeshError(err: unknown): MeshErrorInfo {
   return { status: null, message: String(err).slice(0, 300) };
 }
 
-/** Pollinations-style "someone else is using this lane right now" — always
- *  transient; callers should wait out the short cooldown and retry instead of
- *  burning the walk / failing the agent. */
 export function isBusyMeshError(info: MeshErrorInfo): boolean {
   const lower = info.message.toLowerCase();
   return /previous request is still running|1 request at a time per ip|wait for it to finish/.test(
@@ -1267,24 +894,26 @@ export function isBusyMeshError(info: MeshErrorInfo): boolean {
   );
 }
 
+function isAuthError(info: MeshErrorInfo): boolean {
+  const lower = info.message.toLowerCase();
+  return (
+    info.status === 401 ||
+    info.status === 403 ||
+    /invalid.?api.?key|incorrect api key|unauthorized|forbidden|authentication/.test(lower)
+  );
+}
+
 export function cooldownForMeshError(
   info: MeshErrorInfo
 ): { ms: number; hard: boolean } {
   const lower = info.message.toLowerCase();
-  // Pollinations "previous request is still running / 1 request at a time per
-  // IP" (and pollen-key nags) are TRANSIENT concurrency busy — the next
-  // attempt gets the single-flight slot, so cool for seconds only. Checked
-  // BEFORE every other branch (busy arrives with various status codes) so a
-  // busy storm can never pin models on 45–90s cooldowns.
   if (isBusyMeshError(info)) {
     return { ms: 6_000, hard: false };
   }
-  if (
-    info.status === 401 ||
-    info.status === 403 ||
-    /invalid.?api.?key|incorrect api key|unauthorized|forbidden|authentication/.test(lower)
-  ) {
-    return { ms: 10 * 60_000, hard: false };
+  if (isAuthError(info)) {
+    // Keep auth cooldown short (15s) so if the user updates their key or retries,
+    // it recovers promptly without sticking for 10 minutes.
+    return { ms: 15_000, hard: false };
   }
   if (
     info.status === 404 ||
@@ -1292,22 +921,21 @@ export function cooldownForMeshError(
       lower
     )
   ) {
-    return { ms: 6 * 60 * 60_000, hard: true };
+    return { ms: 5 * 60_000, hard: true };
   }
   if (info.status === 402 || /\bbilling\b|payment required|credit/.test(lower)) {
-    return { ms: 6 * 60 * 60_000, hard: true };
+    return { ms: 5 * 60_000, hard: true };
   }
   if (
     info.status === 429 ||
     /rate.?limit|too many requests|quota|quota exceeded|limit reached|overloaded/.test(lower)
   ) {
-    return { ms: 90_000, hard: false };
+    return { ms: 45_000, hard: false };
   }
   if (info.status !== null && info.status >= 500) {
-    return { ms: 30_000, hard: false };
+    return { ms: 20_000, hard: false };
   }
-  // Network errors, timeouts, 4xx payload issues → short cooldown, try next lane.
-  return { ms: 45_000, hard: false };
+  return { ms: 20_000, hard: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,8 +980,48 @@ function buildMeshMessages(params: {
   return messages;
 }
 
+function buildAnthropicMessages(params: {
+  historyMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  userPrompt: string;
+  attachmentDataUrl?: string | null;
+  withImage?: boolean;
+}): Array<{ role: 'user' | 'assistant'; content: string | Array<Record<string, unknown>> }> {
+  const out: Array<{
+    role: 'user' | 'assistant';
+    content: string | Array<Record<string, unknown>>;
+  }> = [];
+  for (const item of (params.historyMessages || []).slice(-10)) {
+    if (!item?.content) continue;
+    out.push({
+      role: item.role === 'assistant' ? 'assistant' : 'user',
+      content: String(item.content).slice(0, 4000),
+    });
+  }
+  const prompt = params.userPrompt.slice(0, 30000);
+  if (params.withImage && params.attachmentDataUrl?.startsWith('data:image/')) {
+    const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/.exec(
+      params.attachmentDataUrl
+    );
+    if (match?.[1] && match?.[2]) {
+      out.push({
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: match[1], data: match[2] },
+          },
+          { type: 'text', text: prompt },
+        ],
+      });
+      return out;
+    }
+  }
+  out.push({ role: 'user', content: prompt });
+  return out;
+}
+
 // ---------------------------------------------------------------------------
-// HTTP: one candidate, streaming + non-streaming
+// HTTP: one candidate, streaming + non-streaming (Chat Completions, Responses, Claude Messages)
 // ---------------------------------------------------------------------------
 
 interface MeshAttemptParams {
@@ -1403,26 +1071,29 @@ function extractOpenAiError(json: unknown, fallback: string): string {
   return fallback.slice(0, 300);
 }
 
-async function postMeshJson(
-  candidate: MeshCandidate,
+async function postJsonEndpoint(
+  url: string,
+  headers: Record<string, string>,
   body: Record<string, unknown>,
+  candidate: MeshCandidate,
   params: MeshAttemptParams
 ): Promise<Response> {
-  const controller = params.signal ?? new AbortController();
+  const controller = new AbortController();
+  const outerSignal = params.signal?.signal;
+  if (outerSignal?.aborted) throw new Error('Request cancelled.');
+  const onOuterAbort = () => controller.abort();
+  outerSignal?.addEventListener('abort', onOuterAbort, { once: true });
+
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
   }, params.firstByteTimeoutMs);
+
   try {
-    const res = await fetch(candidate.baseUrl, {
+    const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream, application/json, text/plain',
-        ...(candidate.apiKey ? { Authorization: `Bearer ${candidate.apiKey}` } : {}),
-        ...(candidate.headers || {}),
-      },
+      headers,
       body: JSON.stringify(body),
       signal: controller.signal,
     });
@@ -1432,206 +1103,365 @@ async function postMeshJson(
         json: null,
       }));
       const errMsg = extractOpenAiError(json, text || `HTTP ${res.status}`);
-      if (candidate.providerId === 'agentrouter') {
-        recordAgentRouterDiag(`${candidate.baseUrl} [${candidate.model}]`, res.status, errMsg);
-      }
+      recordAgentRouterDiag(`${url} [${candidate.model}]`, res.status, errMsg);
       throw new MeshHttpError(errMsg, res.status, json ?? text);
     }
-    if (candidate.providerId === 'agentrouter') {
-      recordAgentRouterDiag(`${candidate.baseUrl} [${candidate.model}]`, res.status, 'connected');
-    }
+    recordAgentRouterDiag(`${url} [${candidate.model}]`, res.status, 'connected');
     return res;
   } catch (err) {
     if (err instanceof MeshHttpError) throw err;
     const msg = timedOut
-      ? 'Timed out waiting for first byte'
+      ? 'Timed out waiting for AgentRouter response'
       : err instanceof Error
         ? err.message
         : String(err);
-    if (candidate.providerId === 'agentrouter') {
-      recordAgentRouterDiag(`${candidate.baseUrl} [${candidate.model}]`, null, msg);
-    }
-    if (timedOut) throw new MeshHttpError('Timed out waiting for first byte', null);
+    recordAgentRouterDiag(`${url} [${candidate.model}]`, null, msg);
+    if (timedOut) throw new MeshHttpError('Timed out waiting for AgentRouter response', null);
     throw err;
   } finally {
     clearTimeout(timer);
+    outerSignal?.removeEventListener('abort', onOuterAbort);
   }
 }
 
-/**
- * Stream one candidate to completion. Emits content via `onChunk` /
- * `onReasoningChunk`. Returns the accumulated raw output (may be '').
- * Throws MeshHttpError / abort errors; callers classify + cool down.
- */
+type ProtocolKind = 'chat_completions' | 'responses' | 'anthropic_messages';
+
+function protocolsForCandidate(model: string): ProtocolKind[] {
+  if (/^claude/i.test(model.trim())) {
+    return ['anthropic_messages', 'chat_completions', 'responses'];
+  }
+  return ['chat_completions', 'responses'];
+}
+
+function shouldFallbackProtocol(err: unknown): boolean {
+  const info = normalizeMeshError(err);
+  if (isAuthError(info)) return false;
+  const lower = info.message.toLowerCase();
+  return (
+    info.status === 404 ||
+    info.status === 405 ||
+    info.status === 415 ||
+    /unsupported|not supported|unknown endpoint|use \/v1\/(responses|messages)|claude_native/.test(
+      lower
+    )
+  );
+}
+
+async function consumeSseOrJsonStream(
+  res: Response,
+  protocol: ProtocolKind,
+  params: MeshAttemptParams,
+  onChunk: (text: string) => void,
+  onReasoning?: (text: string) => void
+): Promise<string> {
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  if (!res.body) {
+    throw new MeshHttpError('Empty response body', res.status);
+  }
+
+  if (contentType.includes('text/html')) {
+    const { text } = await readMeshResponseBody(res).catch(() => ({ text: '' }));
+    throw new MeshHttpError(
+      'Upstream returned an HTML/WAF page instead of an API response',
+      502,
+      text.slice(0, 300)
+    );
+  }
+
+  if (contentType.includes('application/json')) {
+    const { json, text } = await readMeshResponseBody(res);
+    const errField =
+      (json as { error?: unknown; code?: number; msg?: string } | null)?.error ||
+      ((json as { code?: number } | null)?.code &&
+      (json as { code?: number }).code !== 0 &&
+      (json as { code?: number }).code !== 200
+        ? (json as { msg?: string }).msg || 'AgentRouter error'
+        : null);
+    if (errField) {
+      throw new MeshHttpError(extractOpenAiError(json, 'AgentRouter error'), res.status, json);
+    }
+
+    if (protocol === 'anthropic_messages') {
+      const blocks = Array.isArray((json as { content?: unknown[] } | null)?.content)
+        ? ((json as { content: Array<{ type?: string; text?: string; thinking?: string }> }).content)
+        : [];
+      let out = '';
+      for (const blk of blocks) {
+        if (blk?.type === 'thinking' && blk.thinking && onReasoning) {
+          onReasoning(blk.thinking);
+        } else if (blk?.type === 'text' && blk.text) {
+          out += blk.text;
+        }
+      }
+      if (out) onChunk(out);
+      return out || text;
+    }
+
+    if (protocol === 'responses') {
+      const respObj = json as {
+        output_text?: string;
+        output?: Array<{ content?: Array<{ type?: string; text?: string }> }>;
+      } | null;
+      let out = typeof respObj?.output_text === 'string' ? respObj.output_text : '';
+      if (!out && Array.isArray(respObj?.output)) {
+        for (const item of respObj.output) {
+          for (const part of item.content || []) {
+            if (typeof part.text === 'string') out += part.text;
+          }
+        }
+      }
+      if (out) onChunk(out);
+      return out || text;
+    }
+
+    const msgObj = (
+      json as {
+        choices?: Array<{
+          message?: { content?: string; reasoning_content?: string; reasoning?: string };
+        }>;
+      } | null
+    )?.choices?.[0]?.message;
+    const reasoning = msgObj?.reasoning_content || msgObj?.reasoning || '';
+    if (reasoning && onReasoning) onReasoning(reasoning);
+    const content = msgObj?.content || '';
+    if (content) onChunk(content);
+    return content || text;
+  }
+
+  // SSE or plain-text stream
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let raw = '';
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const idleMs = params.idleTimeoutMs ?? 45_000;
+  const resetIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      try {
+        reader.cancel().catch(() => undefined);
+      } catch {
+        // ignore
+      }
+    }, idleMs);
+  };
+  resetIdle();
+  const isEventStream = contentType.includes('event-stream');
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      resetIdle();
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIdx = buffer.indexOf('\n');
+      while (newlineIdx >= 0) {
+        const line = buffer.slice(0, newlineIdx).trim();
+        buffer = buffer.slice(newlineIdx + 1);
+        newlineIdx = buffer.indexOf('\n');
+        if (!line || line.startsWith('event:') || line.startsWith(':')) continue;
+        if (!isEventStream && !line.startsWith('data:')) {
+          if (!raw && /^<!doctype\s+html|^<html\b|aliyun_waf|CF_APP_WAF/i.test(line)) {
+            throw new MeshHttpError(
+              'Upstream returned an HTML/WAF challenge instead of an API stream',
+              502
+            );
+          }
+          raw += line;
+          onChunk(line);
+          continue;
+        }
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        if (!parsed || typeof parsed !== 'object') continue;
+        const obj = parsed as Record<string, unknown>;
+        if (obj.error) {
+          throw new MeshHttpError(
+            extractOpenAiError(obj, 'AgentRouter stream error'),
+            res.status,
+            obj
+          );
+        }
+
+        if (protocol === 'anthropic_messages') {
+          const evType = typeof obj.type === 'string' ? obj.type : '';
+          if (evType === 'content_block_delta') {
+            const delta = obj.delta as
+              | { type?: string; text?: string; thinking?: string }
+              | undefined;
+            if (delta?.type === 'thinking_delta' && delta.thinking && onReasoning) {
+              onReasoning(delta.thinking);
+            } else if (delta?.type === 'text_delta' && delta.text) {
+              raw += delta.text;
+              onChunk(delta.text);
+            }
+          }
+          continue;
+        }
+
+        if (protocol === 'responses') {
+          const evType = typeof obj.type === 'string' ? obj.type : '';
+          const deltaText = typeof obj.delta === 'string' ? obj.delta : '';
+          if (
+            (evType.includes('reasoning') && evType.endsWith('.delta')) &&
+            deltaText &&
+            onReasoning
+          ) {
+            onReasoning(deltaText);
+          } else if (evType === 'response.output_text.delta' && deltaText) {
+            raw += deltaText;
+            onChunk(deltaText);
+          } else if (evType === 'response.failed') {
+            throw new MeshHttpError(
+              extractOpenAiError(obj.response || obj, 'Responses API failed'),
+              res.status,
+              obj
+            );
+          }
+          continue;
+        }
+
+        // OpenAI Chat Completions SSE
+        const choices = obj.choices as
+          | Array<{
+              delta?: { content?: string; reasoning_content?: string; reasoning?: string };
+              message?: { content?: string };
+            }>
+          | undefined;
+        const choice = choices?.[0];
+        if (!choice) continue;
+        const reasoning =
+          choice.delta?.reasoning_content || choice.delta?.reasoning || '';
+        if (reasoning && onReasoning) onReasoning(reasoning);
+        const piece = choice.delta?.content || choice.message?.content || '';
+        if (piece) {
+          raw += piece;
+          onChunk(piece);
+        }
+      }
+    }
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer);
+  }
+  return raw;
+}
+
 async function streamOneMeshCandidateRaw(
   candidate: MeshCandidate,
   params: MeshAttemptParams,
   onChunk: (text: string) => void,
   onReasoning?: (text: string) => void
 ): Promise<string> {
-  const messages = buildMeshMessages({
-    systemPrompt: params.systemPrompt,
-    historyMessages: params.historyMessages,
-    userPrompt: params.userPrompt,
-    attachmentDataUrl: params.attachmentDataUrl,
-    withImage: true,
-  });
+  const protocols = protocolsForCandidate(candidate.model);
+  const hasImage = Boolean(params.attachmentDataUrl?.startsWith('data:image/'));
+  let lastErr: unknown = null;
 
-  const buildBody = (withImage: boolean): Record<string, unknown> => ({
-    model: candidate.model,
-    messages: withImage
-      ? messages
-      : buildMeshMessages({
-          systemPrompt: params.systemPrompt,
+  for (const protocol of protocols) {
+    let attemptWithImage = hasImage;
+    for (let imageRetry = 0; imageRetry < 2; imageRetry += 1) {
+      let url = candidate.baseUrl;
+      let headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream, application/json, text/plain',
+        Authorization: `Bearer ${candidate.apiKey}`,
+        ...(candidate.headers || {}),
+      };
+      let body: Record<string, unknown>;
+
+      if (protocol === 'anthropic_messages') {
+        url = toMessagesUrl(candidate.v1Origin);
+        headers = {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream, application/json',
+          'x-api-key': candidate.apiKey,
+          Authorization: `Bearer ${candidate.apiKey}`,
+          'anthropic-version': '2023-06-01',
+          ...(candidate.headers || {}),
+        };
+        body = {
+          model: candidate.model,
+          max_tokens: 8192,
+          ...(params.systemPrompt.trim()
+            ? { system: params.systemPrompt.trim().slice(0, 60000) }
+            : {}),
+          messages: buildAnthropicMessages({
+            historyMessages: params.historyMessages,
+            userPrompt: params.userPrompt,
+            attachmentDataUrl: params.attachmentDataUrl,
+            withImage: attemptWithImage,
+          }),
+          stream: true,
+        };
+      } else if (protocol === 'responses') {
+        url = toResponsesUrl(candidate.v1Origin);
+        const msgs = buildMeshMessages({
+          systemPrompt: '',
           historyMessages: params.historyMessages,
           userPrompt: params.userPrompt,
           attachmentDataUrl: params.attachmentDataUrl,
-          withImage: false,
-        }),
-    stream: true,
-    temperature: params.taskKind === 'build' ? 0.4 : 0.7,
-  });
-
-  const hasImage = Boolean(params.attachmentDataUrl?.startsWith('data:image/'));
-  let attemptWithImage = hasImage;
-  // One silent retry without the image when the provider rejects multimodal payloads.
-  for (let imageRetry = 0; imageRetry < 2; imageRetry += 1) {
-    let res: Response;
-    try {
-      res = await postMeshJson(candidate, buildBody(attemptWithImage), params);
-    } catch (err) {
-      const info = normalizeMeshError(err);
-      const canRetryWithoutImage =
-        attemptWithImage &&
-        info.status !== null &&
-        [400, 413, 415, 422].includes(info.status);
-      if (canRetryWithoutImage) {
-        attemptWithImage = false;
-        continue;
+          withImage: attemptWithImage,
+        });
+        body = {
+          model: candidate.model,
+          ...(params.systemPrompt.trim()
+            ? { instructions: params.systemPrompt.trim().slice(0, 60000) }
+            : {}),
+          input: msgs.map((m) => ({ role: m.role, content: m.content })),
+          stream: true,
+        };
+      } else {
+        url = candidate.baseUrl;
+        body = {
+          model: candidate.model,
+          messages: buildMeshMessages({
+            systemPrompt: params.systemPrompt,
+            historyMessages: params.historyMessages,
+            userPrompt: params.userPrompt,
+            attachmentDataUrl: params.attachmentDataUrl,
+            withImage: attemptWithImage,
+          }),
+          stream: true,
+          temperature: params.taskKind === 'build' ? 0.45 : 0.7,
+        };
       }
-      throw err;
-    }
 
-    const contentType = (res.headers.get('content-type') || '').toLowerCase();
-    if (!res.body) {
-      throw new MeshHttpError('Empty response body', res.status);
-    }
-
-    if (contentType.includes('text/html')) {
-      const { text } = await readMeshResponseBody(res).catch(() => ({ text: '' }));
-      throw new MeshHttpError(
-        'Upstream returned an HTML/WAF page instead of an API response',
-        502,
-        text.slice(0, 300)
-      );
-    }
-
-    // Provider ignored `stream` and returned a plain JSON payload.
-    if (contentType.includes('application/json')) {
-      const { json, text } = await readMeshResponseBody(res);
-      const errField = (json as { error?: unknown } | null)?.error;
-      if (errField) {
-        throw new MeshHttpError(extractOpenAiError(json, 'provider error'), res.status, json);
-      }
-      const content =
-        ((json as { choices?: Array<{ message?: { content?: string } }> } | null)?.choices?.[0]
-          ?.message?.content as string | undefined) || '';
-      if (content) onChunk(content);
-      return content || text;
-    }
-
-    // SSE (or plain-text chunked) stream.
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let raw = '';
-    let idleTimer: ReturnType<typeof setTimeout> | null = null;
-    const idleMs = params.idleTimeoutMs ?? 45_000;
-    const resetIdle = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        try {
-          reader.cancel().catch(() => undefined);
-        } catch {
-          // ignore
+      try {
+        const res = await postJsonEndpoint(url, headers, body, candidate, params);
+        return await consumeSseOrJsonStream(
+          res,
+          protocol,
+          params,
+          onChunk,
+          onReasoning
+        );
+      } catch (err) {
+        lastErr = err;
+        const info = normalizeMeshError(err);
+        if (
+          attemptWithImage &&
+          info.status !== null &&
+          [400, 413, 415, 422].includes(info.status)
+        ) {
+          attemptWithImage = false;
+          continue;
         }
-      }, idleMs);
-    };
-    resetIdle();
-    const isEventStream = contentType.includes('event-stream');
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        resetIdle();
-        buffer += decoder.decode(value, { stream: true });
-        let newlineIdx = buffer.indexOf('\n');
-        while (newlineIdx >= 0) {
-          const line = buffer.slice(0, newlineIdx).trim();
-          buffer = buffer.slice(newlineIdx + 1);
-          newlineIdx = buffer.indexOf('\n');
-          if (!line) continue;
-          if (!isEventStream && !line.startsWith('data:')) {
-            if (
-              !raw &&
-              /^<!doctype\s+html|^<html\b|aliyun_waf|CF_APP_WAF/i.test(line)
-            ) {
-              throw new MeshHttpError(
-                'Upstream returned an HTML/WAF challenge instead of an API stream',
-                502
-              );
-            }
-            // Plain-text chunked body.
-            raw += line;
-            onChunk(line);
-            continue;
-          }
-          if (!line.startsWith('data:')) continue;
-          const payload = line.slice(5).trim();
-          if (!payload || payload === '[DONE]') continue;
-          let parsed: unknown;
-          try {
-            parsed = JSON.parse(payload);
-          } catch {
-            continue;
-          }
-          if (!parsed || typeof parsed !== 'object') continue;
-          const obj = parsed as {
-            error?: { message?: string };
-            choices?: Array<{
-              delta?: { content?: string; reasoning_content?: string; reasoning?: string };
-              message?: { content?: string };
-            }>;
-          };
-          if (obj.error) {
-            throw new MeshHttpError(
-              extractOpenAiError(obj, 'provider stream error'),
-              res.status,
-              obj
-            );
-          }
-          const choice = obj.choices?.[0];
-          if (!choice) continue;
-          const reasoning =
-            choice.delta?.reasoning_content || choice.delta?.reasoning || '';
-          if (reasoning && onReasoning) onReasoning(reasoning);
-          const piece = choice.delta?.content || choice.message?.content || '';
-          if (piece) {
-            raw += piece;
-            onChunk(piece);
-          }
+        if (shouldFallbackProtocol(err)) {
+          break; // try next protocol
         }
+        throw err;
       }
-    } finally {
-      if (idleTimer) clearTimeout(idleTimer);
     }
-    return raw;
   }
-  return '';
+
+  throw lastErr ?? new MeshHttpError('AgentRouter request failed', null);
 }
 
-/** Stream one candidate while holding its provider's single-flight slot
- *  (queueing instead of colliding — Pollinations Classic = 1 request/IP). */
 async function streamOneMeshCandidate(
   candidate: MeshCandidate,
   params: MeshAttemptParams,
@@ -1650,48 +1480,18 @@ async function completeOneMeshCandidateRaw(
   candidate: MeshCandidate,
   params: MeshAttemptParams
 ): Promise<string> {
-  const messages = buildMeshMessages({
-    systemPrompt: params.systemPrompt,
-    historyMessages: params.historyMessages,
-    userPrompt: params.userPrompt,
-    attachmentDataUrl: params.attachmentDataUrl,
-    withImage: Boolean(params.attachmentDataUrl?.startsWith('data:image/')),
-  });
-  const res = await postMeshJson(
+  let out = '';
+  const raw = await streamOneMeshCandidateRaw(
     candidate,
-    {
-      model: candidate.model,
-      messages,
-      stream: false,
-      temperature: params.taskKind === 'build' ? 0.4 : 0.7,
+    params,
+    (chunk) => {
+      out += chunk;
     },
-    params
+    undefined
   );
-  const contentType = (res.headers.get('content-type') || '').toLowerCase();
-  const { json, text } = await readMeshResponseBody(res);
-  if (
-    contentType.includes('text/html') ||
-    (!json && /^<!doctype\s+html|<html\b|aliyun_waf|CF_APP_WAF/i.test(text))
-  ) {
-    throw new MeshHttpError(
-      'Upstream returned an HTML/WAF page instead of an API response',
-      502,
-      text.slice(0, 300)
-    );
-  }
-  const errField = (json as { error?: unknown } | null)?.error;
-  if (errField) {
-    throw new MeshHttpError(extractOpenAiError(json, 'provider error'), res.status, json);
-  }
-  const content =
-    ((json as { choices?: Array<{ message?: { content?: string } }> } | null)?.choices?.[0]
-      ?.message?.content as string | undefined) || '';
-  return content || text;
+  return out || raw;
 }
 
-/** Non-streaming attempt while holding the provider's single-flight slot —
- *  the queue wait happens BEFORE the caller's first-byte timer starts, so
- *  side agents queued behind a long architect stream keep their budget. */
 async function completeOneMeshCandidate(
   candidate: MeshCandidate,
   params: MeshAttemptParams
@@ -1732,31 +1532,19 @@ function linkSignal(
   return () => outer.removeEventListener('abort', onAbort);
 }
 
-/**
- * Run ONE candidate attempt: emit meta → stream → classify.
- * On failure the lane is already cooldown-marked and the error rethrown.
- * If content was already forwarded to the client the error is rethrown
- * WITHOUT cooldown (partial-output semantics — caller finalizes partial HTML).
- */
 async function runMeshStreamAttempt(params: {
   candidate: MeshCandidate;
   walk: MeshWalkParams;
   budget: MeshWalkBudget;
   onForwardChunk: (chunk: string) => void;
-  /** Per-attempt cancel from raceMeshAttempts (leader already won). */
-  raceSignal?: AbortSignal;
 }): Promise<MeshStreamResult> {
   const { candidate, walk, budget } = params;
-  const modelId =
-    candidate.providerId === 'agentrouter'
-      ? `agentrouter::${candidate.model}`
-      : `mesh::${candidate.providerId}::${candidate.model}`;
-  const modelName = `${candidate.providerLabel} · ${candidate.model}`;
+  const modelId = `agentrouter::${candidate.model}`;
+  const modelName = `AgentRouter · ${candidate.model}`;
   walk.onModelMeta?.({ modelId, modelName, provider: candidate.providerId });
 
   const controller = new AbortController();
   const unlink = linkSignal(walk.signal, controller);
-  const unlinkRace = linkSignal(params.raceSignal, controller);
   let emitted = false;
   try {
     const raw = await streamOneMeshCandidate(
@@ -1781,15 +1569,11 @@ async function runMeshStreamAttempt(params: {
       recordDailyUsage(candidate.providerId, candidate.model);
       return { rawOutput: raw, modelUsed: modelId, modelName, provider: candidate.providerId };
     }
-    markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
+    markGatewayCandidateCooldown(candidate.cooldownKey, 20_000, false);
     throw new MeshHttpError('empty response', null);
   } catch (err) {
-    // Content already reached the caller — surface immediately so the engine
-    // can finalize partial HTML exactly like the previous path did.
     if (emitted) throw err;
-    // Cancelled by the caller OR by the race (another lane already won) —
-    // never cooldown-mark a healthy model just because we stopped asking.
-    if (walk.signal?.aborted || params.raceSignal?.aborted) {
+    if (walk.signal?.aborted) {
       throw new Error('Request cancelled.');
     }
     const info = normalizeMeshError(err);
@@ -1798,126 +1582,15 @@ async function runMeshStreamAttempt(params: {
     throw err;
   } finally {
     unlink();
-    unlinkRace();
   }
 }
 
-type MeshRaceOutcome =
-  | { kind: 'success'; result: MeshStreamResult }
-  /** The candidate that streamed to the client died mid-output — rethrow. */
-  | { kind: 'leader-failed'; err: unknown }
-  /** Nobody produced content — details feed the aggregate friendly error. */
-  | { kind: 'all-failed'; details: string[] };
-
-/**
- * Race the top-N candidates concurrently (chat speed path). The first
- * candidate to emit a content chunk becomes the leader and is the only one
- * whose chunks reach the client; the others keep running for redundancy and
- * simply get ignored if they finish. If the leader dies after streaming,
- * its error is rethrown (partial-output semantics). If nobody streams,
- * the caller falls through to the remaining candidates sequentially.
- */
-async function raceMeshAttempts(params: {
-  candidates: MeshCandidate[];
-  walk: MeshWalkParams;
-  budget: MeshWalkBudget;
-}): Promise<MeshRaceOutcome> {
-  const { candidates, walk, budget } = params;
-  let leaderIdx: number | null = null;
-  const attemptControllers = candidates.map(() => new AbortController());
-  let notifyLeaderSettled: () => void = () => undefined;
-  const leaderSettled = new Promise<void>((resolve) => {
-    notifyLeaderSettled = resolve;
-  });
-
-  const settledPromise = Promise.all(
-    candidates.map((candidate, idx) =>
-      runMeshStreamAttempt({
-        candidate,
-        walk,
-        budget,
-        raceSignal: attemptControllers[idx].signal,
-        onForwardChunk: (chunk) => {
-          if (leaderIdx === null) leaderIdx = idx;
-          if (leaderIdx === idx) walk.onContentChunk?.(chunk);
-          // A non-leader's chunks are suppressed — the client only ever sees
-          // one coherent stream.
-        },
-      })
-        .then((result) => ({ idx, ok: true as const, result }))
-        .catch((err: unknown) => ({ idx, ok: false as const, err }))
-        .then((entry) => {
-          if (leaderIdx === idx) notifyLeaderSettled();
-          return entry;
-        })
-    )
-  );
-
-  // The leader decided the stream — cancel every other attempt (including
-  // ones still queued on the provider single-flight slot) so chat returns
-  // the moment the winner finishes instead of waiting for the slowest lane.
-  void leaderSettled.then(() => {
-    attemptControllers.forEach((controller, idx) => {
-      if (idx !== leaderIdx) controller.abort();
-    });
-  });
-
-  const settled = await settledPromise;
-
-  if (leaderIdx !== null) {
-    const leader = settled[leaderIdx];
-    if (leader?.ok) return { kind: 'success', result: leader.result };
-    if (leader && !leader.ok) return { kind: 'leader-failed', err: leader.err };
-  }
-  const details = settled.map((entry) => {
-    if (entry.ok) return `${candidates[entry.idx].providerId}: empty response`;
-    const info = normalizeMeshError(entry.err);
-    return `${candidates[entry.idx].providerId}: ${info.message}`;
-  });
-  return { kind: 'all-failed', details };
-}
-
-/** Top-N race picks with at most one lane per provider — two models of the
- *  SAME provider would only queue behind each other on the single-flight
- *  slot, so racing them together just wasted the walk budget. */
-function pickRaceCandidates(candidates: MeshCandidate[], count: number): MeshCandidate[] {
-  const picked: MeshCandidate[] = [];
-  const seenProviders = new Set<string>();
-  for (const candidate of candidates) {
-    if (picked.length >= count) break;
-    if (seenProviders.has(candidate.providerId)) continue;
-    seenProviders.add(candidate.providerId);
-    picked.push(candidate);
-  }
-  for (const candidate of candidates) {
-    if (picked.length >= count) break;
-    if (!picked.includes(candidate)) picked.push(candidate);
-  }
-  return picked;
-}
-
-/**
- * Streaming failover walk across the whole mesh.
- *  - chat: races the top-3 candidates, then falls back sequentially.
- *  - build: streams one lane live in order (the parallel 3-agent fan-out for
- *    fresh builds lives in `_realtimeEngine` and calls this for the architect).
- * Returns the winning candidate's full output.
- * Throws FreeAiMeshUnavailableError / FreeAiMeshAllFailedError / rethrows
- * partial-output or cancellation errors immediately.
- */
 export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStreamResult> {
   const budget = budgetFor(params.taskKind);
   let cooldownWaits = 0;
 
-  // Bounded self-heal: when every configured engine is only SHORT-cooling
-  // (busy storms recover in seconds), wait for the earliest one instead of
-  // surfacing "all configured engines are cooling down". Long cooldowns
-  // (rate-limit 90s, network 45s…) still fail fast with the friendly error.
   const tryWaitForCooldowns = async (): Promise<boolean> => {
-    // Up to two bounded waits per walk: busy cooldowns are 6s, so one wait
-    // can expire while a cross-instance lane still holds the provider —
-    // a second short wait gives it room to finish instead of failing.
-    if (cooldownWaits >= 2) return false;
+    if (cooldownWaits >= 1) return false;
     if (!getFreeAiMeshStatus().hasAny) return false;
     if (buildMeshCandidates().length > 0) return false;
     const earliest = earliestMeshCooldownMs();
@@ -1936,8 +1609,6 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
     params.requestedModel
   );
   if (candidates.length === 0) {
-    // Distinguish "nothing configured" from "everything configured but cooling
-    // down / quota-capped" so the user gets an actionable message.
     if (getFreeAiMeshStatus().hasAny) {
       if (await tryWaitForCooldowns()) {
         candidates = prioritizeCandidatesForRequestedModel(
@@ -1946,7 +1617,8 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
         );
       } else {
         throw new FreeAiMeshAllFailedError([
-          'all configured engines are cooling down after recent errors',
+          lastAgentRouterDiag?.message ||
+            'AgentRouter models are temporarily cooling down after recent errors',
         ]);
       }
     } else {
@@ -1957,62 +1629,27 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
   const deadlineAt = Date.now() + budget.walkMs;
   const details: string[] = [];
   let attempts = 0;
-  const racedSet = new Set<MeshCandidate>();
-
-  // When AgentRouter (or another explicit primary API key) leads, route directly
-  // through that brain first so fast keyless fallback lanes don't steal chat turns.
-  const primaryIsExplicitBrain = candidates[0]?.providerId === 'agentrouter';
-
-  // Fast path: keyless chat races the top candidates so the quickest free AI answers.
-  // One lane per provider — same-provider models would only queue behind
-  // each other on the single-flight slot.
-  if (params.taskKind === 'chat' && !primaryIsExplicitBrain && candidates.length > 1) {
-    const racePicks = pickRaceCandidates(candidates, Math.min(3, candidates.length));
-    attempts += racePicks.length;
-    for (const pick of racePicks) racedSet.add(pick);
-    const raced = await raceMeshAttempts({
-      candidates: racePicks,
-      walk: params,
-      budget,
-    });
-    if (raced.kind === 'success') return raced.result;
-    if (raced.kind === 'leader-failed') throw raced.err;
-    details.push(...raced.details);
-  }
 
   const runSequential = async (list: MeshCandidate[]): Promise<MeshStreamResult | null> => {
     for (const candidate of list) {
-      if (racedSet.has(candidate)) continue;
       if (params.signal?.aborted) throw new Error('Request cancelled.');
       if (Date.now() > deadlineAt || attempts >= budget.maxAttempts) return null;
       attempts += 1;
-      let busyRetries = 0;
-      for (;;) {
-        try {
-          return await runMeshStreamAttempt({
-            candidate,
-            walk: params,
-            budget,
-            onForwardChunk: (chunk) => params.onContentChunk?.(chunk),
-          });
-        } catch (err) {
-          if (params.signal?.aborted) throw new Error('Request cancelled.');
-          const info = normalizeMeshError(err);
-          // Another lane (chat race, side agent, separate serverless instance)
-          // holds this provider right now. Wait out the 6s busy cooldown and
-          // retry THIS lane once — a fault elsewhere must not fail the walk.
-          if (
-            isBusyMeshError(info) &&
-            busyRetries < 1 &&
-            Date.now() + 6_800 < deadlineAt
-          ) {
-            busyRetries += 1;
-            await sleepWithSignal(6_400, params.signal).catch(() => undefined);
-            if (params.signal?.aborted) throw new Error('Request cancelled.');
-            continue;
-          }
-          details.push(`${candidate.providerId}: ${info.message}`);
-          break;
+      try {
+        return await runMeshStreamAttempt({
+          candidate,
+          walk: params,
+          budget,
+          onForwardChunk: (chunk) => params.onContentChunk?.(chunk),
+        });
+      } catch (err) {
+        if (params.signal?.aborted) throw new Error('Request cancelled.');
+        const info = normalizeMeshError(err);
+        details.push(`${candidate.model}: ${info.message}`);
+        // Auth failures apply to the AgentRouter API key as a whole — fail fast
+        // with the exact upstream error instead of retrying 5 other models.
+        if (isAuthError(info)) {
+          throw new FreeAiMeshAllFailedError(details);
         }
       }
     }
@@ -2022,10 +1659,10 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
   const firstPass = await runSequential(candidates);
   if (firstPass) return firstPass;
 
-  // Everything failed or raced — one bounded cooldown wait, then retry
-  // whatever recovered (busy cooldowns expire in seconds; never permanent).
   if (await tryWaitForCooldowns()) {
-    const retryPass = await runSequential(buildMeshCandidates());
+    const retryPass = await runSequential(
+      prioritizeCandidatesForRequestedModel(buildMeshCandidates(), params.requestedModel)
+    );
     if (retryPass) return retryPass;
   }
 
@@ -2033,11 +1670,6 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
   throw new FreeAiMeshAllFailedError(details);
 }
 
-/**
- * Non-streaming failover walk for optional sub-passes (repair, design
- * architect). NEVER throws — returns null when no lane produced output, so
- * callers can degrade gracefully inside their own timeouts.
- */
 export async function completeFreeAiMesh(params: {
   taskKind: 'chat' | 'build';
   requestedModel?: string;
@@ -2046,81 +1678,44 @@ export async function completeFreeAiMesh(params: {
   userPrompt: string;
   attachmentDataUrl?: string | null;
   signal?: AbortSignal;
-  /** Per-attempt first-byte budget (callers race this against their own timer). */
   timeoutMs?: number;
 }): Promise<string | null> {
   const attemptMs = Math.max(3_000, Math.min(params.timeoutMs ?? 25_000, 25_000));
-  let candidates = prioritizeCandidatesForRequestedModel(
+  const candidates = prioritizeCandidatesForRequestedModel(
     buildMeshCandidates(),
     params.requestedModel
   );
-  if (candidates.length === 0) {
-    // Short busy cooldowns: wait them out once (bounded) instead of silently
-    // degrading the caller to architect-only output.
-    const earliest = earliestMeshCooldownMs();
-    // Must be able to cover a full 6s busy cooldown (was 5s — always too
-    // short, so side agents failed instantly while Pollinations was busy).
-    const waitCapMs = Math.min(attemptMs, 8_000);
-    if (earliest > 0 && earliest <= waitCapMs && getFreeAiMeshStatus().hasAny) {
-      await sleepWithSignal(earliest + 200, params.signal).catch(() => undefined);
-      candidates = prioritizeCandidatesForRequestedModel(
-        buildMeshCandidates(),
-        params.requestedModel
-      );
-    }
-    if (candidates.length === 0) return null;
-  }
+  if (candidates.length === 0) return null;
 
-  // Queue-tolerant deadline: the first-byte budget starts only AFTER the
-  // single-flight slot is granted (inside completeOneMeshCandidate), so a
-  // side agent queued behind a long architect stream must not have its whole
-  // budget consumed while waiting. Grace covers the slot wait itself.
-  const deadlineAt = Date.now() + attemptMs + 130_000;
+  const deadlineAt = Date.now() + attemptMs + 30_000;
   for (const candidate of candidates) {
     if (params.signal?.aborted) return null;
     if (Date.now() > deadlineAt) return null;
-    let busyRetries = 0;
-    for (;;) {
-      const controller = new AbortController();
-      const unlink = linkSignal(params.signal, controller);
-      try {
-        const out = await completeOneMeshCandidate(candidate, {
-          taskKind: params.taskKind,
-          systemPrompt: params.systemPrompt,
-          historyMessages: params.historyMessages,
-          userPrompt: params.userPrompt,
-          attachmentDataUrl: params.attachmentDataUrl,
-          signal: controller,
-          firstByteTimeoutMs: attemptMs,
-        });
-        if (out.trim()) {
-          recordDailyUsage(candidate.providerId, candidate.model);
-          return out;
-        }
-        markGatewayCandidateCooldown(candidate.cooldownKey, 45_000, false);
-        break;
-      } catch (err) {
-        if (params.signal?.aborted) return null;
-        const info = normalizeMeshError(err);
-        const { ms, hard } = cooldownForMeshError(info);
-        markGatewayCandidateCooldown(candidate.cooldownKey, ms, hard);
-        // Busy = another lane holds the provider. Wait out the short cooldown
-        // and retry this lane once before moving on (fault isolation).
-        if (
-          isBusyMeshError(info) &&
-          !hard &&
-          busyRetries < 1 &&
-          Date.now() + ms + 600 < deadlineAt
-        ) {
-          busyRetries += 1;
-          await sleepWithSignal(ms + 400, params.signal).catch(() => undefined);
-          if (params.signal?.aborted) return null;
-          continue;
-        }
-        break;
-      } finally {
-        unlink();
+    const controller = new AbortController();
+    const unlink = linkSignal(params.signal, controller);
+    try {
+      const out = await completeOneMeshCandidate(candidate, {
+        taskKind: params.taskKind,
+        systemPrompt: params.systemPrompt,
+        historyMessages: params.historyMessages,
+        userPrompt: params.userPrompt,
+        attachmentDataUrl: params.attachmentDataUrl,
+        signal: controller,
+        firstByteTimeoutMs: attemptMs,
+      });
+      if (out.trim()) {
+        recordDailyUsage(candidate.providerId, candidate.model);
+        return out;
       }
+      markGatewayCandidateCooldown(candidate.cooldownKey, 20_000, false);
+    } catch (err) {
+      if (params.signal?.aborted) return null;
+      const info = normalizeMeshError(err);
+      const { ms, hard } = cooldownForMeshError(info);
+      markGatewayCandidateCooldown(candidate.cooldownKey, ms, hard);
+      if (isAuthError(info)) return null;
+    } finally {
+      unlink();
     }
   }
   return null;

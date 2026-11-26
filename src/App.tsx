@@ -1098,11 +1098,11 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
           return matched ? matched.id : fetched[0].id;
         });
       } else if (!response.ok || data?.error) {
-        setModelsError(data?.error || 'Unable to load free AI models.');
+        setModelsError(data?.error || 'Unable to load AgentRouter models.');
       }
     } catch (err) {
       setModelsError(
-        err instanceof Error ? err.message : 'Unable to load free AI models.'
+        err instanceof Error ? err.message : 'Unable to load AgentRouter models.'
       );
     } finally {
       setModelsLoading(false);

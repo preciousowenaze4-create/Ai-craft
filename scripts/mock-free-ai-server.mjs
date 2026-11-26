@@ -98,6 +98,19 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(stats));
     return;
   }
+  if (req.method === 'GET' && req.url === '/v1/models') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        object: 'list',
+        data: [
+          { id: 'gpt-6.2-sol' },
+          { id: 'gpt-6.2-astra' },
+        ],
+      })
+    );
+    return;
+  }
   if (req.method === 'POST' && req.url === '/__stats/reset') {
     stats.count = 0;
     stats.active = 0;

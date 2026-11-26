@@ -584,14 +584,14 @@ async function startServer() {
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       ok: true,
-      geminiConfigured: Boolean(getServerGeminiApiKey()),
+      geminiConfigured: false,
       agentRouterConfigured,
       agentRouter: getAgentRouterDiagnostic(),
       serverFreeAiReady: mesh.hasAny,
       freeAiMesh: {
         hasAny: mesh.hasAny,
-        hasKeyless: mesh.hasKeyless,
-        pollinationsEnabled: mesh.pollinationsEnabled,
+        hasKeyless: false,
+        pollinationsEnabled: false,
         providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
         modelPool: mesh.modelPool,
       },
@@ -2444,43 +2444,30 @@ async function startServer() {
     res.json({
       models: getFreeMeshModelOptions(),
       gateways: [
-        ...(agentRouterConfigured
-          ? [
-              {
-                id: 'agentrouter',
-                label: 'AgentRouter · Primary Brain',
-                baseUrl: getAgentRouterApiOrigin(),
-                configured: true,
-                keyCount: 1,
-                modelCount: agentRouterStatus?.modelCount || 0,
-                defaultModel: 'agentrouter::auto',
-              },
-            ]
-          : []),
         {
-          id: 'free-mesh',
-          label: 'Free AI Mesh',
-          baseUrl: 'keyless failover across free providers',
-          configured: mesh.hasAny,
-          keyCount: 0,
-          modelCount: mesh.modelPool.activeModels,
-          defaultModel: agentRouterConfigured ? 'agentrouter::auto' : 'mesh::auto',
+          id: 'agentrouter',
+          label: 'AgentRouter',
+          baseUrl: getAgentRouterApiOrigin(),
+          configured: agentRouterConfigured,
+          keyCount: agentRouterConfigured ? 1 : 0,
+          modelCount: agentRouterStatus?.modelCount || 5,
+          defaultModel: 'agentrouter::auto',
         },
       ],
       geminiConfigured: false,
       agentRouterConfigured,
       serverFreeAiReady: mesh.hasAny,
-      pollinationsConfigured: mesh.pollinationsConfigured,
+      pollinationsConfigured: false,
       puterConfigured: false,
-      keyless: mesh.hasKeyless,
+      keyless: false,
       freeAiMesh: {
         hasAny: mesh.hasAny,
-        hasKeyless: mesh.hasKeyless,
+        hasKeyless: false,
         providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
         modelPool: mesh.modelPool,
       },
       modelPool: mesh.modelPool,
-      freeOnly: !agentRouterConfigured,
+      freeOnly: false,
     });
   });
 
@@ -3197,7 +3184,8 @@ async function startServer() {
         type: 'phase',
         phase: 'understanding',
         kind: 'chat',
-        label: 'Searching live web & thinking...',
+        action: 'Thinking',
+        label: 'Thinking...',
       });
 
       const memAuth =
@@ -3249,20 +3237,13 @@ async function startServer() {
         },
       });
 
-      const agentRouterPrimary =
-        isAgentRouterConfigured() &&
-        (!requestedModel || requestedModel.startsWith('agentrouter::'));
-
       sendEvent({
         type: 'meta',
         kind: prepared.naturalMediaIntent ? 'media' : 'chat',
-        modelId:
-          requestedModel || (agentRouterPrimary ? 'agentrouter::auto' : 'mesh::auto'),
-        modelName:
-          prepared.requestedModelLabel ||
-          (agentRouterPrimary ? 'AgentRouter · Auto' : 'Free AI Mesh · Auto'),
-        provider: agentRouterPrimary ? 'agentrouter' : 'free-mesh',
-        gateway: agentRouterPrimary ? 'agentrouter' : 'mesh',
+        modelId: requestedModel || 'agentrouter::auto',
+        modelName: prepared.requestedModelLabel || 'AgentRouter · Auto',
+        provider: 'agentrouter',
+        gateway: 'agentrouter',
         isFallback: false,
       });
 
@@ -3301,7 +3282,7 @@ async function startServer() {
           billing: initialBillingSummary,
           media: mediaResult,
           modelUsed: mediaResult.modelId || 'free-media',
-          modelName: prepared.requestedModelLabel || 'Free AI Studio',
+          modelName: prepared.requestedModelLabel || 'AgentRouter',
           provider: mediaResult.gateway,
           startedAt: job.startedAt,
         });
@@ -3319,12 +3300,9 @@ async function startServer() {
       let lastPreviewBytesSent = 0;
       let emittedReasoningPhase = false;
 
-      let activeModelUsed =
-        requestedModel || (agentRouterPrimary ? 'agentrouter::auto' : 'mesh::auto');
-      let activeModelName =
-        prepared.requestedModelLabel ||
-        (agentRouterPrimary ? 'AgentRouter · Auto' : 'Free AI Mesh · Auto');
-      let activeProvider = agentRouterPrimary ? 'agentrouter' : 'free-mesh';
+      let activeModelUsed = requestedModel || 'agentrouter::auto';
+      let activeModelName = prepared.requestedModelLabel || 'AgentRouter · Auto';
+      let activeProvider = 'agentrouter';
       let parallelMergedRaw: string | null = null;
 
       let lastReasoningUpdateAt = 0;
@@ -3375,13 +3353,12 @@ async function startServer() {
           if (enteredCodePhase) return;
           reasoningBuffer = `${reasoningBuffer}${reasoningChunk}`.slice(-600);
           const now = Date.now();
-          if (!emittedReasoningPhase || now - lastReasoningUpdateAt >= 1600) {
+          if (!emittedReasoningPhase || now - lastReasoningUpdateAt >= 1400) {
             emittedReasoningPhase = true;
             lastReasoningUpdateAt = now;
             const headingMatches = Array.from(reasoningBuffer.matchAll(/\*\*([^*\n]{4,72})\*\*/g));
             const latestHeading =
-              headingMatches[headingMatches.length - 1]?.[1]?.trim() ||
-              'Planning screens, data & layout step by step...';
+              headingMatches[headingMatches.length - 1]?.[1]?.trim() || 'Thinking...';
             sendEvent({
               type: 'phase',
               phase: 'understanding',
@@ -3393,6 +3370,23 @@ async function startServer() {
         },
         onContentChunk: (chunk) => {
           rawAccumulated += chunk;
+          const openThinkIdx = rawAccumulated.lastIndexOf('<think>');
+          const closeThinkIdx = rawAccumulated.lastIndexOf('</think>');
+          if (openThinkIdx !== -1 && openThinkIdx > closeThinkIdx && !enteredCodePhase) {
+            const now = Date.now();
+            if (!emittedReasoningPhase || now - lastReasoningUpdateAt >= 1200) {
+              emittedReasoningPhase = true;
+              lastReasoningUpdateAt = now;
+              sendEvent({
+                type: 'phase',
+                phase: 'understanding',
+                kind: prepared.initialRoute === 'build' ? 'build' : 'chat',
+                action: 'Thinking',
+                label: 'Thinking...',
+              });
+            }
+            return;
+          }
           const cleanSoFar = stripReasoningTags(rawAccumulated);
 
           const foundTitle = extractSessionTitleFromRaw(cleanSoFar);

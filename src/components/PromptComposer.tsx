@@ -142,7 +142,7 @@ export function PromptComposer({
           : '0 6px 24px rgba(15, 15, 30, 0.045)',
       }}
     >
-      {models.length > 1 && (
+      {models.length > 0 && (
         <div className="flex items-center justify-between gap-2 pb-1.5 mb-1 border-b border-black/[0.05]">
           <div className="flex items-center gap-2 min-w-0">
             <ProviderLogo
@@ -153,11 +153,11 @@ export function PromptComposer({
             />
             <span className="text-[12.5px] font-medium text-[#18181B] truncate">
               {activeModel?.name ??
-                (modelsLoading ? 'Connecting free AI mesh...' : 'Free AI Mesh')}
+                (modelsLoading ? 'Connecting AgentRouter...' : 'AgentRouter')}
             </span>
-            <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 border border-emerald-200 px-2 py-0.5 text-[10.5px] font-semibold text-emerald-700 shrink-0">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-              Free · no key
+            <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10.5px] font-semibold text-indigo-700 shrink-0">
+              <span className="w-1.5 h-1.5 rounded-full bg-indigo-500" />
+              AgentRouter
             </span>
           </div>
 

@@ -1,4 +1,3 @@
-import { hasServerFreeAiKey } from './_aiGateways.js';
 import {
   getAgentRouterApiOrigin,
   getFreeAiMeshStatus,
@@ -20,44 +19,31 @@ export async function GET(request: Request): Promise<Response> {
       {
         models: getFreeMeshModelOptions(),
         gateways: [
-          ...(agentRouterConfigured
-            ? [
-                {
-                  id: 'agentrouter',
-                  label: 'AgentRouter',
-                  baseUrl: getAgentRouterApiOrigin(),
-                  configured: true,
-                  keyCount: 1,
-                  modelCount:
-                    mesh.providers.find((p) => p.id === 'agentrouter')?.modelCount || 5,
-                  defaultModel: 'agentrouter::auto',
-                },
-              ]
-            : []),
           {
-            id: 'free-mesh',
-            label: 'Free AI Mesh',
-            baseUrl: 'keyless failover across free providers',
-            configured: mesh.hasAny,
-            keyCount: 0,
-            modelCount: mesh.modelPool.activeModels,
-            defaultModel: 'mesh::auto',
+            id: 'agentrouter',
+            label: 'AgentRouter',
+            baseUrl: getAgentRouterApiOrigin(),
+            configured: agentRouterConfigured,
+            keyCount: agentRouterConfigured ? 1 : 0,
+            modelCount:
+              mesh.providers.find((p) => p.id === 'agentrouter')?.modelCount || 5,
+            defaultModel: 'agentrouter::auto',
           },
         ],
         agentRouterConfigured,
         geminiConfigured: false,
         serverFreeAiReady: mesh.hasAny,
-        pollinationsConfigured: mesh.pollinationsConfigured,
+        pollinationsConfigured: false,
         puterConfigured: false,
-        keyless: mesh.hasKeyless,
+        keyless: false,
         freeAiMesh: {
           hasAny: mesh.hasAny,
-          hasKeyless: mesh.hasKeyless,
+          hasKeyless: false,
           providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
           modelPool: mesh.modelPool,
         },
         modelPool: mesh.modelPool,
-        freeOnly: !agentRouterConfigured,
+        freeOnly: false,
       },
       {
         headers: {
@@ -71,19 +57,19 @@ export async function GET(request: Request): Promise<Response> {
       {
         models: getFreeMeshModelOptions(),
         agentRouterConfigured: isAgentRouterConfigured(),
-        geminiConfigured: hasServerFreeAiKey(),
+        geminiConfigured: false,
         serverFreeAiReady: mesh.hasAny,
-        pollinationsConfigured: mesh.pollinationsConfigured,
+        pollinationsConfigured: false,
         puterConfigured: false,
-        keyless: mesh.hasKeyless,
+        keyless: false,
         freeAiMesh: {
           hasAny: mesh.hasAny,
-          hasKeyless: mesh.hasKeyless,
+          hasKeyless: false,
           providers: mesh.providers.filter((p) => p.configured).map((p) => p.id),
           modelPool: mesh.modelPool,
         },
         modelPool: mesh.modelPool,
-        freeOnly: !isAgentRouterConfigured(),
+        freeOnly: false,
       },
       {
         status: 200,
