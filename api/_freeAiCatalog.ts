@@ -23,17 +23,11 @@
 /** Curated free-tier model IDs per mesh provider (real, known entries). */
 export const FREE_MODEL_CATALOG: Record<string, string[]> = {
   agentrouter: [
-    'claude-sonnet-4-5',
-    'claude-opus-4-7',
-    'gpt-5.5',
-    'gpt-5',
-    'deepseek-v3.2',
-    'deepseek-chat',
-    'deepseek-r1',
-    'glm-5.1',
-    'kimi-k2.6',
-    'gpt-4o',
-    'claude-3-7-sonnet-20250219',
+    'gpt-6.2-sol',
+    'gpt-6.2-astra',
+    'gpt-5.6-sol',
+    'gpt-6.1-sol',
+    'claude-opus-5-5',
   ],
   groq: [
     'llama-3.3-70b-versatile',

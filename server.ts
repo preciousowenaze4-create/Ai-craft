@@ -77,6 +77,8 @@ import {
   type GeneratedMediaResult,
 } from './api/_mediaService.js';
 import {
+  getAgentRouterApiOrigin,
+  getAgentRouterDiagnostic,
   getFreeAiMeshStatus,
   getFreeMeshModelOptions,
   isAgentRouterConfigured,
@@ -584,6 +586,7 @@ async function startServer() {
       ok: true,
       geminiConfigured: Boolean(getServerGeminiApiKey()),
       agentRouterConfigured,
+      agentRouter: getAgentRouterDiagnostic(),
       serverFreeAiReady: mesh.hasAny,
       freeAiMesh: {
         hasAny: mesh.hasAny,
@@ -2446,8 +2449,7 @@ async function startServer() {
               {
                 id: 'agentrouter',
                 label: 'AgentRouter · Primary Brain',
-                baseUrl:
-                  (process.env.AGENTROUTER_BASE_URL || 'https://co.agentrouter.org/v1').trim(),
+                baseUrl: getAgentRouterApiOrigin(),
                 configured: true,
                 keyCount: 1,
                 modelCount: agentRouterStatus?.modelCount || 0,

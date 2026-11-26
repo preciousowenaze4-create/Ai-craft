@@ -111,12 +111,60 @@ export class FreeAiMeshAllFailedError extends Error {
 // Env helpers
 // ---------------------------------------------------------------------------
 
+function cleanPastedSecret(rawValue: string | undefined): {
+  cleaned: string;
+  hadQuotes: boolean;
+  hadAssignPrefix: boolean;
+  hadBearerPrefix: boolean;
+  hadWhitespace: boolean;
+  looksLikeUrl: boolean;
+} {
+  if (typeof rawValue !== 'string') {
+    return {
+      cleaned: '',
+      hadQuotes: false,
+      hadAssignPrefix: false,
+      hadBearerPrefix: false,
+      hadWhitespace: false,
+      looksLikeUrl: false,
+    };
+  }
+  let s = rawValue.trim();
+  const hadAssignPrefix = /^(?:export\s+)?[A-Z0-9_]+\s*=\s*/i.test(s);
+  if (hadAssignPrefix) {
+    s = s.replace(/^(?:export\s+)?[A-Z0-9_]+\s*=\s*/i, '').trim();
+  }
+  const strippedQuotes = s.replace(/^[`"'\u201c\u201d\u2018\u2019]+|[`"'\u201c\u201d\u2018\u2019;,]+$/g, '').trim();
+  const hadQuotes = strippedQuotes !== s;
+  s = strippedQuotes;
+  const hadBearerPrefix = /^bearer\s+/i.test(s);
+  if (hadBearerPrefix) {
+    s = s.replace(/^bearer\s+/i, '').trim();
+  }
+  const hadWhitespace = /\s/.test(s);
+  if (hadWhitespace) {
+    // If someone pasted a multi-line snippet or wrapped key, prefer an sk-... token if present,
+    // otherwise collapse internal line breaks/whitespace.
+    const skMatch = s.match(/sk-[A-Za-z0-9._-]+/);
+    s = skMatch ? skMatch[0] : s.replace(/\s+/g, '');
+  }
+  const looksLikeUrl = /^https?:\/\//i.test(s);
+  return {
+    cleaned: s,
+    hadQuotes,
+    hadAssignPrefix,
+    hadBearerPrefix,
+    hadWhitespace,
+    looksLikeUrl,
+  };
+}
+
 function readEnvKey(...names: string[]): string {
   for (const name of names) {
-    const raw = (process.env[name] || '').trim().replace(/^["']|["']$/g, '');
-    if (!raw) continue;
-    if (/^(my[_-]|your[_-]|xxx+|<|change[-_]?me|placeholder)/i.test(raw)) continue;
-    return raw;
+    const { cleaned, looksLikeUrl } = cleanPastedSecret(process.env[name]);
+    if (!cleaned || looksLikeUrl) continue;
+    if (/^(my[_-]|your[_-]|xxx+|<|change[-_]?me|placeholder)/i.test(cleaned)) continue;
+    return cleaned;
   }
   return '';
 }
@@ -300,34 +348,156 @@ const AGENTROUTER_DEFAULT_BASE = 'https://co.agentrouter.org/v1';
 let agentRouterModelsCache: { models: string[]; at: number } | null = null;
 let agentRouterRefreshInFlight = false;
 
+function normalizeAgentRouterOrigin(rawBase: string): string {
+  const trimmed = rawBase.trim();
+  if (!trimmed || !/^https?:\/\//i.test(trimmed)) return AGENTROUTER_DEFAULT_BASE;
+  try {
+    const parsed = new URL(trimmed);
+    const host = parsed.hostname.toLowerCase();
+    // agentrouter.org (root/www) serves the web dashboard behind an interactive
+    // Aliyun WAF captcha; API calls use co.agentrouter.org/v1.
+    if (host === 'agentrouter.org' || host === 'www.agentrouter.org') {
+      parsed.protocol = 'https:';
+      parsed.hostname = 'co.agentrouter.org';
+    }
+    const cleanPath = parsed.pathname
+      .replace(/\/+$/, '')
+      .replace(/\/chat\/completions$/i, '');
+    const v1Path = /\/v1$/i.test(cleanPath)
+      ? cleanPath
+      : cleanPath && cleanPath !== '/'
+        ? `${cleanPath}/v1`
+        : '/v1';
+    return `${parsed.origin}${v1Path}`;
+  } catch {
+    return AGENTROUTER_DEFAULT_BASE;
+  }
+}
+
 function getAgentRouterCredentials(): {
   apiKey: string;
   baseUrl: string;
   v1Origin: string;
+  keyEnvName: string;
+  baseEnvName: string;
+  keyShape: {
+    hadQuotes: boolean;
+    hadAssignPrefix: boolean;
+    hadBearerPrefix: boolean;
+    hadWhitespace: boolean;
+    looksLikeUrl: boolean;
+    looksLikeSkToken: boolean;
+    lengthOk: boolean;
+  };
 } | null {
-  const apiKey = readEnvKey(
+  const keyNames = [
     'AGENTROUTER_API_KEY',
     'AGENT_ROUTER_API_KEY',
-    'AGENTROUTER_KEY'
-  );
-  if (!apiKey) return null;
-  const rawBase =
-    (process.env.AGENTROUTER_BASE_URL || '').trim() || AGENTROUTER_DEFAULT_BASE;
-  if (!/^https?:\/\//i.test(rawBase)) return null;
-  const normalizedBase = rawBase.replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
-  const v1Origin = /\/v1$/i.test(normalizedBase)
-    ? normalizedBase
-    : `${normalizedBase}/v1`;
+    'AGENTROUTER_KEY',
+    'AGENTROUTER_TOKEN',
+  ];
+  let matchedKeyName = '';
+  let keyInfo = cleanPastedSecret(undefined);
+  for (const name of keyNames) {
+    const info = cleanPastedSecret(process.env[name]);
+    if (!info.cleaned) continue;
+    if (/^(my[_-]|your[_-]|xxx+|<|change[-_]?me|placeholder)/i.test(info.cleaned)) continue;
+    matchedKeyName = name;
+    keyInfo = info;
+    break;
+  }
+  if (!matchedKeyName || !keyInfo.cleaned || keyInfo.looksLikeUrl) return null;
+
+  const baseNames = ['AGENTROUTER_BASE_URL', 'AGENT_ROUTER_BASE_URL'];
+  let matchedBaseName = '';
+  let rawBase = '';
+  for (const name of baseNames) {
+    const val = (process.env[name] || '').trim().replace(/^["'`]|["'`]$/g, '');
+    if (val && /^https?:\/\//i.test(val)) {
+      matchedBaseName = name;
+      rawBase = val;
+      break;
+    }
+  }
+  if (!rawBase) rawBase = AGENTROUTER_DEFAULT_BASE;
+  const v1Origin = normalizeAgentRouterOrigin(rawBase);
   return {
-    apiKey,
-    baseUrl: toChatCompletionsUrl(normalizedBase),
+    apiKey: keyInfo.cleaned,
+    baseUrl: toChatCompletionsUrl(v1Origin),
     v1Origin,
+    keyEnvName: matchedKeyName,
+    baseEnvName: matchedBaseName || 'default',
+    keyShape: {
+      hadQuotes: keyInfo.hadQuotes,
+      hadAssignPrefix: keyInfo.hadAssignPrefix,
+      hadBearerPrefix: keyInfo.hadBearerPrefix,
+      hadWhitespace: keyInfo.hadWhitespace,
+      looksLikeUrl: keyInfo.looksLikeUrl,
+      looksLikeSkToken: /^sk-/i.test(keyInfo.cleaned),
+      lengthOk: keyInfo.cleaned.length >= 16,
+    },
+  };
+}
+
+let lastAgentRouterDiag: {
+  checkedAt: string;
+  endpoint: string;
+  status: number | null;
+  message: string;
+} | null = null;
+
+function sanitizeDiagMessage(rawMessage: string): string {
+  return String(rawMessage || '')
+    .replace(/sk-[A-Za-z0-9._-]{6,}/g, 'sk-***')
+    .replace(/Bearer\s+\S+/gi, 'Bearer ***')
+    .trim()
+    .slice(0, 220);
+}
+
+function recordAgentRouterDiag(
+  endpoint: string,
+  status: number | null,
+  rawMessage: string
+): void {
+  lastAgentRouterDiag = {
+    checkedAt: new Date().toISOString(),
+    endpoint,
+    status,
+    message: sanitizeDiagMessage(rawMessage),
+  };
+}
+
+export function getAgentRouterDiagnostic(): {
+  configured: boolean;
+  apiOrigin: string;
+  lastCheckedAt: string | null;
+  lastEndpoint: string | null;
+  lastStatus: number | null;
+  lastMessage: string | null;
+} {
+  const creds = getAgentRouterCredentials();
+  return {
+    configured: Boolean(creds),
+    apiOrigin: creds?.v1Origin || AGENTROUTER_DEFAULT_BASE,
+    lastCheckedAt: lastAgentRouterDiag?.checkedAt ?? null,
+    lastEndpoint: lastAgentRouterDiag?.endpoint ?? null,
+    lastStatus: lastAgentRouterDiag?.status ?? null,
+    lastMessage: lastAgentRouterDiag?.message ?? null,
   };
 }
 
 export function isAgentRouterConfigured(): boolean {
   return Boolean(getAgentRouterCredentials());
 }
+
+export function getAgentRouterApiOrigin(): string {
+  return getAgentRouterCredentials()?.v1Origin || AGENTROUTER_DEFAULT_BASE;
+}
+
+const AGENTROUTER_CLIENT_HEADERS = {
+  'User-Agent': 'codex_cli_rs/0.34.0',
+  Accept: 'application/json',
+};
 
 function scheduleAgentRouterModelsRefresh(v1Origin: string, apiKey: string): void {
   if (agentRouterRefreshInFlight) return;
@@ -337,11 +507,15 @@ function scheduleAgentRouterModelsRefresh(v1Origin: string, apiKey: string): voi
   fetch(`${v1Origin}/models`, {
     headers: {
       Authorization: `Bearer ${apiKey}`,
-      'User-Agent': 'AI-Craft/1.0',
+      ...AGENTROUTER_CLIENT_HEADERS,
     },
     signal: controller.signal,
   })
-    .then((res) => (res.ok ? res.json() : null))
+    .then((res) => {
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      if (!res.ok || ct.includes('text/html')) return null;
+      return res.json();
+    })
     .then((payload: unknown) => {
       const list = Array.isArray((payload as { data?: unknown[] } | null)?.data)
         ? (payload as { data: unknown[] }).data
@@ -378,22 +552,53 @@ export async function refreshAgentRouterModelsIfConfigured(): Promise<string[]> 
   const creds = getAgentRouterCredentials();
   if (!creds) return [];
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 2800);
+  const timer = setTimeout(() => controller.abort(), 3500);
   try {
     const res = await fetch(`${creds.v1Origin}/models`, {
       headers: {
         Authorization: `Bearer ${creds.apiKey}`,
-        'User-Agent': 'AI-Craft/1.0',
+        ...AGENTROUTER_CLIENT_HEADERS,
       },
       signal: controller.signal,
     });
-    if (!res.ok) return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
-    const payload = (await res.json().catch(() => null)) as { data?: unknown[] } | unknown[] | null;
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (!res.ok || ct.includes('text/html')) {
+      const errBody = await res.text().catch(() => '');
+      recordAgentRouterDiag(
+        `${creds.v1Origin}/models`,
+        res.status,
+        ct.includes('text/html') ? 'HTML/WAF response' : errBody || `HTTP ${res.status}`
+      );
+      return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
+    }
+    const payload = (await res.json().catch(() => null)) as
+      | { data?: unknown[]; code?: number; msg?: string }
+      | unknown[]
+      | null;
+    if (
+      payload &&
+      !Array.isArray(payload) &&
+      typeof payload.code === 'number' &&
+      payload.code !== 0 &&
+      payload.code !== 200
+    ) {
+      recordAgentRouterDiag(
+        `${creds.v1Origin}/models`,
+        payload.code,
+        payload.msg || 'AgentRouter error'
+      );
+      return resolveAgentRouterModels(creds.v1Origin, creds.apiKey);
+    }
     const list = Array.isArray((payload as { data?: unknown[] } | null)?.data)
       ? (payload as { data: unknown[] }).data
       : Array.isArray(payload)
         ? payload
         : [];
+    recordAgentRouterDiag(
+      `${creds.v1Origin}/models`,
+      res.status,
+      `ok (${list.length} models)`
+    );
     const names: string[] = [];
     for (const entry of list) {
       const id =
@@ -461,7 +666,7 @@ const MESH_PROVIDERS: MeshProviderDef[] = [
         apiKey: creds.apiKey,
         models: resolveAgentRouterModels(creds.v1Origin, creds.apiKey),
         headers: {
-          'User-Agent': 'AI-Craft/1.0',
+          'User-Agent': 'codex_cli_rs/0.34.0',
           'X-Title': 'AI Craft',
         },
       };
@@ -702,11 +907,11 @@ function budgetFor(taskKind: 'chat' | 'build'): MeshWalkBudget {
   const hasPrimaryRouter = isAgentRouterConfigured();
   if (taskKind === 'chat') {
     return hasPrimaryRouter
-      ? { firstByteMs: 12_000, idleMs: 25_000, walkMs: 45_000, maxAttempts: 8 }
+      ? { firstByteMs: 15_000, idleMs: 25_000, walkMs: 50_000, maxAttempts: 8 }
       : { firstByteMs: 6_000, idleMs: 20_000, walkMs: 30_000, maxAttempts: 8 };
   }
   return hasPrimaryRouter
-    ? { firstByteMs: 18_000, idleMs: 50_000, walkMs: 80_000, maxAttempts: 12 }
+    ? { firstByteMs: 24_000, idleMs: 55_000, walkMs: 90_000, maxAttempts: 12 }
     : { firstByteMs: 10_000, idleMs: 45_000, walkMs: 65_000, maxAttempts: 12 };
 }
 
@@ -799,7 +1004,7 @@ function prioritizeCandidatesForRequestedModel(
             baseUrl: creds.baseUrl,
             apiKey: creds.apiKey,
             headers: {
-              'User-Agent': 'AI-Craft/1.0',
+              'User-Agent': 'codex_cli_rs/0.34.0',
               'X-Title': 'AI Craft',
             },
             model: targetModel,
@@ -1189,9 +1394,10 @@ function extractOpenAiError(json: unknown, fallback: string): string {
     const obj = json as {
       error?: { message?: string; code?: string; type?: string };
       message?: string;
+      msg?: string;
       detail?: string;
     };
-    const msg = obj.error?.message || obj.message || obj.detail;
+    const msg = obj.error?.message || obj.message || obj.msg || obj.detail;
     if (typeof msg === 'string' && msg.trim()) return msg.slice(0, 300);
   }
   return fallback.slice(0, 300);
@@ -1225,15 +1431,26 @@ async function postMeshJson(
         text: '',
         json: null,
       }));
-      throw new MeshHttpError(
-        extractOpenAiError(json, text || `HTTP ${res.status}`),
-        res.status,
-        json ?? text
-      );
+      const errMsg = extractOpenAiError(json, text || `HTTP ${res.status}`);
+      if (candidate.providerId === 'agentrouter') {
+        recordAgentRouterDiag(`${candidate.baseUrl} [${candidate.model}]`, res.status, errMsg);
+      }
+      throw new MeshHttpError(errMsg, res.status, json ?? text);
+    }
+    if (candidate.providerId === 'agentrouter') {
+      recordAgentRouterDiag(`${candidate.baseUrl} [${candidate.model}]`, res.status, 'connected');
     }
     return res;
   } catch (err) {
     if (err instanceof MeshHttpError) throw err;
+    const msg = timedOut
+      ? 'Timed out waiting for first byte'
+      : err instanceof Error
+        ? err.message
+        : String(err);
+    if (candidate.providerId === 'agentrouter') {
+      recordAgentRouterDiag(`${candidate.baseUrl} [${candidate.model}]`, null, msg);
+    }
     if (timedOut) throw new MeshHttpError('Timed out waiting for first byte', null);
     throw err;
   } finally {
@@ -1300,6 +1517,15 @@ async function streamOneMeshCandidateRaw(
       throw new MeshHttpError('Empty response body', res.status);
     }
 
+    if (contentType.includes('text/html')) {
+      const { text } = await readMeshResponseBody(res).catch(() => ({ text: '' }));
+      throw new MeshHttpError(
+        'Upstream returned an HTML/WAF page instead of an API response',
+        502,
+        text.slice(0, 300)
+      );
+    }
+
     // Provider ignored `stream` and returned a plain JSON payload.
     if (contentType.includes('application/json')) {
       const { json, text } = await readMeshResponseBody(res);
@@ -1346,6 +1572,15 @@ async function streamOneMeshCandidateRaw(
           newlineIdx = buffer.indexOf('\n');
           if (!line) continue;
           if (!isEventStream && !line.startsWith('data:')) {
+            if (
+              !raw &&
+              /^<!doctype\s+html|^<html\b|aliyun_waf|CF_APP_WAF/i.test(line)
+            ) {
+              throw new MeshHttpError(
+                'Upstream returned an HTML/WAF challenge instead of an API stream',
+                502
+              );
+            }
             // Plain-text chunked body.
             raw += line;
             onChunk(line);
@@ -1432,7 +1667,18 @@ async function completeOneMeshCandidateRaw(
     },
     params
   );
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
   const { json, text } = await readMeshResponseBody(res);
+  if (
+    contentType.includes('text/html') ||
+    (!json && /^<!doctype\s+html|<html\b|aliyun_waf|CF_APP_WAF/i.test(text))
+  ) {
+    throw new MeshHttpError(
+      'Upstream returned an HTML/WAF page instead of an API response',
+      502,
+      text.slice(0, 300)
+    );
+  }
   const errField = (json as { error?: unknown } | null)?.error;
   if (errField) {
     throw new MeshHttpError(extractOpenAiError(json, 'provider error'), res.status, json);

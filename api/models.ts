@@ -1,5 +1,6 @@
 import { hasServerFreeAiKey } from './_aiGateways.js';
 import {
+  getAgentRouterApiOrigin,
   getFreeAiMeshStatus,
   getFreeMeshModelOptions,
   isAgentRouterConfigured,
@@ -24,11 +25,11 @@ export async function GET(request: Request): Promise<Response> {
                 {
                   id: 'agentrouter',
                   label: 'AgentRouter',
-                  baseUrl: (process.env.AGENTROUTER_BASE_URL || 'https://co.agentrouter.org/v1').trim(),
+                  baseUrl: getAgentRouterApiOrigin(),
                   configured: true,
                   keyCount: 1,
                   modelCount:
-                    mesh.providers.find((p) => p.id === 'agentrouter')?.modelCount || 11,
+                    mesh.providers.find((p) => p.id === 'agentrouter')?.modelCount || 5,
                   defaultModel: 'agentrouter::auto',
                 },
               ]
