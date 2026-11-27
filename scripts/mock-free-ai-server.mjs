@@ -243,7 +243,23 @@ const server = http.createServer((req, res) => {
 
     if (isGeminiEndpoint) {
       const { text: lastUserText } = extractGeminiPromptText(parsed);
+      const hasSearchTool = Array.isArray(parsed.tools) && parsed.tools.some((t) => Boolean(t?.googleSearch));
+      if (hasSearchTool && /__REJECT_TOOLS_400__/.test(lastUserText)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: {
+              code: 400,
+              message: 'Search grounding tool is unsupported for this candidate.',
+              status: 'INVALID_ARGUMENT',
+            },
+          })
+        );
+        return;
+      }
+
       const wantsBuild = /\b(build|todo|app|website|create)\b/i.test(lastUserText);
+      const includeThought = /__INCLUDE_THOUGHT__/.test(lastUserText);
       const replyText =
         mode === 'streaming-html' || (mode === 'streaming' && wantsBuild) ? HTML_APP : REPLY;
 
@@ -257,8 +273,25 @@ const server = http.createServer((req, res) => {
         for (let i = 0; i < replyText.length; i += 700) {
           chunks.push(replyText.slice(i, i + 700));
         }
+        let sentThought = !includeThought;
         let i = 0;
         const send = () => {
+          if (!sentThought) {
+            sentThought = true;
+            const thoughtPayload = {
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [{ text: '**Planning architecture**\nReviewing requirements.', thought: true }],
+                  },
+                },
+              ],
+            };
+            res.write(`data: ${JSON.stringify(thoughtPayload)}\n\n`);
+            setTimeout(send, 5);
+            return;
+          }
           if (i < chunks.length) {
             const isLast = i === chunks.length - 1;
             const payload = {
@@ -268,6 +301,16 @@ const server = http.createServer((req, res) => {
                     role: 'model',
                     parts: [{ text: chunks[i] }],
                   },
+                  ...(isLast && hasSearchTool
+                    ? {
+                        groundingMetadata: {
+                          webSearchQueries: ['gemini live search query'],
+                          groundingChunks: [
+                            { web: { uri: 'https://example.com/live-source', title: 'Live Example Source' } },
+                          ],
+                        },
+                      }
+                    : {}),
                   ...(isLast ? { finishReason: 'STOP' } : {}),
                 },
               ],

@@ -5,6 +5,7 @@ import {
   buildProjectInfraContext,
   classifyInitialRoute,
   deriveServerSessionTitle,
+  detectArtifactCompletionStates,
   extractDbSchemaFromHtml,
   extractDbSchemaFromRaw,
   extractLiveBuildArtifacts,
@@ -39,6 +40,7 @@ import {
   isFreeAiMeshAvailable,
   isMeshParallelBuildsEnabled,
   streamFreeAiMesh,
+  type MeshGroundingMeta,
 } from './_freeAiMesh.js';
 
 export function createGeminiClient(apiKey: string): GoogleGenAI {
@@ -61,11 +63,284 @@ export interface VisualHintsSpec {
   height?: number;
 }
 
+export interface StreamBuildStep {
+  id: string;
+  kind?: 'thought' | 'search' | 'read' | 'edit' | 'check';
+  label: string;
+  detail?: string;
+  file?: string;
+  files?: Array<{ path: string; status: 'running' | 'complete' }>;
+  queries?: string[];
+  sources?: Array<{ title: string; url: string }>;
+  action?: string;
+  status: 'pending' | 'running' | 'complete' | 'error';
+  startedAt?: number;
+  endedAt?: number;
+  durationSec?: number;
+}
+
 export interface PrepareRealtimeStageEvent {
   phase: 'understanding' | 'building';
   kind: 'chat' | 'build' | 'media';
+  stepKind?: 'thought' | 'search' | 'read';
+  stepStatus?: 'running' | 'complete';
   action: string;
   label: string;
+  queries?: string[];
+  sources?: Array<{ title: string; url: string }>;
+}
+
+export function createRealtimeStepTracker(
+  onStep: (step: StreamBuildStep) => void
+) {
+  const steps: StreamBuildStep[] = [];
+  let thoughtSeq = 0;
+  let activeThoughtId: string | null = null;
+  let thoughtText = '';
+  let lastThoughtEmitAt = 0;
+  let lastEditEmitKey = '';
+  let lastEditEmitAt = 0;
+
+  const cloneStep = (s: StreamBuildStep): StreamBuildStep => ({
+    ...s,
+    files: s.files ? s.files.map((f) => ({ ...f })) : undefined,
+    queries: s.queries ? [...s.queries] : undefined,
+    sources: s.sources ? s.sources.map((src) => ({ ...src })) : undefined,
+  });
+
+  const upsertStep = (next: StreamBuildStep) => {
+    const idx = steps.findIndex((s) => s.id === next.id);
+    if (idx === -1) {
+      steps.push(cloneStep(next));
+    } else {
+      steps[idx] = cloneStep({ ...steps[idx], ...next });
+    }
+    onStep(cloneStep(steps[idx === -1 ? steps.length - 1 : idx]));
+  };
+
+  const handleStage = (stage: PrepareRealtimeStageEvent) => {
+    if (!stage.stepKind) return;
+    const now = Date.now();
+    const id = stage.stepKind === 'read' ? 'step-read' : 'step-search-pre';
+    const existing = steps.find((s) => s.id === id);
+    const startedAt = existing?.startedAt ?? now;
+    const isComplete = stage.stepStatus === 'complete';
+    const endedAt = isComplete ? now : undefined;
+    const durationSec =
+      isComplete && endedAt
+        ? Math.max(1, Math.round((endedAt - startedAt) / 1000))
+        : undefined;
+    upsertStep({
+      id,
+      kind: stage.stepKind,
+      action: stage.action,
+      label: stage.label,
+      queries: stage.queries,
+      sources: stage.sources,
+      status: isComplete ? 'complete' : 'running',
+      startedAt,
+      endedAt,
+      durationSec,
+    });
+  };
+
+  const pushReasoning = (chunkText: string) => {
+    const chunk = chunkText || '';
+    if (!chunk) return;
+    const now = Date.now();
+    if (!activeThoughtId) {
+      thoughtSeq += 1;
+      activeThoughtId = `step-thought-${thoughtSeq}`;
+      thoughtText = '';
+      lastThoughtEmitAt = 0;
+    }
+    thoughtText = `${thoughtText}${chunk}`.slice(-1800);
+    if (now - lastThoughtEmitAt < 350 && steps.some((s) => s.id === activeThoughtId)) {
+      return;
+    }
+    lastThoughtEmitAt = now;
+    const existing = steps.find((s) => s.id === activeThoughtId);
+    const headingMatches = Array.from(thoughtText.matchAll(/\*\*([^*\n]{4,72})\*\*/g));
+    const latestHeading =
+      headingMatches[headingMatches.length - 1]?.[1]?.trim() || 'Thinking...';
+    upsertStep({
+      id: activeThoughtId,
+      kind: 'thought',
+      action: 'Thinking',
+      label: latestHeading,
+      detail: thoughtText.trim(),
+      status: 'running',
+      startedAt: existing?.startedAt ?? now,
+    });
+  };
+
+  const completeActiveThought = () => {
+    if (!activeThoughtId) return;
+    const existing = steps.find((s) => s.id === activeThoughtId);
+    if (existing) {
+      const now = Date.now();
+      const startedAt = existing.startedAt ?? now;
+      const durationSec = Math.max(1, Math.round((now - startedAt) / 1000));
+      upsertStep({
+        ...existing,
+        action: 'Thought',
+        label: `Thought for ${durationSec}s`,
+        detail: thoughtText.trim() || existing.detail,
+        status: 'complete',
+        endedAt: now,
+        durationSec,
+      });
+    }
+    activeThoughtId = null;
+    thoughtText = '';
+  };
+
+  const pushGrounding = (meta: MeshGroundingMeta) => {
+    const queries = (meta.queries || []).filter(Boolean);
+    const sources = (meta.sources || []).filter((s) => s.url);
+    if (queries.length === 0 && sources.length === 0) return;
+    const now = Date.now();
+    const existing = steps.find((s) => s.id === 'step-search-grounding');
+    const mergedQueries = Array.from(
+      new Set([...(existing?.queries || []), ...queries])
+    ).slice(0, 6);
+    const mergedSources = Array.from(
+      new Map(
+        [...(existing?.sources || []), ...sources].map((src) => [src.url, src])
+      ).values()
+    ).slice(0, 8);
+    upsertStep({
+      id: 'step-search-grounding',
+      kind: 'search',
+      action: 'Searched web',
+      label: mergedQueries[0]
+        ? `Searched web: ${mergedQueries[0]}`
+        : 'Searched web',
+      queries: mergedQueries,
+      sources: mergedSources,
+      status: 'complete',
+      startedAt: existing?.startedAt ?? now,
+      endedAt: now,
+      durationSec: 1,
+    });
+  };
+
+  const pushCodeProgress = (htmlSoFar: string, isPatch: boolean) => {
+    completeActiveThought();
+    const now = Date.now();
+    const states = isPatch
+      ? [{ path: 'index.html', action: 'Editing', status: 'running' as const }]
+      : detectArtifactCompletionStates(htmlSoFar);
+    if (states.length === 0) return;
+    const activeItem =
+      [...states].reverse().find((s) => s.status === 'running') ||
+      states[states.length - 1];
+    const editKey = states.map((s) => `${s.path}:${s.status}`).join('|');
+    if (editKey === lastEditEmitKey && now - lastEditEmitAt < 500) {
+      return;
+    }
+    lastEditEmitKey = editKey;
+    lastEditEmitAt = now;
+    const existing = steps.find((s) => s.id === 'step-edit-files');
+    upsertStep({
+      id: 'step-edit-files',
+      kind: 'edit',
+      action: isPatch ? 'Editing file' : 'Editing files',
+      label: activeItem ? `Editing ${activeItem.path}` : 'Editing files',
+      file: activeItem?.path || 'index.html',
+      files: states.map((s) => ({ path: s.path, status: s.status })),
+      status: 'running',
+      startedAt: existing?.startedAt ?? now,
+    });
+  };
+
+  const startCheck = (label = 'Checking files & live preview') => {
+    completeActiveThought();
+    const now = Date.now();
+    const existing = steps.find((s) => s.id === 'step-check');
+    upsertStep({
+      id: 'step-check',
+      kind: 'check',
+      action: 'Checking',
+      label,
+      status: 'running',
+      startedAt: existing?.startedAt ?? now,
+    });
+  };
+
+  const finishSteps = (finalFiles: string[]): StreamBuildStep[] => {
+    completeActiveThought();
+    const now = Date.now();
+
+    const preRead = steps.find((s) => s.id === 'step-read');
+    if (preRead && preRead.status !== 'complete') {
+      upsertStep({
+        ...preRead,
+        status: 'complete',
+        endedAt: now,
+        durationSec: Math.max(1, Math.round((now - (preRead.startedAt ?? now)) / 1000)),
+      });
+    }
+
+    const preSearch = steps.find((s) => s.id === 'step-search-pre');
+    if (preSearch && preSearch.status !== 'complete') {
+      upsertStep({
+        ...preSearch,
+        status: 'complete',
+        endedAt: now,
+        durationSec: Math.max(1, Math.round((now - (preSearch.startedAt ?? now)) / 1000)),
+      });
+    }
+
+    const editStep = steps.find((s) => s.id === 'step-edit-files');
+    if (editStep || finalFiles.length > 0) {
+      const mergedPaths = Array.from(
+        new Set([
+          ...(editStep?.files?.map((f) => f.path) || []),
+          ...finalFiles,
+        ])
+      );
+      const startedAt = editStep?.startedAt ?? now;
+      upsertStep({
+        id: 'step-edit-files',
+        kind: 'edit',
+        action: 'Edited files',
+        label: mergedPaths.length > 1 ? 'Edited files' : `Edited ${mergedPaths[0] || 'index.html'}`,
+        file: mergedPaths[0] || 'index.html',
+        files: mergedPaths.map((p) => ({ path: p, status: 'complete' as const })),
+        status: 'complete',
+        startedAt,
+        endedAt: now,
+        durationSec: Math.max(1, Math.round((now - startedAt) / 1000)),
+      });
+    }
+
+    const checkStep = steps.find((s) => s.id === 'step-check');
+    if (checkStep) {
+      const startedAt = checkStep.startedAt ?? now;
+      upsertStep({
+        ...checkStep,
+        action: 'Checked',
+        label: 'Verified live preview & database',
+        status: 'complete',
+        endedAt: now,
+        durationSec: Math.max(1, Math.round((now - startedAt) / 1000)),
+      });
+    }
+
+    return steps.map(cloneStep);
+  };
+
+  return {
+    handleStage,
+    pushReasoning,
+    completeActiveThought,
+    pushGrounding,
+    pushCodeProgress,
+    startCheck,
+    finishSteps,
+    getSteps: () => steps.map(cloneStep),
+  };
 }
 
 export interface PrepareRealtimeInput {
@@ -101,9 +376,11 @@ export interface PreparedRealtimePrompt {
   naturalMediaIntent: 'image' | 'music' | 'video' | null;
   requestedModelLabel: string;
   shouldGenerateTitle: boolean;
+  hasPreviousHtml?: boolean;
   isPatchMode?: boolean;
   isGameBuild?: boolean;
   testMode?: boolean;
+  didRunWebSearch?: boolean;
   systemPrompt: string;
   userPrompt: string;
   historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -293,18 +570,26 @@ export async function prepareRealtimePrompt(
     isFreeAiMeshAvailable() &&
     Boolean(input.attachmentDataUrl);
 
-  if (wantsSearch || shouldRunDesignEngine || initialRoute === 'build') {
+  if (hasPreviousHtml && initialRoute !== 'chat') {
+    input.onStage?.({
+      phase: 'understanding',
+      kind: 'build',
+      stepKind: 'read',
+      stepStatus: 'running',
+      action: 'Reading',
+      label: 'Reading project files (index.html)',
+    });
+  }
+
+  if (wantsSearch) {
     input.onStage?.({
       phase: 'understanding',
       kind: initialRoute === 'build' ? 'build' : 'chat',
-      action: wantsSearch ? 'Searching' : initialRoute === 'build' ? 'Building' : 'Thinking',
-      label: wantsSearch
-        ? 'Searching live web...'
-        : shouldRunDesignEngine
-          ? 'Analyzing layout & screenshot...'
-          : isPatchMode
-            ? 'Planning update...'
-            : 'Planning app layout & database...',
+      stepKind: 'search',
+      stepStatus: 'running',
+      action: 'Searching',
+      label: `Searching web: ${focusedSearchQuery}`,
+      queries: [focusedSearchQuery],
     });
   }
 
@@ -328,22 +613,36 @@ export async function prepareRealtimePrompt(
       : Promise.resolve({ brainContext: input.projectMemoryContext || '' }),
   ]);
 
+  if (hasPreviousHtml && initialRoute !== 'chat') {
+    input.onStage?.({
+      phase: 'understanding',
+      kind: 'build',
+      stepKind: 'read',
+      stepStatus: 'complete',
+      action: 'Read',
+      label: 'Read project files (index.html)',
+    });
+  }
+
+  if (wantsSearch) {
+    const searchSources = (searchData.results || [])
+      .filter((r) => typeof r?.url === 'string' && r.url.startsWith('http'))
+      .slice(0, 6)
+      .map((r) => ({ title: r.title || r.url, url: r.url }));
+    input.onStage?.({
+      phase: 'understanding',
+      kind: initialRoute === 'build' ? 'build' : 'chat',
+      stepKind: 'search',
+      stepStatus: 'complete',
+      action: 'Searched',
+      label: `Searched web: ${focusedSearchQuery}`,
+      queries: [focusedSearchQuery],
+      sources: searchSources,
+    });
+  }
+
   const effectiveMemoryContext = resolvedMem.brainContext || input.projectMemoryContext || '';
   const webSearchContext = formatWebSearchContext(searchData);
-
-  input.onStage?.({
-    phase: 'understanding',
-    kind: initialRoute === 'build' ? 'build' : 'chat',
-    action: initialRoute === 'build' ? 'Building' : 'Thinking',
-    label:
-      initialRoute === 'build'
-        ? isGameBuild
-          ? 'Designing game mechanics & controls...'
-          : isPatchMode
-            ? 'Planning update...'
-            : 'Planning app layout & database...'
-        : 'Thinking...',
-  });
 
   const timeContext = [
     input.clientTime ? `User local date/time: ${input.clientTime}` : '',
@@ -409,11 +708,11 @@ export async function prepareRealtimePrompt(
   });
 
   const historyMessages: Array<{ role: 'user' | 'assistant'; content: string }> = history
-    .slice(-8)
+    .slice(-14)
     .filter((h) => typeof h?.text === 'string' && h.text.trim().length > 0)
     .map((h) => ({
       role: h.role === 'assistant' || h.role === 'model' ? 'assistant' : 'user',
-      content: h.text.trim().slice(0, 2200),
+      content: h.text.trim().slice(0, 2800),
     }));
 
   const userBlocks: string[] = [];
@@ -441,7 +740,7 @@ MANDATORY ARCHITECT RULES:
         : `CURRENT_PROJECT_FILES — TARGETED UPDATE MODE (Active Builder: ${executionPlan.requestedModelLabel}):
 MANDATORY EDIT RULES:
 1. Inspect CURRENT_PROJECT_FILES below carefully — NEVER just chat or repeat unchanged boilerplate.
-2. Apply real code modifications matching the user's request (modifying templates, components, layout, logic, or state directly).
+2. Apply real code modifications matching the user's request (modifying templates, components, layout, logic, or state directly). If asked to remove/delete a section or control, cleanly remove it from HTML/CSS/JS.
 3. For localized updates, use \`<<<AICRAFT_PATCH>>>...<<<END_PATCH>>>\` with exact \`<<<SEARCH>>>...<<<REPLACE>>>...\` anchors copied verbatim from \`index.html\` below, \`<<<APPEND_CSS>>>\`, \`<<<APPEND_SCREEN>>>\`, and/or \`<<<APPEND_SCRIPT>>>\`. If the requested change restructures components or navigation across sections, output the full updated app inside \`<<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>\`.`;
 
     userBlocks.push(
@@ -471,8 +770,11 @@ MANDATORY EDIT RULES:
     naturalMediaIntent,
     requestedModelLabel: executionPlan.requestedModelLabel,
     shouldGenerateTitle,
+    hasPreviousHtml,
     isPatchMode,
     isGameBuild,
+    testMode,
+    didRunWebSearch: wantsSearch,
     systemPrompt,
     userPrompt: userBlocks.join('\n\n'),
     historyMessages,
@@ -520,6 +822,7 @@ export interface FinalizedRealtimeResult {
   aiText: string;
   previewHtml: string;
   valid: boolean;
+  patchFailedCompletely?: boolean;
   validationReason?: string;
   files: string[];
   planSteps: string[];
@@ -636,7 +939,7 @@ export function finalizeRealtimeOutput(
   const validation = patchFailedCompletely
     ? {
         valid: false,
-        reason: `Surgical patch anchors did not match existing HTML while updating "${input.message.slice(0, 120)}". Preserve existing styles/screens and apply the requested addition cleanly.`,
+        reason: `Surgical patch anchors did not match existing HTML while updating "${input.message.slice(0, 120)}". Apply the requested edit/removal directly to the existing app cleanly.`,
       }
     : validateBuiltAppHtml(hardenedHtml);
   const files = extractLiveBuildArtifacts(hardenedHtml).map((a) => a.path);
@@ -660,6 +963,7 @@ export function finalizeRealtimeOutput(
     aiText,
     previewHtml: hardenedHtml,
     valid: validation.valid,
+    patchFailedCompletely,
     validationReason: validation.reason,
     files,
     planSteps,
@@ -687,6 +991,8 @@ interface StreamServerFreeAiParams {
   initialRoute?: 'chat' | 'build' | 'auto';
   /** Set by patch/continue callers — those never fan out to parallel agents. */
   isFastPatch?: boolean;
+  /** Enable Gemini native Google Search grounding tool on live generation. */
+  enableWebSearch?: boolean;
   systemPrompt: string;
   historyMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
   userPrompt: string;
@@ -696,6 +1002,7 @@ interface StreamServerFreeAiParams {
   allowParallelAgents?: boolean;
   onModelMeta?: (meta: { modelId: string; modelName: string; provider: string }) => void;
   onReasoningChunk?: (reasoningText: string) => void;
+  onGrounding?: (meta: MeshGroundingMeta) => void;
   onContentChunk: (chunkText: string) => void;
   /** Live 3-agent progress: emitted at start and on every agent completion. */
   onAgentsSnapshot?: (agents: RealtimeAgentStatus[]) => void;
@@ -926,10 +1233,12 @@ async function runParallelBuildAgents(
       historyMessages: params.historyMessages,
       userPrompt: params.userPrompt,
       attachmentDataUrl: params.attachmentDataUrl ?? null,
+      enableWebSearch: Boolean(params.enableWebSearch),
       signal: params.signal,
       onModelMeta: params.onModelMeta,
       onContentChunk: params.onContentChunk,
       onReasoningChunk: params.onReasoningChunk,
+      onGrounding: params.onGrounding,
     });
 
   try {
@@ -974,10 +1283,7 @@ async function runParallelBuildAgents(
 }
 
 /**
- * The single chat/build engine: ALWAYS the free AI mesh — zero API keys
- * required, daily-quota failover across the whole free-model catalog, and
- * (for fresh full builds) three agents building architecture + UI + logic
- * at the same time. The old Gemini-key path was removed entirely.
+ * The single chat/build engine powered by the Gemini API mesh.
  */
 export async function streamServerFreeAiRealTime(
   params: StreamServerFreeAiParams
@@ -993,10 +1299,12 @@ export async function streamServerFreeAiRealTime(
       historyMessages: params.historyMessages,
       userPrompt: params.userPrompt,
       attachmentDataUrl: params.attachmentDataUrl ?? null,
+      enableWebSearch: Boolean(params.enableWebSearch),
       signal: params.signal,
       onModelMeta: params.onModelMeta,
       onContentChunk: params.onContentChunk,
       onReasoningChunk: params.onReasoningChunk,
+      onGrounding: params.onGrounding,
     });
 
   const parallelRequested =
@@ -1012,24 +1320,35 @@ export async function streamServerFreeAiRealTime(
 }
 
 /**
- * Fast single-pass repair if initial HTML failed script syntax or completeness validation.
+ * Fast single-pass repair if initial HTML failed script syntax or completeness validation,
+ * OR fallback full-document edit when a surgical patch missed anchors.
  */
 export async function repairIncompleteBuildHtml(params: {
   brokenHtml: string;
   validationReason: string;
   userMessage: string;
   mode: 'mobile' | 'web';
+  isPatchFallback?: boolean;
 }): Promise<string> {
   if (!params.brokenHtml.trim()) return '';
 
-  const repairPrompt = [
-    `The built ${params.mode} app HTML for "${params.userMessage.slice(0, 200)}" failed validation: ${params.validationReason}`,
-    'Fix ONLY the broken/truncated HTML, CSS, Vue <template>/defineComponent wiring, or <script> syntax and ensure the main screen content renders immediately with working buttons and zero empty blank viewports (use <script src="/vendor/vue.global.prod.js"></script> if Vue is used).',
-    'Output ONLY the complete corrected <!DOCTYPE html>...</html> inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>.',
-    '```html',
-    params.brokenHtml.slice(0, 70000),
-    '```',
-  ].join('\n');
+  const repairPrompt = params.isPatchFallback
+    ? [
+        `Apply this exact user request directly to the existing ${params.mode} app HTML: "${params.userMessage}"`,
+        'Preserve working features, database tables (`window.AICraft.db`), and unrelated styles, while directly applying all requested additions, updates, or removals.',
+        'Output ONLY the complete updated <!DOCTYPE html>...</html> inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>.',
+        '```html',
+        params.brokenHtml.slice(0, 70000),
+        '```',
+      ].join('\n')
+    : [
+        `The built ${params.mode} app HTML for "${params.userMessage.slice(0, 200)}" failed validation: ${params.validationReason}`,
+        'Fix ONLY the broken/truncated HTML, CSS, Vue <template>/defineComponent wiring, or <script> syntax and ensure the main screen content renders immediately with working buttons and zero empty blank viewports (use <script src="/vendor/vue.global.prod.js"></script> if Vue is used).',
+        'Output ONLY the complete corrected <!DOCTYPE html>...</html> inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>.',
+        '```html',
+        params.brokenHtml.slice(0, 70000),
+        '```',
+      ].join('\n');
 
   const extractAndHarden = (raw: string): string => {
     const extracted = extractPreviewHtmlFromRaw(raw) || finalizePartialPreviewHtml(raw);
@@ -1042,10 +1361,11 @@ export async function repairIncompleteBuildHtml(params: {
     if (isFreeAiMeshAvailable()) {
       const meshRaw = await completeFreeAiMesh({
         taskKind: 'build',
-        systemPrompt:
-          'You are a strict single-file HTML repair engine. Output ONLY the complete corrected document, no commentary.',
+        systemPrompt: params.isPatchFallback
+          ? 'You are a precise single-file HTML application editor. Apply the user request cleanly to the provided HTML and output ONLY the complete updated document inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>.'
+          : 'You are a strict single-file HTML repair engine. Output ONLY the complete corrected document, no commentary.',
         userPrompt: repairPrompt,
-        timeoutMs: 10000,
+        timeoutMs: params.isPatchFallback ? 14000 : 10000,
       });
       if (meshRaw) {
         const hardened = extractAndHarden(meshRaw);
@@ -1057,6 +1377,8 @@ export async function repairIncompleteBuildHtml(params: {
 
   return Promise.race([
     repairPromise,
-    new Promise<string>((resolve) => setTimeout(() => resolve(''), 12000)),
+    new Promise<string>((resolve) =>
+      setTimeout(() => resolve(''), params.isPatchFallback ? 15000 : 12000)
+    ),
   ]);
 }

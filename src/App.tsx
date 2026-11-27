@@ -1093,7 +1093,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
     setModelsError(null);
     try {
       const url = refresh ? '/api/models?refresh=1' : '/api/models';
-      const response = await fetch(url);
+      const response = await fetch(url, { cache: 'no-store' });
       const contentType = response.headers.get('content-type') || '';
       if (!contentType.includes('application/json')) {
         throw new Error('Backend /api/models endpoint returned non-JSON response.');
@@ -1537,6 +1537,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                   model?: string;
                 }>;
                 message?: string;
+                fatal?: boolean;
                 errorMessage?: string;
                 reason?: BuilderTurn['pausedReason'];
                 pausedReason?: BuilderTurn['pausedReason'];
@@ -1545,6 +1546,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                 thoughtSeconds?: number;
                 title?: string;
                 logo?: Record<string, string>;
+                step?: BuildToolStep;
                 toolStep?: BuildToolStep;
                 toolSteps?: BuildToolStep[];
               };
@@ -1685,6 +1687,40 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                   targetCreditsForTurn = Math.min(CLIENT_MAX_CREDITS_PER_BUILD, desiredTarget);
                   scheduleCreditTicker();
                 }
+              } else if (evt.type === 'step' && evt.step) {
+                flushBuffered();
+                const incomingStep = evt.step;
+                if (incomingStep.kind === 'edit' || incomingStep.kind === 'check') {
+                  currentTurnKind = 'build';
+                  if (currentTurnPhase === 'understanding') {
+                    currentTurnPhase = 'building';
+                  }
+                }
+                updateTurn(projectId, turnId, (t) => {
+                  const existing = t.toolSteps ?? [];
+                  const idx = existing.findIndex((s) => s.id === incomingStep.id);
+                  const nextSteps =
+                    idx === -1
+                      ? [...existing, incomingStep]
+                      : existing.map((s, i) => (i === idx ? incomingStep : s));
+                  return {
+                    ...t,
+                    kind:
+                      incomingStep.kind === 'edit' || incomingStep.kind === 'check'
+                        ? 'build'
+                        : t.kind,
+                    phase:
+                      incomingStep.kind === 'edit' || incomingStep.kind === 'check'
+                        ? t.phase === 'understanding'
+                          ? 'building'
+                          : t.phase
+                        : t.phase,
+                    activeAction: incomingStep.action ?? t.activeAction,
+                    activeFile: incomingStep.file ?? t.activeFile,
+                    phaseLabel: incomingStep.label || t.phaseLabel,
+                    toolSteps: nextSteps,
+                  };
+                });
               } else if (evt.type === 'file' && evt.path) {
                 flushBuffered();
                 currentTurnKind = 'build';
@@ -1697,53 +1733,20 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                 if (typeof evt.bytesBuilt === 'number') {
                   latestBytesBuilt = evt.bytesBuilt;
                 }
-                const fileAction = evt.action ?? 'Editing file';
+                const fileAction = evt.action ?? 'Editing files';
                 const filePath = evt.path;
-                updateTurn(projectId, turnId, (t) => {
-                  const existingSteps = t.toolSteps ?? [
-                    {
-                      id: 'step-thinking',
-                      label: 'Thought through app architecture',
-                      action: 'Thinking',
-                      status: 'complete' as const,
-                    },
-                  ];
-                  const updatedSteps = existingSteps.map((s) =>
-                    s.status === 'running' ? { ...s, status: 'complete' as const } : s
-                  );
-                  const stepLabel = `${fileAction} ${filePath}`;
-                  const foundIdx = updatedSteps.findIndex((s) => s.file === filePath);
-                  if (foundIdx !== -1) {
-                    updatedSteps[foundIdx] = {
-                      ...updatedSteps[foundIdx],
-                      action: fileAction,
-                      label: stepLabel,
-                      status: 'running',
-                    };
-                  } else {
-                    updatedSteps.push({
-                      id: `step-${updatedSteps.length + 1}`,
-                      label: stepLabel,
-                      file: filePath,
-                      action: fileAction,
-                      status: 'running',
-                    });
-                  }
-
-                  return {
-                    ...t,
-                    kind: 'build',
-                    phase: t.phase === 'understanding' ? 'building' : t.phase,
-                    activeAction: fileAction,
-                    activeFile: filePath,
-                    files: evt.allFiles ?? t.files,
-                    toolSteps: updatedSteps,
-                    bytesBuilt:
-                      typeof evt.bytesBuilt === 'number'
-                        ? evt.bytesBuilt
-                        : t.bytesBuilt,
-                  };
-                });
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  kind: 'build',
+                  phase: t.phase === 'understanding' ? 'building' : t.phase,
+                  activeAction: fileAction,
+                  activeFile: filePath,
+                  files: evt.allFiles ?? t.files,
+                  bytesBuilt:
+                    typeof evt.bytesBuilt === 'number'
+                      ? evt.bytesBuilt
+                      : t.bytesBuilt,
+                }));
               } else if (evt.type === 'progress') {
                 if (typeof evt.bytesBuilt === 'number') {
                   latestBytesBuilt = evt.bytesBuilt;
@@ -1751,21 +1754,26 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                   scheduleBufferedFlush();
                 }
               } else if (evt.type === 'partialHtml' && evt.previewHtml) {
+                const hasPriorPreview = projectsRef.current
+                  .find((p) => p.id === projectId)
+                  ?.turns.some((prevT) => prevT.id !== turnId && Boolean(prevT.previewHtml));
                 if (typeof evt.bytesBuilt === 'number') {
                   latestBytesBuilt = evt.bytesBuilt;
                 }
-                const partialHtml = evt.previewHtml;
-                updateTurn(projectId, turnId, (t) => ({
-                  ...t,
-                  kind: 'build',
-                  phase: t.phase === 'understanding' ? 'building' : t.phase,
-                  phaseLabel: 'Building & checking live preview...',
-                  previewHtml: partialHtml,
-                  bytesBuilt:
-                    typeof evt.bytesBuilt === 'number'
-                      ? evt.bytesBuilt
-                      : t.bytesBuilt,
-                }));
+                if (!hasPriorPreview) {
+                  const partialHtml = evt.previewHtml;
+                  updateTurn(projectId, turnId, (t) => ({
+                    ...t,
+                    kind: 'build',
+                    phase: t.phase === 'understanding' ? 'building' : t.phase,
+                    phaseLabel: 'Checking files & live preview...',
+                    previewHtml: partialHtml,
+                    bytesBuilt:
+                      typeof evt.bytesBuilt === 'number'
+                        ? evt.bytesBuilt
+                        : t.bytesBuilt,
+                  }));
+                }
               } else if (evt.type === 'agents' && Array.isArray(evt.agents)) {
                 updateTurn(projectId, turnId, (t) => ({
                   ...t,
@@ -1838,44 +1846,14 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                   const incomingSteps = Array.isArray(evt.toolSteps)
                     ? (evt.toolSteps as BuildToolStep[])
                     : undefined;
-                  let resolvedToolSteps = incomingSteps ?? t.toolSteps ?? [];
-                  if (resolvedToolSteps.length === 0 && resolvedFiles.length > 0) {
-                    resolvedToolSteps = [
-                      {
-                        id: 'step-thinking',
-                        label: 'Thought through app architecture',
-                        action: 'Thinking',
-                        status: 'complete' as const,
-                      },
-                      ...resolvedFiles.map((file, idx) => {
-                        const act = file.endsWith('.css')
-                          ? 'Styling'
-                          : file.includes('database')
-                            ? 'Wiring database'
-                            : file.endsWith('.js')
-                              ? 'Scripting'
-                              : 'Editing file';
-                        return {
-                          id: `step-file-${idx}`,
-                          label: `${act} ${file}`,
-                          file,
-                          action: act,
-                          status: 'complete' as const,
-                        };
-                      }),
-                      {
-                        id: 'step-preview-check',
-                        label: 'Verified live preview & database',
-                        action: 'Checking',
-                        status: 'complete' as const,
-                      },
-                    ];
-                  } else {
-                    resolvedToolSteps = resolvedToolSteps.map((s) => ({
-                      ...s,
-                      status: 'complete' as const,
-                    }));
-                  }
+                  const baseSteps = incomingSteps ?? t.toolSteps ?? [];
+                  const resolvedToolSteps = baseSteps.map((s) => ({
+                    ...s,
+                    status: 'complete' as const,
+                    files: s.files
+                      ? s.files.map((f) => ({ ...f, status: 'complete' as const }))
+                      : undefined,
+                  }));
 
                   return {
                     ...t,
@@ -2158,27 +2136,30 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                 stopCreditTicker();
                 flushBuffered();
                 const rawMsg = evt.message ?? 'AI Craft encountered an error.';
+                const isFatalError =
+                  Boolean(evt.fatal) ||
+                  /gemini_api_key|api[_\s]?key|permission[_\s]?denied|unauthenticated|unauthorized|not configured|\b(?:401|403|404)\b/i.test(
+                    rawMsg
+                  );
                 const isTransientMesh =
+                  !isFatalError &&
                   /busy or unreachable|cooling down|retry in a few seconds|temporarily unavailable/i.test(
                     rawMsg
                   );
                 const priorAuto = transientAutoRetryRef.current[turnId] ?? 0;
-                if (isTransientMesh && priorAuto < 2) {
+                if (isTransientMesh && priorAuto < 1) {
                   transientAutoRetryRef.current[turnId] = priorAuto + 1;
                   updateTurn(projectId, turnId, (t) => ({
                     ...t,
                     phase: 'building',
-                    phaseLabel:
-                      priorAuto === 0
-                        ? 'Gemini was busy — retrying…'
-                        : 'Switching to another Gemini model…',
+                    phaseLabel: 'Gemini was busy — retrying…',
                     errorMessage: undefined,
                   }));
                   window.setTimeout(() => {
                     void resumeJobStreamRef.current?.(projectId, turnId, latestJobId);
-                  }, 3_500 + priorAuto * 2_500);
+                  }, 3_500);
                 } else {
-                  if (!isTransientMesh) transientAutoRetryRef.current[turnId] = 0;
+                  transientAutoRetryRef.current[turnId] = 0;
                   updateTurn(projectId, turnId, (t) => ({
                     ...t,
                     phase: 'error',
@@ -2330,10 +2311,37 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
         activeConnectionsRef.current.delete(turnId);
 
         if (!result.sawTerminalEvent) {
+          const existingTurn = projectsRef.current
+            .find((p) => p.id === projectId)
+            ?.turns.find((t) => t.id === turnId);
+          const alreadyHasClosedHtml = Boolean(
+            existingTurn?.previewHtml &&
+              /<\/html\s*>/i.test(existingTurn.previewHtml.trim()) &&
+              existingTurn.previewHtml.length >= 1200
+          );
+          if (alreadyHasClosedHtml && existingTurn) {
+            updateTurn(projectId, turnId, (t) => ({
+              ...t,
+              kind: 'build',
+              phase: 'complete',
+              phaseLabel: 'Build complete',
+              toolSteps: (t.toolSteps ?? []).map((s) => ({
+                ...s,
+                status: 'complete' as const,
+                files: s.files
+                  ? s.files.map((f) => ({ ...f, status: 'complete' as const }))
+                  : undefined,
+              })),
+            }));
+            void publishProjectLive(projectId, existingTurn.previewHtml!);
+            setProjectViews((prev) => ({ ...prev, [projectId]: 'preview' }));
+            return;
+          }
+
           const reconnectJobId = result.latestJobId || knownJobId;
           const isVisible = document.visibilityState === 'visible';
           const retryCount = retriedTurnsRef.current.get(turnId) ?? 0;
-          if (reconnectJobId || !isVisible || retryCount < 3) {
+          if (reconnectJobId || (!isVisible && retryCount < 1) || retryCount < 1) {
             updateTurn(projectId, turnId, (t) =>
               t.phase === 'complete' || t.phase === 'paused' || t.phase === 'error'
                 ? t
@@ -2346,7 +2354,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                   }
             );
             if (isVisible) {
-              const delayMs = retryCount === 0 ? 500 : retryCount === 1 ? 1200 : 2000;
+              const delayMs = retryCount === 0 ? 500 : 1200;
               window.setTimeout(() => {
                 void resumeJobStreamRef.current?.(projectId, turnId, reconnectJobId);
               }, delayMs);
@@ -2632,6 +2640,29 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
         ) {
           return;
         }
+        // Never overwrite an already-finished closed HTML preview with [[CONTINUE_BUILD]]!
+        if (
+          latestTurn.previewHtml &&
+          /<\/html\s*>/i.test(latestTurn.previewHtml.trim()) &&
+          latestTurn.previewHtml.length >= 1200
+        ) {
+          updateTurn(projectId, turnId, (t) => ({
+            ...t,
+            kind: 'build',
+            phase: 'complete',
+            phaseLabel: 'Build complete',
+            toolSteps: (t.toolSteps ?? []).map((s) => ({
+              ...s,
+              status: 'complete' as const,
+              files: s.files
+                ? s.files.map((f) => ({ ...f, status: 'complete' as const }))
+                : undefined,
+            })),
+          }));
+          void publishProjectLive(projectId, latestTurn.previewHtml);
+          setProjectViews((prev) => ({ ...prev, [projectId]: 'preview' }));
+          return;
+        }
         const prevCount = retriedTurnsRef.current.get(turnId) ?? 0;
         retriedTurnsRef.current.set(turnId, prevCount + 1);
         const idx = latestProj.turns.findIndex((t) => t.id === turnId);
@@ -2640,45 +2671,45 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
           { role: 'user', text: t.userMessage },
           ...(t.aiText ? [{ role: 'model', text: t.aiText }] : []),
         ]);
-        const hasPartialTurnHtml = Boolean(turn.previewHtml && turn.previewHtml.trim());
+        const hasPartialTurnHtml = Boolean(latestTurn.previewHtml && latestTurn.previewHtml.trim());
         const previousHtml =
-          turn.previewHtml ||
+          latestTurn.previewHtml ||
           [...priorTurns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ||
           '';
         const messageToSend = hasPartialTurnHtml
-          ? `[[CONTINUE_BUILD]] Resume and finish building the app seamlessly from the existing saved preview HTML for: "${turn.userMessage}". Preserve every completed section and finish any incomplete parts cleanly.`
-          : turn.userMessage;
-        const projectSecrets = project.secrets ?? [];
+          ? `[[CONTINUE_BUILD]] Resume and finish building the app seamlessly from the existing saved preview HTML for: "${latestTurn.userMessage}". Preserve every completed section and finish any incomplete parts cleanly.`
+          : latestTurn.userMessage;
+        const projectSecrets = latestProj.secrets ?? [];
         void runBuilderStream(
-          project.id,
-          turn.id,
+          latestProj.id,
+          latestTurn.id,
           messageToSend,
-          project.mode,
-          turn.modelId,
+          latestProj.mode,
+          latestTurn.modelId,
           history,
           {
-            reactEnabled: project.mode === 'web',
+            reactEnabled: latestProj.mode === 'web',
             backendEnabled: false,
             webSearchEnabled: true,
             testMode,
-            attachmentName: turn.attachmentName,
-            attachmentDataUrl: turn.attachmentDataUrl ?? null,
+            attachmentName: latestTurn.attachmentName,
+            attachmentDataUrl: latestTurn.attachmentDataUrl ?? null,
             secretKeys: projectSecrets.map((s) => s.key),
             secretHints: buildProjectSecretHints(projectSecrets),
-            databaseTables: (project.databaseConfig?.tables ?? []).map(
+            databaseTables: (latestProj.databaseConfig?.tables ?? []).map(
               (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
             ),
             clientCreditsRemaining: creditsRef.current,
           },
           previousHtml,
-          turn.startedAt ?? Date.now()
+          latestTurn.startedAt ?? Date.now()
         );
       };
 
       const retryCount = retriedTurnsRef.current.get(turnId) ?? 0;
       const targetJobId = jobId || turn.jobId;
       if (!targetJobId) {
-        if (retryCount < 3) {
+        if (retryCount < 1) {
           rerunTurnFromSavedProgress();
         } else {
           updateTurn(projectId, turnId, (t) => ({
@@ -2698,12 +2729,13 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
         // Step 1: Fast JSON snapshot check first so waking from background updates instantly
         const snapRes = await fetch(
           `/api/craft/jobs/${encodeURIComponent(targetJobId)}`,
-          { signal: controller.signal }
+          { signal: controller.signal, cache: 'no-store' }
         );
+        const snapContentType = snapRes.headers.get('content-type') || '';
 
-        if (snapRes.status === 404) {
+        if (snapRes.status === 404 || !snapContentType.includes('application/json')) {
           activeConnectionsRef.current.delete(turnId);
-          if (retryCount < 3) {
+          if (retryCount < 1) {
             rerunTurnFromSavedProgress();
             return;
           }
@@ -2734,7 +2766,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
         // Step 2: Still running on server -> attach to live ?stream=1 SSE tail
         const response = await fetch(
           `/api/craft/jobs/${encodeURIComponent(targetJobId)}?stream=1`,
-          { signal: controller.signal }
+          { signal: controller.signal, cache: 'no-store' }
         );
 
         if (!response.ok || !response.body) {
@@ -2759,7 +2791,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
         activeConnectionsRef.current.delete(turnId);
       }
     },
-    [applyJobSnapshotToTurn, consumeSseStream, runBuilderStream, updateTurn]
+    [applyJobSnapshotToTurn, consumeSseStream, publishProjectLive, runBuilderStream, testMode, updateTurn]
   );
 
   const resumeJobStreamRef = useRef<

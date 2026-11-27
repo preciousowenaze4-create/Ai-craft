@@ -358,8 +358,8 @@ assert(
   'mobile app build must execute live web search and populate searchData.query'
 );
 assert(
-  mobileStages.some((s) => s.kind === 'build' && /planning/i.test(s.label)),
-  'prepareRealtimePrompt must emit build planning stage event'
+  mobileStages.some((s) => s.kind === 'build' && /searching|searched/i.test(s.action)),
+  'prepareRealtimePrompt must emit real web search stage when web search runs'
 );
 assert(
   /\/vendor\/vue\.global\.prod\.js/.test(mobilePromptPrep.systemPrompt),
@@ -513,6 +513,95 @@ assert(
     restructurePrep.userPrompt.includes('=== FILE: index.html ===') &&
     restructurePrep.userPrompt.includes('screens/chats-screen.vue'),
   'Restructure prompt must feed CURRENT_PROJECT_FILES manifest and actual existing code'
+);
+
+// --- 11: live grounding metadata, native thoughts, 400 fallback, progressive steps & patch fallback ---
+const { detectArtifactCompletionStates } = await import('../api/_builderCore.js');
+const { finalizeRealtimeOutput, repairIncompleteBuildHtml } = await import(
+  '../api/_realtimeEngine.js'
+);
+
+const groundingEvents: Array<{ queries: string[]; sources: Array<{ title: string; url: string }> }> = [];
+const thoughtChunks: string[] = [];
+const groundedRes = await streamFreeAiMesh({
+  taskKind: 'chat',
+  systemPrompt: 'You are a helpful assistant.',
+  historyMessages: [],
+  userPrompt: 'Search live docs __INCLUDE_THOUGHT__',
+  enableWebSearch: true,
+  onGrounding: (g) => groundingEvents.push(g),
+  onReasoningChunk: (t) => thoughtChunks.push(t),
+  onContentChunk: () => {},
+});
+assert(
+  groundedRes.rawOutput.includes('Build success'),
+  'grounded stream must complete cleanly'
+);
+assert(
+  groundingEvents.some(
+    (g) =>
+      g.queries.includes('gemini live search query') &&
+      g.sources.some((s) => s.url === 'https://example.com/live-source')
+  ),
+  'streamFreeAiMesh must forward Gemini groundingMetadata queries and sources via onGrounding'
+);
+assert(
+  thoughtChunks.some((t) => t.includes('Planning architecture')),
+  'streamFreeAiMesh must forward native part.thought chunks via onReasoningChunk'
+);
+
+const fallbackNoTools = await streamFreeAiMesh({
+  taskKind: 'chat',
+  systemPrompt: 'sys',
+  historyMessages: [],
+  userPrompt: 'Say hello __REJECT_TOOLS_400__',
+  enableWebSearch: true,
+  onContentChunk: () => {},
+});
+assert(
+  fallbackNoTools.rawOutput.includes('Build success'),
+  'streamFreeAiMesh must retry cleanly without googleSearch when upstream rejects tool with 400'
+);
+
+const partialHtmlInProgress =
+  '<!DOCTYPE html><html><head><style>body{margin:0}';
+const runningStates = detectArtifactCompletionStates(partialHtmlInProgress);
+assert(
+  runningStates.find((s) => s.path === 'index.html')?.status === 'running' &&
+    runningStates.find((s) => s.path === 'styles.css')?.status === 'running',
+  'detectArtifactCompletionStates must mark open styles.css/index.html as running before closing tags'
+);
+
+const partialStyleClosed = `${partialHtmlInProgress}</style></head><body><script>console.log(1);</script></body></html>`;
+const completeStates = detectArtifactCompletionStates(partialStyleClosed);
+assert(
+  completeStates.find((s) => s.path === 'styles.css')?.status === 'complete' &&
+    completeStates.find((s) => s.path === 'app.js')?.status === 'complete' &&
+    completeStates.find((s) => s.path === 'index.html')?.status === 'complete',
+  'detectArtifactCompletionStates must flip files to complete once genuine closing tags stream'
+);
+
+const missedPatchFinalize = finalizeRealtimeOutput({
+  rawOutput:
+    '<<<AICRAFT_PATCH>>>\n<<<SEARCH>>>\nNONEXISTENT_ANCHOR_XYZ\n<<<REPLACE>>>\nREPLACED\n<<<END_PATCH>>>',
+  message: 'Remove the help button',
+  mode: 'web',
+  previousHtml: sampleVueMobileHtml,
+});
+assert(
+  missedPatchFinalize.patchFailedCompletely === true && missedPatchFinalize.valid === false,
+  'finalizeRealtimeOutput must flag patchFailedCompletely when surgical anchors miss'
+);
+const patchFallbackHtml = await repairIncompleteBuildHtml({
+  brokenHtml: sampleVueMobileHtml,
+  validationReason: missedPatchFinalize.validationReason || 'Patch missed anchors',
+  userMessage: 'Build a todo app',
+  mode: 'web',
+  isPatchFallback: true,
+});
+assert(
+  patchFallbackHtml.includes('Mesh Todo'),
+  'repairIncompleteBuildHtml with isPatchFallback must produce valid replacement HTML when anchors miss'
 );
 
 console.log('ALL GEMINI ENGINE TESTS PASSED');

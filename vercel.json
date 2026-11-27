@@ -14,6 +14,15 @@
           "value": "public, max-age=31536000, immutable"
         }
       ]
+    },
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, no-cache, must-revalidate"
+        }
+      ]
     }
   ],
   "rewrites": [
@@ -28,6 +37,10 @@
     {
       "source": "/api/app-data/(.*)",
       "destination": "/api/app-data?__route=$1"
+    },
+    {
+      "source": "/api/craft/jobs/(.*)",
+      "destination": "/api/craft/jobs?jobId=$1"
     },
     {
       "source": "/api/memory",

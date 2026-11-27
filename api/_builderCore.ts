@@ -1932,6 +1932,102 @@ export function extractLiveBuildArtifacts(htmlSoFar: string): LiveBuildArtifact[
   return artifacts;
 }
 
+export interface LiveBuildArtifactState {
+  path: string;
+  action: string;
+  status: 'running' | 'complete';
+}
+
+/**
+ * Inspects streamed HTML so far and returns each detected virtual file alongside
+ * its genuine completion state based on whether its closing tag/block has finished streaming.
+ */
+export function detectArtifactCompletionStates(htmlSoFar: string): LiveBuildArtifactState[] {
+  const clean = htmlSoFar.trim();
+  if (!clean) return [];
+
+  const baseArtifacts = extractLiveBuildArtifacts(clean);
+  if (baseArtifacts.length === 0) return [];
+
+  const lower = clean.toLowerCase();
+  const hasHtmlEnd = /<\/html\s*>/i.test(clean);
+
+  const hasClosedTagAfter = (openPos: number, closeTag: string): boolean => {
+    if (openPos < 0) return false;
+    return lower.indexOf(closeTag, openPos) > openPos;
+  };
+
+  // Find inline <script> completion state
+  let inlineScriptOpenPos = -1;
+  let inlineScriptClosed = false;
+  for (const m of clean.matchAll(/<script(?![^>]*\bsrc=)([^>]*)>/gi)) {
+    const attrs = (m[1] || '').toLowerCase();
+    if (attrs.includes('text/x-template') || attrs.includes('application/json')) continue;
+    const pos = m.index ?? -1;
+    if (pos >= 0) {
+      inlineScriptOpenPos = pos;
+      inlineScriptClosed = hasClosedTagAfter(pos, '</script>');
+    }
+  }
+
+  return baseArtifacts.map((artifact) => {
+    const p = artifact.path;
+    let complete = false;
+
+    if (p === 'index.html') {
+      complete = hasHtmlEnd;
+    } else if (p === 'styles.css') {
+      const styleOpen = lower.indexOf('<style');
+      complete = hasHtmlEnd || hasClosedTagAfter(styleOpen, '</style>');
+    } else if (p === 'components/canvas.html') {
+      complete = hasHtmlEnd || hasClosedTagAfter(lower.indexOf('<canvas'), '</canvas>');
+    } else if (p === 'components/navigation.html') {
+      complete = hasHtmlEnd || hasClosedTagAfter(lower.indexOf('<nav'), '</nav>');
+    } else if (p === 'components/header.html') {
+      complete = hasHtmlEnd || hasClosedTagAfter(lower.indexOf('<header'), '</header>');
+    } else if (p === 'components/footer.html') {
+      complete = hasHtmlEnd || hasClosedTagAfter(lower.indexOf('<footer'), '</footer>');
+    } else if (p === 'components/form.html') {
+      complete = hasHtmlEnd || hasClosedTagAfter(lower.indexOf('<form'), '</form>');
+    } else if (p === 'app.js' || p === 'database/schema.js' || p === 'modules/monetization.js') {
+      complete = hasHtmlEnd || (inlineScriptOpenPos >= 0 && inlineScriptClosed);
+    } else if (p.endsWith('.vue')) {
+      const baseName = p.replace(/^(?:screens|components)\//, '').replace(/\.vue$/, '');
+      const escaped = baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const tplRegex = new RegExp(
+        `<(template|script\\b[^>]*type=["']text\\/x-template["'])\\b[^>]*\\b(?:id|data-component)=["'](?:tpl[-_])?${escaped}["'][^>]*>`,
+        'i'
+      );
+      const tplMatch = tplRegex.exec(clean);
+      if (tplMatch && tplMatch.index !== undefined) {
+        const closeTag = tplMatch[1].toLowerCase().startsWith('script') ? '</script>' : '</template>';
+        complete = hasHtmlEnd || hasClosedTagAfter(tplMatch.index, closeTag);
+      } else {
+        complete = hasHtmlEnd || (inlineScriptOpenPos >= 0 && inlineScriptClosed);
+      }
+    } else if (p.startsWith('screens/') && p.endsWith('.html')) {
+      const screenId = p.slice('screens/'.length, -'.html'.length).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const screenRegex = new RegExp(
+        `<(section|article|main|div)\\b[^>]*\\b(?:id|data-screen|data-view|data-tab|data-page|data-module)=["']${screenId}["'][^>]*>`,
+        'i'
+      );
+      const sm = screenRegex.exec(clean);
+      if (sm && sm.index !== undefined) {
+        const tag = sm[1].toLowerCase();
+        complete =
+          hasHtmlEnd ||
+          hasClosedTagAfter(sm.index, tag === 'div' ? '</body>' : `</${tag}>`);
+      }
+    }
+
+    return {
+      path: p,
+      action: artifact.action,
+      status: complete ? 'complete' : 'running',
+    };
+  });
+}
+
 export function buildProjectInfraContext(params: {
   secretHints: Array<{ key: string; hint: string }>;
   secretKeys: string[];
@@ -2050,6 +2146,7 @@ export function buildCraftSystemPrompt(params: {
       titleRuleForChat,
       'CONVERSATION RULES:',
       '- Never output `<think>` tags in your text.',
+      '- Respect all previous messages and constraints from the conversation history — never forget earlier edits, preferences, or removals.',
       '- Answer naturally, directly, and humanly like ChatGPT — adapt depth to the question instead of forcing canned templates.',
       '- Do NOT output HTML app bundles or fake build plans in conversation mode.',
       '- STRICT HONESTY: NEVER claim you built, added, fixed, or changed anything in Preview unless it already exists in the context above.',
@@ -2081,6 +2178,7 @@ export function buildCraftSystemPrompt(params: {
     'OUTPUT FORMAT & STREAMING ARCHITECTURE (CRITICAL):',
     '- Never output `<think>` or XML thought tags in your text response.',
     '- NEVER JUST CHAT OR REPEAT UNCHANGED BOILERPLATE: Whenever `CURRENT_PROJECT_FILES` exists and the user asks to build, update, fix, remove, or restructure the app, inspect `CURRENT_PROJECT_FILES` and explicitly apply the real structural changes to the code/files. Never emit unchanged boilerplate or conversational-only text.',
+    '- PRESERVE PRIOR REMOVALS & CONSTRAINTS: Check the full conversation history. Whenever the user asks to remove, delete, or hide a specific section, button, tab, or feature, completely remove it from the DOM/templates, styles, and JavaScript handlers, and NEVER re-add previously removed parts on later edits unless explicitly asked.',
     '- ZERO FAKE "APP NOT READY" OR PLACEHOLDER SCREENS: NEVER output placeholder screens (such as "App Not Ready", "Your app is still building", "Under construction", "Coming Soon") or stock photos pretending the app is building. Build the real, working, interactive application immediately.',
     '- CLEAN PARSEABLE OUTPUT (ZERO CLUTTER): Follow the exact tag protocol below so real-time streaming, file extraction, and live Preview rendering stay 100% clean.',
     '- NEVER generate standalone images inside Preview builds — focus 100% on building real, functional, interactive apps in real time.',
@@ -2090,7 +2188,7 @@ export function buildCraftSystemPrompt(params: {
       ? '  (1) Mobile viewport behavior (portrait frame, safe areas, >=44px touch targets, transitions, HTTP/database flow), (2) Every screen & navigation pattern (tabs, stack push/back detail views, headers, FAB, modals/sheets), (3) Modular Vue components + interactive buttons, inputs, lists & state.'
       : '  (1) Viewport layout & navigation architecture, (2) Interactive views/components, (3) Database tables & live state flow.',
     '- Output `[[DB_SCHEMA: table(col:type, ...)]]` lines for each domain table (types: `text`, `number`, `boolean`, `timestamp`, `json`).',
-    '- Write ONE short present-tense sentence saying what you are building or updating right now (e.g. "Structuring your Vue mobile messaging architecture and building the screens now..."). NEVER write past-tense "I have built..." before code, and never include code fences or conversational clutter outside the tags.',
+    '- Write ONE short present-tense sentence saying what you are building or updating right now (e.g. "Structuring your Vue mobile messaging architecture and building the screens now..."). NEVER write past-tense "I have built..." or list fake tool/thinking/search steps in prose before code, and never include code fences or conversational clutter outside the tags.',
     '- Immediately emit the application code:',
     '  * Full build / new app / structural layout or component overhaul: `<<<AICRAFT_APP_HTML>>>` then complete `<!DOCTYPE html>...</html>` then `<<<END_AICRAFT_APP_HTML>>>`',
     '  * Localized surgical edit on existing Preview app: `<<<AICRAFT_PATCH>>>` using exact `<<<SEARCH>>>...<<<REPLACE>>>...`, `<<<APPEND_CSS>>>`, `<<<APPEND_SCREEN>>>`, `<<<APPEND_SCRIPT>>>` ending with `<<<END_PATCH>>>`',

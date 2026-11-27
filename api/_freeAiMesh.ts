@@ -611,12 +611,12 @@ function buildGeminiContents(params: {
   withImage?: boolean;
 }): Content[] {
   const contents: Content[] = [];
-  for (const item of (params.historyMessages || []).slice(-10)) {
+  for (const item of (params.historyMessages || []).slice(-16)) {
     const text = typeof item?.content === 'string' ? item.content.trim() : '';
     if (!text) continue;
     contents.push({
       role: item.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: text.slice(0, 4000) }],
+      parts: [{ text: text.slice(0, 4500) }],
     });
   }
 
@@ -642,7 +642,8 @@ function buildGeminiContents(params: {
 function buildGeminiGenerateConfig(
   modelId: string,
   systemPrompt: string,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  enableWebSearch?: boolean
 ): GenerateContentConfig {
   const isG4 = isGemini4SeriesModel(modelId);
   const thinkingMode = inferGeminiThinkingMode(modelId);
@@ -668,6 +669,10 @@ function buildGeminiGenerateConfig(
     };
   }
 
+  if (enableWebSearch) {
+    config.tools = [{ googleSearch: {} }];
+  }
+
   return config;
 }
 
@@ -675,12 +680,19 @@ function buildGeminiGenerateConfig(
 // Streaming & Non-Streaming Execution
 // ---------------------------------------------------------------------------
 
+export interface MeshGroundingMeta {
+  queries: string[];
+  sources: Array<{ title: string; url: string }>;
+}
+
 interface MeshAttemptParams {
   taskKind: 'chat' | 'build';
   systemPrompt: string;
   historyMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
   userPrompt: string;
   attachmentDataUrl?: string | null;
+  enableWebSearch?: boolean;
+  onGrounding?: (meta: MeshGroundingMeta) => void;
   signal?: AbortController;
   firstByteTimeoutMs: number;
   idleTimeoutMs?: number;
@@ -704,11 +716,14 @@ async function streamOneMeshCandidateRaw(
   onReasoning?: (text: string) => void
 ): Promise<string> {
   const hasImage = Boolean(params.attachmentDataUrl?.startsWith('data:image/'));
-  const maxImagePasses = hasImage ? 2 : 1;
+  const maxPasses = hasImage || params.enableWebSearch ? 2 : 1;
+  let useImagePass = hasImage;
+  let useSearchPass = Boolean(params.enableWebSearch);
   let lastErr: unknown = null;
 
-  for (let pass = 0; pass < maxImagePasses; pass += 1) {
-    const withImage = hasImage && pass === 0;
+  for (let pass = 0; pass < maxPasses; pass += 1) {
+    const withImage = useImagePass;
+    const withSearch = useSearchPass;
     const controller = new AbortController();
     const outerSignal = params.signal?.signal;
     if (outerSignal?.aborted) throw new Error('Request cancelled.');
@@ -747,7 +762,8 @@ async function streamOneMeshCandidateRaw(
       const config = buildGeminiGenerateConfig(
         candidate.model,
         params.systemPrompt,
-        controller.signal
+        controller.signal,
+        withSearch
       );
 
       const stream = await ai.models.generateContentStream({
@@ -761,6 +777,8 @@ async function streamOneMeshCandidateRaw(
       let promptTokens = 0;
       let candidatesTokens = 0;
       let totalTokens = 0;
+      const seenQueries = new Set<string>();
+      const seenSourceUrls = new Set<string>();
 
       for await (const chunk of stream) {
         if (!gotFirstEvent) {
@@ -768,6 +786,37 @@ async function streamOneMeshCandidateRaw(
           clearTimeout(firstByteTimer);
         }
         resetIdle();
+
+        const groundingMeta = chunk.candidates?.[0]?.groundingMetadata;
+        if (groundingMeta && params.onGrounding) {
+          const newQueries: string[] = [];
+          const newSources: Array<{ title: string; url: string }> = [];
+          if (Array.isArray(groundingMeta.webSearchQueries)) {
+            for (const q of groundingMeta.webSearchQueries) {
+              const cleanQ = typeof q === 'string' ? q.trim() : '';
+              if (cleanQ && !seenQueries.has(cleanQ)) {
+                seenQueries.add(cleanQ);
+                newQueries.push(cleanQ);
+              }
+            }
+          }
+          if (Array.isArray(groundingMeta.groundingChunks)) {
+            for (const gChunk of groundingMeta.groundingChunks) {
+              const uri = typeof gChunk?.web?.uri === 'string' ? gChunk.web.uri.trim() : '';
+              const title =
+                typeof gChunk?.web?.title === 'string' && gChunk.web.title.trim()
+                  ? gChunk.web.title.trim()
+                  : uri;
+              if (uri && !seenSourceUrls.has(uri)) {
+                seenSourceUrls.add(uri);
+                newSources.push({ title, url: uri });
+              }
+            }
+          }
+          if (newQueries.length > 0 || newSources.length > 0) {
+            params.onGrounding({ queries: newQueries, sources: newSources });
+          }
+        }
 
         const parts = chunk.candidates?.[0]?.content?.parts ?? [];
         if (parts.length > 0) {
@@ -825,11 +874,18 @@ async function streamOneMeshCandidateRaw(
       );
 
       if (
-        withImage &&
+        pass + 1 < maxPasses &&
         info.status !== null &&
         [400, 413, 415, 422].includes(info.status)
       ) {
-        continue;
+        if (withSearch && /tool|search|grounding|unsupported|invalid/i.test(info.message)) {
+          useSearchPass = false;
+          continue;
+        }
+        if (withImage) {
+          useImagePass = false;
+          continue;
+        }
       }
       throw friendlyErr;
     } finally {
@@ -888,10 +944,12 @@ interface MeshWalkParams {
   historyMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
   userPrompt: string;
   attachmentDataUrl?: string | null;
+  enableWebSearch?: boolean;
   signal?: AbortSignal;
   onModelMeta?: (meta: { modelId: string; modelName: string; provider: string }) => void;
   onContentChunk?: (chunkText: string) => void;
   onReasoningChunk?: (reasoningText: string) => void;
+  onGrounding?: (meta: MeshGroundingMeta) => void;
 }
 
 function linkSignal(
@@ -928,6 +986,8 @@ async function runMeshStreamAttempt(params: {
         historyMessages: walk.historyMessages,
         userPrompt: walk.userPrompt,
         attachmentDataUrl: walk.attachmentDataUrl,
+        enableWebSearch: walk.enableWebSearch,
+        onGrounding: walk.onGrounding,
         signal: controller,
         firstByteTimeoutMs: budget.firstByteMs,
         idleTimeoutMs: budget.idleMs,

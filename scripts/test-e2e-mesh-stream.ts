@@ -162,10 +162,26 @@ if (buildMeta?.kind !== 'build') {
   console.error('FAIL: build SSE meta event should carry kind=build, got:', JSON.stringify(buildMeta));
   process.exit(1);
 }
+const buildStepEvents = buildEvents.filter((e) => e.type === 'step');
+if (!buildStepEvents.some((e) => {
+  const step = e.step as { kind?: string; status?: string } | undefined;
+  return step?.kind === 'edit' && step?.status === 'complete';
+})) {
+  console.error('FAIL: build SSE stream should emit completed edit step events, got:', JSON.stringify(buildStepEvents));
+  process.exit(1);
+}
 const buildDone = buildEvents.find((e) => e.type === 'done');
 const previewHtml = String(buildDone?.previewHtml ?? '');
 if (!previewHtml.includes('<!DOCTYPE html>') || !previewHtml.includes('Mesh Todo')) {
   console.error('FAIL: previewHtml missing expected build HTML');
+  process.exit(1);
+}
+
+// /api/craft/jobs/:id must return JSON 404 (not SPA HTML fallback) when job is unknown
+const missingJobRes = await fetch(`http://127.0.0.1:${PORT}/api/craft/jobs/nonexistent_job_id`);
+const missingJobType = missingJobRes.headers.get('content-type') || '';
+if (missingJobRes.status !== 404 || !missingJobType.includes('application/json')) {
+  console.error('FAIL: /api/craft/jobs/nonexistent should return JSON 404, got:', missingJobRes.status, missingJobType);
   process.exit(1);
 }
 

@@ -172,12 +172,24 @@ export interface MeshAgentState {
   model?: string;
 }
 
+export interface GroundingSource {
+  title: string;
+  url: string;
+}
+
 export interface BuildToolStep {
   id: string;
+  kind?: 'thought' | 'search' | 'read' | 'edit' | 'check';
   label: string;
+  detail?: string;
   file?: string;
+  files?: Array<{ path: string; status: 'running' | 'complete' }>;
+  queries?: string[];
+  sources?: GroundingSource[];
   action?: string;
-  status: 'pending' | 'running' | 'complete';
+  status: 'pending' | 'running' | 'complete' | 'error';
+  startedAt?: number;
+  endedAt?: number;
   durationSec?: number;
 }
 

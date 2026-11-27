@@ -54,7 +54,7 @@ export default defineConfig(() => {
         },
         workbox: {
           maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
-          navigateFallbackDenylist: [/^\/api\//, /^\/app(?:\/|$)/],
+          navigateFallbackDenylist: [/^\/api\//, /^\/app(?:\/|$)/, /^\/p(?:\/|$)/],
           globPatterns: ['**/*.{js,css,html,ico,png,jpg,jpeg,svg,woff,woff2}'],
           globIgnores: [
             'assets/aistudio/IMG_5029*',
@@ -67,6 +67,10 @@ export default defineConfig(() => {
             'assets/aistudio/IMG_534*',
           ],
           runtimeCaching: [
+            {
+              urlPattern: /^\/api\/.*/i,
+              handler: 'NetworkOnly',
+            },
             {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
               handler: 'CacheFirst',
@@ -98,7 +102,7 @@ export default defineConfig(() => {
           ],
         },
         devOptions: {
-          enabled: true,
+          enabled: false,
           type: 'module',
         },
       }),

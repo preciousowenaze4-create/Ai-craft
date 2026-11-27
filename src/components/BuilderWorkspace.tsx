@@ -1,22 +1,27 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDown,
   ArrowUp,
   BadgeCheck,
   Check,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
+  ChevronRight,
   Code2,
   Copy,
   Database,
   Download,
+  ExternalLink,
   Eye,
+  FileText,
   Film,
   FlaskConical,
   Globe,
   Image as ImageIcon,
   KeyRound,
   LayoutGrid,
+  Lightbulb,
   Loader2,
   MessageSquare,
   Monitor,
@@ -29,6 +34,7 @@ import {
   RotateCcw,
   RotateCw,
   Save,
+  Search,
   Share2,
   ShieldAlert,
   Smartphone,
@@ -189,6 +195,14 @@ function formatCountdown(isoDate: string | undefined, nowMs: number): string {
   return `${mins}m ${String(secs).padStart(2, '0')}s`;
 }
 
+function formatElapsedDuration(totalSec: number): string {
+  const sec = Math.max(1, Math.floor(totalSec));
+  if (sec < 60) return `${sec}s`;
+  const mins = Math.floor(sec / 60);
+  const remSec = sec % 60;
+  return `${mins}m ${remSec}s`;
+}
+
 interface BuilderWorkspaceProps {
   projectId: string;
   projectTitle: string;
@@ -292,6 +306,7 @@ export function BuilderWorkspace({
   const [activeDrawer, setActiveDrawer] = useState<'secrets' | 'database' | 'deploy' | null>(null);
   const [showHeaderActions, setShowHeaderActions] = useState(false);
   const [expandedPlanTurns, setExpandedPlanTurns] = useState<Record<string, boolean>>({});
+  const [expandedThoughtSteps, setExpandedThoughtSteps] = useState<Record<string, boolean>>({});
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const [previewKey, setPreviewKey] = useState(0);
   const [copiedCode, setCopiedCode] = useState(false);
@@ -416,7 +431,6 @@ export function BuilderWorkspace({
     setCodeEditError(null);
     setCodeSaveNotice(null);
     setPreviewSurfaceBg('#FFFFFF');
-    lastPreviewBuildRef.current = 0;
   }, [projectId, stopVoice]);
 
   const {
@@ -1408,67 +1422,32 @@ export function BuilderWorkspace({
     return `${vueScriptTag}${bridgeScript}${preparedHtml}`;
   }, [latestPreviewHtml, secrets, projectId, effectiveDbAppId, testMode]);
 
-  // Live preview rendering: blob-URL iframe instead of srcDoc.
-  // Blob documents have an opaque base URL, so we inject a <base href> to keep
-  // relative asset resolution identical to the previous srcDoc behavior.
-  // While streaming, rebuild the blob at most every 1200ms (throttle with the
-  // latest HTML); rebuild immediately on first render, when the stream ends,
-  // and for any non-streaming change (secrets, manual refresh).
-  const [previewObjectUrl, setPreviewObjectUrl] = useState<string | null>(null);
-  const previewObjectUrlRef = useRef<string | null>(null);
-  const lastPreviewBuildRef = useRef(0);
-
-  useLayoutEffect(() => {
-    if (!connectedPreviewHtml) {
-      const prev = previewObjectUrlRef.current;
-      previewObjectUrlRef.current = null;
-      lastPreviewBuildRef.current = 0;
-      setPreviewObjectUrl(null);
-      if (prev) window.setTimeout(() => URL.revokeObjectURL(prev), 1500);
-      return;
+  // Inject <base href> synchronously so Preview renders immediately via srcDoc
+  // across desktop, iOS Safari, and Android WebView with zero blob-URL lag or SW blocking.
+  const previewSrcDocHtml = useMemo(() => {
+    const html = connectedPreviewHtml;
+    if (!html) return '';
+    let baseHref = '/';
+    try {
+      baseHref = new URL('.', window.location.href).href;
+    } catch {
+      // fall back to root
     }
-    const buildObjectUrl = () => {
-      const html = connectedPreviewHtml;
-      if (!html) return;
-      let baseHref = '/';
-      try {
-        baseHref = new URL('.', window.location.href).href;
-      } catch {
-        // fall back to root
-      }
-      const baseTag = `<base href="${baseHref}">`;
-      let withBase = html;
-      if (!/<base\b/i.test(html)) {
-        if (/<head[^>]*>/i.test(html)) {
-          withBase = html.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`);
-        } else if (/<html[^>]*>/i.test(html)) {
-          withBase = html.replace(/<html([^>]*)>/i, `<html$1><head>${baseTag}</head>`);
-        } else {
-          const doctypeMatch = /^<!DOCTYPE[^>]*>/i.exec(html);
-          withBase = doctypeMatch
-            ? html.slice(0, doctypeMatch[0].length) +
-              `<html><head>${baseTag}</head>` +
-              html.slice(doctypeMatch[0].length)
-            : baseTag + html;
-        }
-      }
-      const url = URL.createObjectURL(new Blob([withBase], { type: 'text/html' }));
-      const prev = previewObjectUrlRef.current;
-      previewObjectUrlRef.current = url;
-      lastPreviewBuildRef.current = Date.now();
-      setPreviewObjectUrl(url);
-      if (prev && prev !== url) window.setTimeout(() => URL.revokeObjectURL(prev), 1500);
-    };
-    const sinceLastBuild = Date.now() - lastPreviewBuildRef.current;
-    const minGapMs = isStreaming ? 900 : 0;
-    const delayMs = Math.max(0, minGapMs - sinceLastBuild);
-    if (delayMs === 0) {
-      buildObjectUrl();
-      return;
+    const baseTag = `<base href="${baseHref}">`;
+    if (/<base\b/i.test(html)) return html;
+    if (/<head[^>]*>/i.test(html)) {
+      return html.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`);
     }
-    const timer = window.setTimeout(buildObjectUrl, delayMs);
-    return () => window.clearTimeout(timer);
-  }, [connectedPreviewHtml, isStreaming]);
+    if (/<html[^>]*>/i.test(html)) {
+      return html.replace(/<html([^>]*)>/i, `<html$1><head>${baseTag}</head>`);
+    }
+    const doctypeMatch = /^<!DOCTYPE[^>]*>/i.exec(html);
+    return doctypeMatch
+      ? html.slice(0, doctypeMatch[0].length) +
+          `<html><head>${baseTag}</head>` +
+          html.slice(doctypeMatch[0].length)
+      : baseTag + html;
+  }, [connectedPreviewHtml]);
 
   useEffect(() => {
     try {
@@ -1480,16 +1459,6 @@ export function BuilderWorkspace({
       // ignore iframe postMessage error
     }
   }, [isStreaming]);
-
-  // Revoke the last blob URL on unmount.
-  useEffect(
-    () => () => {
-      const current = previewObjectUrlRef.current;
-      previewObjectUrlRef.current = null;
-      if (current) URL.revokeObjectURL(current);
-    },
-    []
-  );
 
   const activeModel = useMemo(
     () => models.find((m) => m.id === selectedModel) ?? null,
@@ -2319,7 +2288,7 @@ export function BuilderWorkspace({
                   ref={previewIframeRef}
                   key={`${projectId}-${latestBuiltTurnId ?? 'empty'}-${previewKey}-${secretsFingerprint}`}
                   title={`${projectTitle} Preview`}
-                  src={previewObjectUrl ?? undefined}
+                  srcDoc={previewSrcDocHtml}
                   onLoad={() => {
                     try {
                       previewIframeRef.current?.contentWindow?.postMessage(
@@ -3002,25 +2971,6 @@ export function BuilderWorkspace({
                   : Math.max(1, turn.thoughtSeconds)
                 : Math.max(1, turn.thoughtSeconds);
 
-              const activeStageIndex: 0 | 1 | 2 = (() => {
-                if (!isTurnWorking) return 2;
-                const actionLower = (turn.activeAction || '').toLowerCase();
-                if (actionLower.includes('check') || actionLower.includes('verify')) return 2;
-                if (
-                  turn.phase === 'building' ||
-                  actionLower.includes('cod') ||
-                  Boolean(turn.activeFile) ||
-                  (turn.bytesBuilt ?? 0) > 0
-                ) {
-                  return 1;
-                }
-                return 0;
-              })();
-
-              const isPlanOpen = Boolean(expandedPlanTurns[turn.id]);
-              const togglePlan = () =>
-                setExpandedPlanTurns((prev) => ({ ...prev, [turn.id]: !prev[turn.id] }));
-
               const turnModelName =
                 models.length > 0
                   ? turn.modelName ||
@@ -3029,65 +2979,22 @@ export function BuilderWorkspace({
                     'Gemini'
                   : turn.modelName || 'Gemini';
 
-              const stageSteps = ['Building', 'Coding', 'Checking'] as const;
+              const realSteps: BuildToolStep[] = Array.isArray(turn.toolSteps)
+                ? turn.toolSteps
+                : [];
+              const hasRealSteps = realSteps.length > 0;
               const isCompletedBuild =
                 turn.phase === 'complete' &&
-                (isBuildTurn || Boolean(turn.previewHtml || (turn.toolSteps && turn.toolSteps.length > 0)));
-              const showPipelineCard = isTurnWorking
-                ? (isBuildTurn || turn.phase === 'building' || Boolean(turn.activeFile))
-                : isCompletedBuild;
-              const previewBytes = turn.bytesBuilt || turn.previewHtml?.length || 0;
-
-              const displaySteps: BuildToolStep[] =
-                turn.toolSteps && turn.toolSteps.length > 0
-                  ? turn.toolSteps
-                  : (() => {
-                      const items: BuildToolStep[] = [
-                        {
-                          id: 'step-arch',
-                          label: 'Thought through app architecture & database schema',
-                          action: 'Thinking',
-                          status: isCompletedBuild ? 'complete' : (activeStageIndex === 0 ? 'running' : 'complete'),
-                        },
-                      ];
-                      const files =
-                        turn.files && turn.files.length > 0
-                          ? turn.files
-                          : turn.activeFile
-                            ? [turn.activeFile]
-                            : ['index.html'];
-                      files.forEach((file, idx) => {
-                        const action = file.endsWith('.css')
-                          ? 'Styling'
-                          : file.includes('database')
-                            ? 'Wiring database'
-                            : file.endsWith('.js')
-                              ? 'Scripting'
-                              : 'Editing file';
-                        const isFileActive =
-                          !isCompletedBuild &&
-                          activeStageIndex === 1 &&
-                          (turn.activeFile === file || (!turn.activeFile && idx === 0));
-                        const isFileDone =
-                          isCompletedBuild ||
-                          activeStageIndex > 1 ||
-                          (activeStageIndex === 1 && turn.activeFile !== file && idx === 0);
-                        items.push({
-                          id: `step-f-${idx}`,
-                          label: `${action} ${file}`,
-                          file,
-                          action,
-                          status: isFileDone ? 'complete' : (isFileActive ? 'running' : 'pending'),
-                        });
-                      });
-                      items.push({
-                        id: 'step-verify',
-                        label: 'Checking files & live preview',
-                        action: 'Checking',
-                        status: isCompletedBuild ? 'complete' : (activeStageIndex === 2 ? 'running' : 'pending'),
-                      });
-                      return items;
-                    })();
+                (isBuildTurn || Boolean(turn.previewHtml));
+              const previewBytes = turn.previewHtml
+                ? turn.previewHtml.length
+                : turn.bytesBuilt ?? 0;
+              const isPlanOpen = Boolean(expandedPlanTurns[turn.id]);
+              const togglePlan = () =>
+                setExpandedPlanTurns((prev) => ({
+                  ...prev,
+                  [turn.id]: !prev[turn.id],
+                }));
 
               return (
                 <article key={turn.id} className="flex flex-col gap-3">
@@ -3110,28 +3017,28 @@ export function BuilderWorkspace({
                     </div>
                   </div>
 
-                  {/* Clean AI Attribution Row */}
+                  {/* Genuine Model Attribution & Live Timer Header */}
                   <div className="flex items-center justify-between gap-2 pt-0.5">
                     <div className="flex items-center gap-2 min-w-0">
                       <ProviderLogo
                         provider={turn.modelProvider || activeModel?.provider}
                         modelId={turn.modelId || selectedModel}
-                        size={20}
+                        size={19}
                         isTracking={isTurnWorking}
                         trackingColor={theme.accentColor}
                       />
-                      <span className="font-display font-semibold text-[14px] tracking-[-0.01em] text-[#0B0B0F] truncate">
+                      <span className="font-display font-medium text-[13.5px] tracking-[-0.01em] text-[#52525B] truncate">
                         {turnModelName}
                       </span>
                       <span aria-hidden="true" className="text-[#A1A1AA] text-xs">
-                        ·
+                        •
                       </span>
-                      <span className="text-[12.5px] text-[#71717A] tabular-nums truncate">
+                      <span className="text-[13px] text-[#71717A] tabular-nums truncate">
                         {isTurnWorking
-                          ? `${showPipelineCard ? stageSteps[activeStageIndex] : turn.activeAction || 'Thinking'} · ${elapsedSec}s`
+                          ? `Running for ${formatElapsedDuration(elapsedSec)}`
                           : isPausedTurn
-                            ? `Paused · ${elapsedSec}s`
-                            : `${elapsedSec}s`}
+                            ? `Paused · ${formatElapsedDuration(elapsedSec)}`
+                            : formatElapsedDuration(elapsedSec)}
                       </span>
                     </div>
 
@@ -3142,108 +3049,245 @@ export function BuilderWorkspace({
                     )}
                   </div>
 
-                  {/* Clean Real-Time Building -> Coding -> Checking Tracker & Completed Verification Card */}
-                  {showPipelineCard && (
-                    <div className="rounded-2xl border border-black/[0.08] bg-[#FAFAFC] px-3.5 py-3 flex flex-col gap-2.5">
-                      <div className="flex items-center gap-2 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                        {stageSteps.map((stageLabel, idx) => {
-                          const isDone = isCompletedBuild || idx < activeStageIndex;
-                          const isActive = !isCompletedBuild && idx === activeStageIndex;
+                  {/* Truthful Real-Time Chronological Activity Stream (Zero Hardcoded Steps) */}
+                  {hasRealSteps && (
+                    <div className="flex flex-col gap-2 pl-0.5">
+                      {realSteps.map((step) => {
+                        const isStepRunning = isTurnWorking && step.status === 'running';
+                        const isStepDone = !isTurnWorking || step.status === 'complete';
+                        const stepKind =
+                          step.kind ||
+                          (step.files && step.files.length > 0
+                            ? 'edit'
+                            : /search/i.test(step.action || '')
+                              ? 'search'
+                              : /read/i.test(step.action || '')
+                                ? 'read'
+                                : /check/i.test(step.action || '')
+                                  ? 'check'
+                                  : 'thought');
+
+                        if (stepKind === 'thought') {
+                          const thoughtKey = `${turn.id}:${step.id}`;
+                          const isThoughtOpen = Boolean(expandedThoughtSteps[thoughtKey]);
+                          const hasDetail = Boolean(step.detail && step.detail.trim().length > 0);
                           return (
-                            <div key={stageLabel} className="flex items-center gap-2 shrink-0">
+                            <div key={step.id} className="flex flex-col gap-1.5">
+                              <button
+                                type="button"
+                                disabled={!hasDetail}
+                                onClick={() =>
+                                  hasDetail &&
+                                  setExpandedThoughtSteps((prev) => ({
+                                    ...prev,
+                                    [thoughtKey]: !prev[thoughtKey],
+                                  }))
+                                }
+                                className={`flex items-center gap-2 text-left text-[13px] ${
+                                  isStepRunning
+                                    ? 'text-[#0B0B0F] font-medium'
+                                    : 'text-[#71717A]'
+                                } ${hasDetail ? 'hover:text-[#0B0B0F] transition-colors cursor-pointer' : 'cursor-default'}`}
+                              >
+                                {isStepRunning ? (
+                                  <span className="relative flex items-center justify-center w-4 h-4 shrink-0">
+                                    <Loader2
+                                      className="w-3.5 h-3.5 animate-spin"
+                                      style={{ color: theme.accentColor }}
+                                    />
+                                  </span>
+                                ) : (
+                                  <Lightbulb className="w-3.5 h-3.5 text-[#71717A] shrink-0" />
+                                )}
+                                <span className="truncate">{step.label}</span>
+                                {hasDetail && (
+                                  isThoughtOpen ? (
+                                    <ChevronDown className="w-3.5 h-3.5 text-[#A1A1AA] shrink-0" />
+                                  ) : (
+                                    <ChevronRight className="w-3.5 h-3.5 text-[#A1A1AA] shrink-0" />
+                                  )
+                                )}
+                              </button>
+                              {isThoughtOpen && step.detail && (
+                                <div className="ml-5.5 rounded-xl border border-black/[0.07] bg-[#FAFAFC] px-3 py-2 text-[12px] leading-relaxed text-[#52525B] whitespace-pre-wrap max-h-48 overflow-y-auto">
+                                  {step.detail}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        }
+
+                        if (stepKind === 'search') {
+                          return (
+                            <div key={step.id} className="flex flex-col gap-1.5">
                               <div
-                                className={`inline-flex items-center gap-1.5 text-[12.5px] font-medium ${
-                                  isActive
-                                    ? 'text-[#0B0B0F]'
-                                    : isDone
-                                      ? 'text-[#0D5BFF]'
-                                      : 'text-[#A1A1AA]'
+                                className={`flex items-center gap-2 text-[13px] ${
+                                  isStepRunning ? 'text-[#0B0B0F] font-medium' : 'text-[#52525B]'
                                 }`}
                               >
-                                {isActive ? (
+                                {isStepRunning ? (
                                   <Loader2
                                     className="w-3.5 h-3.5 animate-spin shrink-0"
                                     style={{ color: theme.accentColor }}
                                   />
-                                ) : isDone ? (
-                                  <CheckCircle2 className="w-3.5 h-3.5 text-[#0D5BFF] shrink-0" />
                                 ) : (
-                                  <span className="w-2 h-2 rounded-full bg-black/15 shrink-0" />
+                                  <Search className="w-3.5 h-3.5 text-[#0D5BFF] shrink-0" />
                                 )}
-                                <span>{stageLabel}</span>
+                                <span className="truncate">{step.label}</span>
                               </div>
-                              {idx < stageSteps.length - 1 && (
-                                <span aria-hidden="true" className="text-[#D4D4D8] text-xs">
-                                  /
-                                </span>
+                              {step.sources && step.sources.length > 0 && (
+                                <div className="ml-5.5 flex flex-wrap gap-1.5">
+                                  {step.sources.slice(0, 5).map((src) => (
+                                    <a
+                                      key={src.url}
+                                      href={src.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="inline-flex items-center gap-1 max-w-[220px] rounded-lg border border-black/[0.08] bg-[#FAFAFC] hover:bg-[#F4F4F6] px-2 py-1 text-[11.5px] text-[#3F3F46] truncate transition-colors"
+                                      title={src.title || src.url}
+                                    >
+                                      <span className="truncate">{src.title || src.url}</span>
+                                      <ExternalLink className="w-2.5 h-2.5 shrink-0 text-[#71717A]" />
+                                    </a>
+                                  ))}
+                                </div>
                               )}
                             </div>
                           );
-                        })}
-                      </div>
+                        }
 
-                      <div className="flex items-center justify-between gap-2 text-[12.5px] text-[#52525B]">
-                        <span className="truncate flex items-center gap-1.5 font-medium">
-                          {isCompletedBuild ? (
-                            <>
-                              <CheckCircle2 className="w-3.5 h-3.5 text-[#0D5BFF] shrink-0" />
-                              <span>All files edited & live preview verified</span>
-                            </>
-                          ) : activeStageIndex === 1 && turn.activeFile ? (
-                            `Editing file ${turn.activeFile}`
-                          ) : (
-                            turn.phaseLabel || `${stageSteps[activeStageIndex]}...`
-                          )}
-                        </span>
-                        {displaySteps.length > 0 && (
-                          <button
-                            type="button"
-                            onClick={togglePlan}
-                            className="shrink-0 text-[12px] font-semibold text-[#0B0B0F] hover:text-[#0D5BFF] transition-colors whitespace-nowrap px-1.5 py-0.5 rounded-md hover:bg-black/[0.04]"
-                          >
-                            {isPlanOpen ? 'Hide steps' : `Steps (${displaySteps.length})`}
-                          </button>
-                        )}
-                      </div>
+                        if (stepKind === 'read') {
+                          return (
+                            <div
+                              key={step.id}
+                              className={`flex items-center gap-2 text-[13px] ${
+                                isStepRunning ? 'text-[#0B0B0F] font-medium' : 'text-[#71717A]'
+                              }`}
+                            >
+                              {isStepRunning ? (
+                                <Loader2
+                                  className="w-3.5 h-3.5 animate-spin shrink-0"
+                                  style={{ color: theme.accentColor }}
+                                />
+                              ) : (
+                                <FileText className="w-3.5 h-3.5 text-[#71717A] shrink-0" />
+                              )}
+                              <span className="truncate">{step.label}</span>
+                            </div>
+                          );
+                        }
 
-                      {isPlanOpen && displaySteps.length > 0 && (
-                        <ul className="pt-2 border-t border-black/[0.06] space-y-1.5 text-[12.5px] text-[#3F3F46]">
-                          {displaySteps.map((step) => {
-                            const isStepComplete = isCompletedBuild || step.status === 'complete';
-                            const isStepRunning = !isCompletedBuild && step.status === 'running';
-                            return (
-                              <li key={step.id} className="flex items-center justify-between gap-2">
-                                <div className="flex items-center gap-2 min-w-0">
-                                  {isStepRunning ? (
-                                    <Loader2
-                                      className="w-3.5 h-3.5 animate-spin shrink-0"
-                                      style={{ color: theme.accentColor }}
-                                    />
-                                  ) : isStepComplete ? (
-                                    <CheckCircle2 className="w-3.5 h-3.5 text-[#16A34A] shrink-0" />
-                                  ) : (
-                                    <span className="w-2 h-2 rounded-full bg-black/20 shrink-0 ml-0.5" />
-                                  )}
-                                  <span
-                                    className={`truncate ${
-                                      isStepComplete
-                                        ? 'text-[#18181B]'
-                                        : isStepRunning
-                                          ? 'text-[#0B0B0F] font-medium'
-                                          : 'text-[#71717A]'
-                                    }`}
-                                  >
-                                    {step.label}
-                                  </span>
-                                </div>
-                                {step.file && (
-                                  <span className="shrink-0 text-[11px] font-mono text-[#71717A] bg-black/[0.04] px-1.5 py-0.5 rounded">
-                                    {step.file}
-                                  </span>
+                        if (stepKind === 'edit') {
+                          const fileEntries =
+                            step.files && step.files.length > 0
+                              ? step.files
+                              : step.file
+                                ? [{ path: step.file, status: step.status === 'complete' ? ('complete' as const) : ('running' as const) }]
+                                : [];
+                          return (
+                            <div key={step.id} className="flex flex-col gap-2">
+                              <div
+                                className={`flex items-center gap-2 text-[13px] ${
+                                  isStepRunning ? 'text-[#0B0B0F] font-medium' : 'text-[#52525B]'
+                                }`}
+                              >
+                                {isStepRunning ? (
+                                  <Loader2
+                                    className="w-3.5 h-3.5 animate-spin shrink-0"
+                                    style={{ color: theme.accentColor }}
+                                  />
+                                ) : (
+                                  <Pencil className="w-3.5 h-3.5 text-[#0D5BFF] shrink-0" />
                                 )}
-                              </li>
-                            );
-                          })}
+                                <span className="truncate">
+                                  {isStepRunning
+                                    ? step.label || 'Editing files'
+                                    : fileEntries.length > 1
+                                      ? 'Edited files'
+                                      : step.label || 'Edited file'}
+                                </span>
+                              </div>
+                              {fileEntries.length > 0 && (
+                                <div className="rounded-2xl border border-black/[0.08] bg-[#FAFAFC] overflow-hidden divide-y divide-black/[0.05]">
+                                  {fileEntries.map((f) => {
+                                    const isFileDone = isCompletedBuild || !isTurnWorking || f.status === 'complete';
+                                    return (
+                                      <div
+                                        key={f.path}
+                                        className="flex items-center justify-between gap-3 px-3.5 py-2.5 text-[12.5px]"
+                                      >
+                                        <span className="font-mono text-[#18181B] truncate">
+                                          {f.path}
+                                        </span>
+                                        {isFileDone ? (
+                                          <CheckCircle2 className="w-4 h-4 text-[#0D5BFF] shrink-0" />
+                                        ) : (
+                                          <Loader2
+                                            className="w-4 h-4 animate-spin shrink-0"
+                                            style={{ color: theme.accentColor }}
+                                          />
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        }
+
+                        // 'check' step
+                        return (
+                          <div
+                            key={step.id}
+                            className={`flex items-center gap-2 text-[13px] ${
+                              isStepRunning ? 'text-[#0B0B0F] font-medium' : 'text-[#52525B]'
+                            }`}
+                          >
+                            {isStepRunning ? (
+                              <Loader2
+                                className="w-3.5 h-3.5 animate-spin shrink-0"
+                                style={{ color: theme.accentColor }}
+                              />
+                            ) : isStepDone ? (
+                              <CheckCircle2 className="w-3.5 h-3.5 text-[#0D5BFF] shrink-0" />
+                            ) : (
+                              <span className="w-2 h-2 rounded-full bg-black/20 shrink-0" />
+                            )}
+                            <span className="truncate">{step.label}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Architecture Plan Breakdown (when model emitted real [[PLAN:...]] steps) */}
+                  {turn.planSteps && turn.planSteps.length > 0 && (
+                    <div className="rounded-xl border border-black/[0.06] bg-[#FAFAFC] px-3 py-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setExpandedPlanTurns((prev) => ({
+                            ...prev,
+                            [turn.id]: !prev[turn.id],
+                          }))
+                        }
+                        className="w-full flex items-center justify-between gap-2 text-[12px] font-medium text-[#52525B] hover:text-[#0B0B0F]"
+                      >
+                        <span>Architecture plan ({turn.planSteps.length})</span>
+                        {expandedPlanTurns[turn.id] ? (
+                          <ChevronDown className="w-3.5 h-3.5" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                      {expandedPlanTurns[turn.id] && (
+                        <ul className="mt-2 pt-2 border-t border-black/[0.05] space-y-1 text-[12px] text-[#3F3F46]">
+                          {turn.planSteps.map((planItem, idx) => (
+                            <li key={idx} className="leading-snug">
+                              • {planItem}
+                            </li>
+                          ))}
                         </ul>
                       )}
                     </div>
@@ -3267,16 +3311,14 @@ export function BuilderWorkspace({
                       </div>
                     </div>
                   ) : (
-                    (displayAiText || !showPipelineCard) && (
+                    (displayAiText || (!hasRealSteps && isTurnWorking) || (isCompletedBuild && !displayAiText)) && (
                       <div className="flex items-start justify-between gap-2.5">
                         <div className="flex-1 min-w-0 text-[15px] leading-[1.6] tracking-[-0.005em] text-[#111118] whitespace-pre-wrap">
                           {displayAiText || (
-                            <span className="text-[#71717A]">
+                            <span className="text-[#71717A] text-[13.5px]">
                               {isTurnWorking
-                                ? turn.phaseLabel || 'Thinking...'
-                                : isBuildTurn
-                                  ? 'Your app is ready to preview.'
-                                  : 'Waiting for response...'}
+                                ? 'Connecting to Gemini...'
+                                : 'Your app is ready to preview.'}
                             </span>
                           )}
                           {isTurnWorking && displayAiText && (

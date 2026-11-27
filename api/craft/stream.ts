@@ -22,10 +22,12 @@ import {
   type GeneratedMediaResult,
 } from '../_mediaService.js';
 import {
+  createRealtimeStepTracker,
   finalizeRealtimeOutput,
   prepareRealtimePrompt,
   repairIncompleteBuildHtml,
   streamServerFreeAiRealTime,
+  type StreamBuildStep,
   type VisualHintsSpec,
 } from '../_realtimeEngine.js';
 import {
@@ -200,12 +202,8 @@ export async function POST(request: Request): Promise<Response> {
 
       try {
         const startedAt = Date.now();
-        sendEvent({
-          type: 'phase',
-          phase: 'understanding',
-          kind: 'chat',
-          action: 'Thinking',
-          label: 'Thinking...',
+        const stepTracker = createRealtimeStepTracker((step: StreamBuildStep) => {
+          sendEvent({ type: 'step', step });
         });
 
         const memAuth =
@@ -247,6 +245,7 @@ export async function POST(request: Request): Promise<Response> {
           visualHints,
           projectMemoryPromise,
           onStage: (stage) => {
+            stepTracker.handleStage(stage);
             sendEvent({
               type: 'phase',
               phase: stage.phase,
@@ -326,20 +325,18 @@ export async function POST(request: Request): Promise<Response> {
         let lastFilesKey = '';
         let lastBytesSent = 0;
         let lastPreviewBytesSent = 0;
-        let emittedReasoningPhase = false;
+        let lastThinkTagLen = 0;
 
         let activeModelUsed = requestedModel || 'gemini::gemini-4-hydrogen';
         let activeModelName = prepared.requestedModelLabel || 'Gemini 4 Hydrogen';
         let activeProvider = 'gemini';
         let parallelMergedRaw: string | null = null;
 
-        let lastReasoningUpdateAt = 0;
-        let reasoningBuffer = '';
-
         await streamServerFreeAiRealTime({
           requestedModel,
           initialRoute: prepared.initialRoute,
           isFastPatch: Boolean(prepared.isPatchMode),
+          enableWebSearch: webSearchEnabled && prepared.mediaKind === null,
           systemPrompt: prepared.systemPrompt,
           historyMessages: prepared.historyMessages,
           userPrompt: prepared.userPrompt,
@@ -374,39 +371,20 @@ export async function POST(request: Request): Promise<Response> {
               isFallback: false,
             });
           },
+          onGrounding: (meta) => {
+            stepTracker.pushGrounding(meta);
+          },
           onReasoningChunk: (reasoningChunk) => {
-            if (enteredCodePhase) return;
-            reasoningBuffer = `${reasoningBuffer}${reasoningChunk}`.slice(-600);
-            const now = Date.now();
-            if (!emittedReasoningPhase || now - lastReasoningUpdateAt >= 1400) {
-              emittedReasoningPhase = true;
-              lastReasoningUpdateAt = now;
-              const headingMatches = Array.from(reasoningBuffer.matchAll(/\*\*([^*\n]{4,72})\*\*/g));
-              const latestHeading =
-                headingMatches[headingMatches.length - 1]?.[1]?.trim() || 'Thinking...';
-              sendEvent({
-                type: 'phase',
-                phase: 'understanding',
-                kind: prepared.initialRoute === 'build' ? 'build' : 'chat',
-                action: 'Thinking',
-                label: latestHeading,
-              });
-            }
+            stepTracker.pushReasoning(reasoningChunk);
           },
           onContentChunk: (chunk) => {
             rawAccumulated += chunk;
             if (hasOpenReasoningTag(rawAccumulated) && !enteredCodePhase) {
-              const now = Date.now();
-              if (!emittedReasoningPhase || now - lastReasoningUpdateAt >= 1200) {
-                emittedReasoningPhase = true;
-                lastReasoningUpdateAt = now;
-                sendEvent({
-                  type: 'phase',
-                  phase: 'understanding',
-                  kind: prepared.initialRoute === 'build' ? 'build' : 'chat',
-                  action: 'Thinking',
-                  label: 'Thinking...',
-                });
+              const tagSlice = rawAccumulated.slice(lastThinkTagLen);
+              lastThinkTagLen = rawAccumulated.length;
+              const cleanedDelta = tagSlice.replace(/<\/?(?:think[a-z0-9_-]*|thought)\b[^>]*>/gi, '');
+              if (cleanedDelta) {
+                stepTracker.pushReasoning(cleanedDelta);
               }
               return;
             }
@@ -440,6 +418,7 @@ export async function POST(request: Request): Promise<Response> {
 
             const proseSoFar = getSafeStreamingProse(cleanSoFar);
             if (proseSoFar.length > emittedProseLen) {
+              stepTracker.completeActiveThought();
               const delta = proseSoFar.slice(emittedProseLen);
               emittedProseLen = proseSoFar.length;
               if (delta) {
@@ -451,63 +430,47 @@ export async function POST(request: Request): Promise<Response> {
             if (codeStart) {
               if (!enteredCodePhase) {
                 enteredCodePhase = true;
-                const initialFile = codeStart.isPatch ? 'patch.diff' : 'index.html';
-                const initialAction = codeStart.isPatch ? 'Editing file' : 'Writing file';
-                const initialLabel = `${initialAction} ${initialFile}`;
+                stepTracker.completeActiveThought();
+                const initialFile = codeStart.isPatch ? 'index.html' : 'index.html';
+                const initialAction = codeStart.isPatch ? 'Editing file' : 'Editing files';
                 sendEvent({
                   type: 'phase',
                   phase: 'building',
                   kind: 'build',
                   action: initialAction,
-                  label: initialLabel,
-                  toolStep: {
-                    id: 'step-code-init',
-                    label: initialLabel,
-                    file: initialFile,
-                    action: initialAction,
-                    status: 'running',
-                  },
+                  label: `${initialAction} ${initialFile}`,
                 });
               }
 
               const htmlSoFar = cleanSoFar
                 .slice(codeStart.htmlOffset)
                 .replace(/<<<\s*(?:END_AICRAFT_APP_HTML|END_PATCH|END_AICRAFT_PATCH)\s*>>>[\s\S]*/i, '');
+              stepTracker.pushCodeProgress(htmlSoFar, Boolean(codeStart.isPatch));
+
               const artifacts = extractLiveBuildArtifacts(htmlSoFar);
               const paths = artifacts.map((a) => a.path);
               const filesKey = paths.join('|');
               if (
                 filesKey !== lastFilesKey ||
-                htmlSoFar.length - lastBytesSent >= 250
+                htmlSoFar.length - lastBytesSent >= 300
               ) {
                 lastFilesKey = filesKey;
                 lastBytesSent = htmlSoFar.length;
                 const active = artifacts[artifacts.length - 1];
-                const activeAction = active?.action
-                  ? (codeStart.isPatch ? 'Editing' : active.action)
-                  : (codeStart.isPatch ? 'Editing' : 'Writing');
                 const activeFile = active?.path || 'index.html';
-                const stepAction = `${activeAction} file`;
-                const stepLabel = `${activeAction} ${activeFile}`;
                 sendEvent({
                   type: 'file',
-                  action: stepAction,
+                  action: codeStart.isPatch ? 'Editing file' : 'Editing files',
                   path: activeFile,
                   allFiles: paths,
                   bytesBuilt: htmlSoFar.length,
-                  toolStep: {
-                    id: `step-${paths.length}`,
-                    label: stepLabel,
-                    file: activeFile,
-                    action: stepAction,
-                    status: 'running',
-                  },
                 });
               }
               if (
                 !codeStart.isPatch &&
-                htmlSoFar.length >= 80 &&
-                htmlSoFar.length - lastPreviewBytesSent >= 250
+                !prepared.hasPreviousHtml &&
+                htmlSoFar.length >= 1200 &&
+                htmlSoFar.length - lastPreviewBytesSent >= 900
               ) {
                 lastPreviewBytesSent = htmlSoFar.length;
                 const liveHtml = finalizePartialPreviewHtml(cleanSoFar);
@@ -526,18 +489,13 @@ export async function POST(request: Request): Promise<Response> {
         clearInterval(keepAlive);
 
         if (enteredCodePhase) {
+          stepTracker.startCheck('Checking files & live preview');
           sendEvent({
             type: 'phase',
             phase: 'building',
             kind: 'build',
             action: 'Checking',
             label: 'Checking files & live preview...',
-            toolStep: {
-              id: 'step-check',
-              label: 'Checking files & live preview',
-              action: 'Checking',
-              status: 'running',
-            },
           });
         }
 
@@ -558,31 +516,41 @@ export async function POST(request: Request): Promise<Response> {
 
         if (
           finalized.kind === 'build' &&
-          !finalized.valid &&
+          (!finalized.valid || finalized.patchFailedCompletely) &&
           finalized.previewHtml &&
-          Date.now() - startedAt < 42000
+          Date.now() - startedAt < 45000
         ) {
+          stepTracker.startCheck(
+            finalized.patchFailedCompletely
+              ? 'Applying update to app files...'
+              : 'Checking scripts & live preview...'
+          );
           sendEvent({
             type: 'phase',
             phase: 'building',
             kind: 'build',
             action: 'Checking',
-            label: 'Verifying scripts & polishing live UI...',
+            label: finalized.patchFailedCompletely
+              ? 'Applying update to app files...'
+              : 'Checking files & live preview...',
           });
           const repairedHtml = await repairIncompleteBuildHtml({
             brokenHtml: finalized.previewHtml,
             validationReason: finalized.validationReason || 'Incomplete app output',
             userMessage: message,
             mode,
+            isPatchFallback: Boolean(finalized.patchFailedCompletely),
           });
           if (repairedHtml) {
             finalized.previewHtml = repairedHtml;
             finalized.bytesBuilt = repairedHtml.length;
             finalized.valid = true;
+            finalized.patchFailedCompletely = false;
           }
         }
 
         if (finalized.kind === 'chat') {
+          const chatToolSteps = stepTracker.finishSteps([]);
           if (memAuth) {
             void saveProjectMemorySnapshot(memAuth, {
               projectId,
@@ -617,6 +585,7 @@ export async function POST(request: Request): Promise<Response> {
             modelUsed: finalized.modelUsed,
             modelName: finalized.modelName,
             provider: finalized.provider,
+            toolSteps: chatToolSteps,
           });
           closeStream();
           return;
@@ -702,36 +671,7 @@ export async function POST(request: Request): Promise<Response> {
           }).catch(() => {});
         }
 
-        const buildToolSteps = [
-          {
-            id: 'step-thinking',
-            label: 'Thought through app architecture',
-            action: 'Thinking',
-            status: 'complete' as const,
-          },
-          ...finalized.files.map((file, idx) => {
-            const act = file.endsWith('.css')
-              ? 'Styling'
-              : file.includes('database')
-                ? 'Wiring database'
-                : file.endsWith('.js')
-                  ? 'Scripting'
-                  : 'Editing file';
-            return {
-              id: `step-file-${idx}`,
-              label: `${act} ${file}`,
-              file,
-              action: act,
-              status: 'complete' as const,
-            };
-          }),
-          {
-            id: 'step-preview-check',
-            label: 'Verified live preview & database',
-            action: 'Checking',
-            status: 'complete' as const,
-          },
-        ];
+        const buildToolSteps = stepTracker.finishSteps(finalized.files);
 
         sendEvent({
           type: 'done',
@@ -756,7 +696,7 @@ export async function POST(request: Request): Promise<Response> {
         const savedPartial = rawAccumulated
           ? finalizePartialPreviewHtml(stripReasoningTags(rawAccumulated))
           : '';
-        if (savedPartial && savedPartial.length >= 450) {
+        if (savedPartial && savedPartial.length >= 450 && !previousHtml.trim()) {
           sendEvent({
             type: 'partialHtml',
             previewHtml: savedPartial,
@@ -767,6 +707,10 @@ export async function POST(request: Request): Promise<Response> {
           err instanceof Error
             ? err.message
             : 'Unable to reach Gemini backend right now. Check GEMINI_API_KEY in Settings > Secrets.';
+        const fatal =
+          /gemini_api_key|api[_\s]?key|permission[_\s]?denied|unauthenticated|unauthorized|not configured|\b(?:401|403|404)\b/i.test(
+            errorMessage
+          );
         if (projectId && creditCheck.context?.user?.id) {
           void recordBuildCheckpoint(
             {
@@ -790,6 +734,7 @@ export async function POST(request: Request): Promise<Response> {
         sendEvent({
           type: 'error',
           message: errorMessage,
+          fatal,
         });
         closeStream();
       }
