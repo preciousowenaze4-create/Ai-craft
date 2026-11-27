@@ -4023,8 +4023,6 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
             isOwner={isOwnerUser}
             isVerified={Boolean(authUser?.verified)}
             isRestricted={Boolean(authUser?.restricted)}
-            testMode={testMode}
-            onToggleTestMode={() => setTestMode((v) => !v)}
           />
         </>
       ) : (
@@ -4127,8 +4125,6 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                   modelsLoading={modelsLoading}
                   modelsError={modelsError}
                   isRestricted={Boolean(authUser?.restricted)}
-                  testMode={testMode}
-                  onToggleTestMode={() => setTestMode((v) => !v)}
                   onSelectModel={setSelectedModel}
                   onRetryModels={() => void loadModels(true)}
                   onSubmit={handlePromptSubmit}

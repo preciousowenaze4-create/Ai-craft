@@ -2201,43 +2201,7 @@ export function BuilderWorkspace({
               )}
             </button>
 
-            {/* Test Mode Switch */}
-            {onToggleTestMode && (
-              <button
-                type="button"
-                role="switch"
-                aria-checked={testMode}
-                onClick={onToggleTestMode}
-                aria-label="Toggle Gemini Test Mode"
-                title={
-                  testMode
-                    ? 'Test Mode ON — Using isolated test database'
-                    : 'Turn on Test Mode'
-                }
-                className={`h-8 px-2.5 rounded-full border flex items-center justify-center gap-1.5 text-[11.5px] font-semibold transition-all shrink-0 active:scale-95 ${
-                  testMode
-                    ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
-                    : 'bg-white border-black/[0.08] text-[#52525B] hover:bg-black/[0.04]'
-                }`}
-              >
-                <FlaskConical
-                  className={`w-3.5 h-3.5 ${testMode ? 'text-emerald-600' : 'text-[#71717A]'}`}
-                />
-                <span className="hidden sm:inline">Test</span>
-                <span
-                  aria-hidden="true"
-                  className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
-                    testMode ? 'bg-emerald-500' : 'bg-zinc-300'
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${
-                      testMode ? 'translate-x-3.5' : 'translate-x-0.5'
-                    }`}
-                  />
-                </span>
-              </button>
-            )}
+
 
             {/* Visual Inspector Toggle */}
             <button
@@ -3641,44 +3605,6 @@ export function BuilderWorkspace({
                   </span>
                 </div>
                 <div className="flex items-center gap-1.5 shrink-0">
-                  {onToggleTestMode && (
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={testMode}
-                      aria-label="Toggle Gemini Test Mode"
-                      title={
-                        testMode
-                          ? 'Test Mode ON — Isolated test database & sandboxed app runs'
-                          : 'Turn on Test Mode for isolated testing with Gemini'
-                      }
-                      onClick={onToggleTestMode}
-                      className={`h-8 px-2 rounded-full border inline-flex items-center gap-1.5 text-[11.5px] font-medium transition-all active:scale-95 ${
-                        testMode
-                          ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
-                          : 'bg-white/85 border-black/[0.08] text-[#52525B] hover:bg-black/[0.03]'
-                      }`}
-                    >
-                      <FlaskConical
-                        className={`w-3.5 h-3.5 shrink-0 ${
-                          testMode ? 'text-emerald-600' : 'text-[#71717A]'
-                        }`}
-                      />
-                      <span>Test</span>
-                      <span
-                        aria-hidden="true"
-                        className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
-                          testMode ? 'bg-emerald-500' : 'bg-zinc-300'
-                        }`}
-                      >
-                        <span
-                          className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${
-                            testMode ? 'translate-x-3.5' : 'translate-x-0.5'
-                          }`}
-                        />
-                      </span>
-                    </button>
-                  )}
                   {models.length > 0 && (
                     <ModelSelectorPopover
                       mode={mode}
