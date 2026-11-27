@@ -40,7 +40,10 @@ export async function POST(request: Request): Promise<Response> {
     let lastTranscribeErr: unknown = null;
     for (const candidate of candidates.slice(0, 6)) {
       try {
-        const ai = createGeminiClient(candidate.apiKey);
+        const ai = createGeminiClient(
+          candidate.apiKey,
+          candidate.isOpenAiStyle ? undefined : candidate.baseUrl
+        );
         const response = await ai.models.generateContent({
           model: candidate.upstreamModelId,
           contents: {

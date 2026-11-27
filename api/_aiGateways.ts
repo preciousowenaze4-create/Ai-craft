@@ -57,6 +57,8 @@ export interface DynamicGeminiCandidate {
   confirmedLive: boolean;
   thinkingMode: GeminiThinkingMode;
   isGemini4Series: boolean;
+  baseUrl?: string;
+  isOpenAiStyle?: boolean;
 }
 
 export const SERVER_GEMINI_MODEL_ID = 'gemini::gemini-4-hydrogen';
@@ -73,28 +75,281 @@ const KEY_PLACEHOLDERS = [
   'REPLACE_ME',
 ];
 
-function parseMultiKeysFromRaw(raw: string | undefined): string[] {
-  if (typeof raw !== 'string' || !raw.trim()) return [];
-  return raw
-    .split(/[\r\n,;]+/)
+export interface ParsedEnvKeyEntry {
+  apiKey: string;
+  baseUrl?: string;
+  hintedModel?: string;
+  isOpenAiStyle?: boolean;
+}
+
+function stripWrappingQuotesAndBrackets(part: string): string {
+  let s = part.trim();
+  if (s.startsWith('[') && s.endsWith(']')) {
+    s = s.slice(1, -1).trim();
+  }
+  s = s.replace(/^[\[\s]+/, '').replace(/[\]\s]+$/, '').trim();
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+export function parseEnvListValue(raw: string | undefined): string[] {
+  if (typeof raw !== 'string') return [];
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map((item) => (typeof item === 'string' ? item.trim() : ''))
+          .filter(Boolean);
+      }
+    } catch {
+      // fall through to bracket-stripped splitting
+    }
+  }
+
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      const listCandidate =
+        parsed.keys ?? parsed.models ?? parsed.endpoints ?? parsed.items;
+      if (Array.isArray(listCandidate)) {
+        return listCandidate
+          .map((item) => (typeof item === 'string' ? item.trim() : ''))
+          .filter(Boolean);
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  const inner =
+    trimmed.startsWith('[') && trimmed.endsWith(']')
+      ? trimmed.slice(1, -1)
+      : trimmed;
+  return inner
+    .split(/[\r\n,;|]+/)
+    .map((p) => stripWrappingQuotesAndBrackets(p))
+    .filter(Boolean);
+}
+
+export function normalizeGeminiEndpointUrl(rawUrl: string): {
+  baseUrl: string;
+  rawEndpointUrl: string;
+  hintedModel?: string;
+  isOpenAiStyle: boolean;
+} | null {
+  const cleaned = cleanEnvKey(rawUrl, ['MY_GEMINI_ENDPOINT', 'YOUR_ENDPOINT']);
+  if (!cleaned || !/^https?:\/\//i.test(cleaned)) return null;
+
+  const withoutQuery = cleaned.split(/[?#]/)[0].replace(/\/+$/, '');
+  if (/\/(?:chat\/completions|openai(?:\/v1)?)$/i.test(withoutQuery)) {
+    return {
+      baseUrl: withoutQuery,
+      rawEndpointUrl: withoutQuery,
+      isOpenAiStyle: true,
+    };
+  }
+
+  let hintedModel: string | undefined;
+  let base = withoutQuery;
+  const modelEndpointMatch =
+    /\/v1(?:beta|alpha)?\/models\/([^/:?#]+)(?::[a-zA-Z0-9_]+)?$/i.exec(base) ||
+    /\/models\/([^/:?#]+)(?::[a-zA-Z0-9_]+)?$/i.exec(base);
+  if (modelEndpointMatch?.[1]) {
+    hintedModel = modelEndpointMatch[1].trim();
+  }
+
+  base = base
+    .replace(/\/v1(?:beta|alpha)?\/models(?:\/[^?#]*)?$/i, '')
+    .replace(/\/models(?:\/[^?#]*)?$/i, '')
+    .replace(/\/v1(?:beta|alpha)?$/i, '')
+    .replace(/\/+$/, '');
+
+  if (!/^https?:\/\/[^/]+/i.test(base)) return null;
+  return {
+    baseUrl: base,
+    rawEndpointUrl: withoutQuery,
+    ...(hintedModel ? { hintedModel } : {}),
+    isOpenAiStyle: false,
+  };
+}
+
+function parseKeyEntriesFromRaw(raw: string | undefined): ParsedEnvKeyEntry[] {
+  if (typeof raw !== 'string') return [];
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      const rows = Array.isArray(parsed)
+        ? parsed
+        : parsed && typeof parsed === 'object'
+          ? Array.isArray((parsed as Record<string, unknown>).keys)
+            ? ((parsed as Record<string, unknown>).keys as unknown[])
+            : [parsed]
+          : [];
+      const out: ParsedEnvKeyEntry[] = [];
+      for (const row of rows) {
+        if (typeof row === 'string') {
+          const apiKey = cleanEnvKey(row, KEY_PLACEHOLDERS);
+          if (apiKey.length >= 16) out.push({ apiKey });
+        } else if (row && typeof row === 'object') {
+          const obj = row as Record<string, unknown>;
+          const rawKey =
+            obj.apiKey ?? obj.api_key ?? obj.key ?? obj.token ?? obj.secret;
+          const apiKey =
+            typeof rawKey === 'string'
+              ? cleanEnvKey(rawKey, KEY_PLACEHOLDERS)
+              : '';
+          const rawUrl =
+            obj.endpoint ?? obj.baseUrl ?? obj.base_url ?? obj.url ?? obj.apiUrl;
+          const normUrl =
+            typeof rawUrl === 'string' ? normalizeGeminiEndpointUrl(rawUrl) : null;
+          const rawModel = obj.model ?? obj.modelId;
+          const hintedModel =
+            typeof rawModel === 'string' && rawModel.trim()
+              ? rawModel.trim()
+              : normUrl?.hintedModel;
+          if (apiKey.length >= 16) {
+            out.push({
+              apiKey,
+              ...(normUrl ? { baseUrl: normUrl.baseUrl, isOpenAiStyle: normUrl.isOpenAiStyle } : {}),
+              ...(hintedModel ? { hintedModel } : {}),
+            });
+          }
+        }
+      }
+      if (out.length > 0) return out;
+    } catch {
+      // fall through to string splitting
+    }
+  }
+
+  return parseEnvListValue(trimmed)
     .map((part) => cleanEnvKey(part, KEY_PLACEHOLDERS))
-    .filter((k) => k.length >= 16);
+    .filter((k) => k.length >= 16)
+    .map((apiKey) => ({ apiKey }));
+}
+
+export function getGeminiEndpointOverrides(): Array<{
+  baseUrl: string;
+  rawEndpointUrl: string;
+  hintedModel?: string;
+  isOpenAiStyle: boolean;
+}> {
+  const endpointVars: Array<string | undefined> = [
+    process.env.GEMINI_API_BASE_URL,
+    process.env.GEMINI_BASE_URL,
+    process.env.GEMINI_API_ENDPOINT,
+    process.env.GEMINI_ENDPOINT,
+    process.env.GEMINI_ENDPOINTS,
+    process.env.GEMINI_API_ENDPOINTS,
+    process.env.GEMINI_API_URL,
+    process.env.GOOGLE_GEMINI_BASE_URL,
+    process.env.GOOGLE_GEMINI_ENDPOINT,
+    process.env.GOOGLE_API_BASE_URL,
+    process.env.AI_ENDPOINT,
+    process.env.AI_API_ENDPOINT,
+    process.env.API_ENDPOINT,
+  ];
+
+  const out: Array<{
+    baseUrl: string;
+    rawEndpointUrl: string;
+    hintedModel?: string;
+    isOpenAiStyle: boolean;
+  }> = [];
+  const seen = new Set<string>();
+
+  for (const raw of endpointVars) {
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    const trimmed = raw.trim();
+    if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        const items = Array.isArray(parsed)
+          ? parsed
+          : parsed && typeof parsed === 'object'
+            ? [
+                (parsed as Record<string, unknown>).endpoint ??
+                  (parsed as Record<string, unknown>).baseUrl ??
+                  (parsed as Record<string, unknown>).url,
+              ]
+            : [];
+        for (const item of items) {
+          const candidateUrl =
+            typeof item === 'string'
+              ? item
+              : item && typeof item === 'object'
+                ? String(
+                    (item as Record<string, unknown>).endpoint ??
+                      (item as Record<string, unknown>).baseUrl ??
+                      (item as Record<string, unknown>).url ??
+                      ''
+                  )
+                : '';
+          const norm = normalizeGeminiEndpointUrl(candidateUrl);
+          if (norm && !seen.has(norm.rawEndpointUrl)) {
+            seen.add(norm.rawEndpointUrl);
+            out.push(norm);
+          }
+        }
+        continue;
+      } catch {
+        // fall through
+      }
+    }
+
+    for (const part of parseEnvListValue(trimmed)) {
+      const norm = normalizeGeminiEndpointUrl(part);
+      if (norm && !seen.has(norm.rawEndpointUrl)) {
+        seen.add(norm.rawEndpointUrl);
+        out.push(norm);
+      }
+    }
+  }
+
+  for (const entry of getGeminiEnvKeyEndpointPairs()) {
+    if (entry.baseUrl) {
+      const norm = normalizeGeminiEndpointUrl(entry.baseUrl);
+      if (norm && !seen.has(norm.rawEndpointUrl)) {
+        seen.add(norm.rawEndpointUrl);
+        out.push(norm);
+      }
+    }
+  }
+
+  return out;
 }
 
 export function getGeminiBaseUrlOverride(): string {
-  const raw = (process.env.GEMINI_API_BASE_URL || '').trim().replace(/\/+$/, '');
-  if (!raw) return '';
-  if (/^https?:\/\//i.test(raw)) return raw;
-  return '';
+  const first = getGeminiEndpointOverrides()[0];
+  return first ? first.baseUrl : '';
 }
 
 export function getGeminiEffectiveBaseUrl(): string {
   return getGeminiBaseUrlOverride() || DEFAULT_GEMINI_BASE_URL;
 }
 
-export function getServerGeminiApiKeys(): string[] {
-  const envVars = [
+export function getGeminiEnvKeyEndpointPairs(): ParsedEnvKeyEntry[] {
+  const explicitEnvVars = [
     process.env.GEMINI_API_KEY,
+    process.env.GEMINI_API_KEYS,
+    process.env.GEMINI_KEYS,
+    process.env.GEMINI_KEY_ARRAY,
+    process.env.GEMINI_KEY_LIST,
+    process.env.GEMINI_API_KEY_ARRAY,
+    process.env.GEMINI_API_CONFIG,
+    process.env.GEMINI_CONFIG,
     process.env.GEMINI_API_KEY_1,
     process.env.GEMINI_API_KEY_2,
     process.env.GEMINI_API_KEY_3,
@@ -103,6 +358,8 @@ export function getServerGeminiApiKeys(): string[] {
     process.env.GEMINI_API_KEY_6,
     process.env.GEMINI_API_KEY_7,
     process.env.GEMINI_API_KEY_8,
+    process.env.GEMINI_API_KEY_9,
+    process.env.GEMINI_API_KEY_10,
     process.env.BACKUP_GEMINI_API_KEY,
     process.env.GEMINI_BACKUP_KEY,
     process.env.GEMINI_API_KEY_BACKUP,
@@ -110,19 +367,79 @@ export function getServerGeminiApiKeys(): string[] {
     process.env.MY_GEMINI_API_KEY,
     process.env.YOUR_GEMINI_API_KEY,
     process.env.GOOGLE_API_KEY,
+    process.env.GOOGLE_API_KEYS,
+    process.env.GOOGLE_GEMINI_API_KEY,
+    process.env.GOOGLE_GEMINI_API_KEYS,
+    process.env.AI_API_KEY,
+    process.env.AI_API_KEYS,
+    process.env.API_KEYS,
   ];
 
+  // Also scan any numbered or array-suffixed Gemini/Google env variables dynamically
+  for (const [envName, envVal] of Object.entries(process.env)) {
+    if (
+      /^(?:GEMINI|GOOGLE_GEMINI|GOOGLE_AI|AI_CRAFT_GEMINI)(?:_API)?_KEYS?(?:_\d+|_BACKUP|_ARRAY|_LIST)?$/i.test(
+        envName
+      )
+    ) {
+      explicitEnvVars.push(envVal);
+    }
+  }
+
   const seen = new Set<string>();
-  const keys: string[] = [];
-  for (const raw of envVars) {
-    for (const candidate of parseMultiKeysFromRaw(raw)) {
-      if (!seen.has(candidate)) {
-        seen.add(candidate);
-        keys.push(candidate);
+  const entries: ParsedEnvKeyEntry[] = [];
+  for (const raw of explicitEnvVars) {
+    for (const candidate of parseKeyEntriesFromRaw(raw)) {
+      const dedup = `${candidate.apiKey}::${candidate.baseUrl || ''}`;
+      if (!seen.has(dedup)) {
+        seen.add(dedup);
+        entries.push(candidate);
       }
     }
   }
+  return entries;
+}
+
+export function getServerGeminiApiKeys(): string[] {
+  const seen = new Set<string>();
+  const keys: string[] = [];
+  for (const entry of getGeminiEnvKeyEndpointPairs()) {
+    if (!seen.has(entry.apiKey)) {
+      seen.add(entry.apiKey);
+      keys.push(entry.apiKey);
+    }
+  }
   return keys;
+}
+
+export function getEnvGeminiModelsOverride(): string[] {
+  const rawVars = [
+    process.env.GEMINI_MODEL,
+    process.env.GEMINI_MODELS,
+    process.env.GEMINI_MODEL_ARRAY,
+    process.env.GEMINI_MODELS_ARRAY,
+    process.env.AI_MODELS,
+    process.env.AI_MODEL,
+  ];
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of rawVars) {
+    for (const item of parseEnvListValue(raw)) {
+      const bare = item.replace(/^(?:gemini::|models\/)/i, '').trim();
+      if (bare && isBuilderCompatibleGeminiModel(bare) && !seen.has(bare)) {
+        seen.add(bare);
+        out.push(bare);
+      }
+    }
+  }
+  for (const ep of getGeminiEndpointOverrides()) {
+    if (ep.hintedModel && isBuilderCompatibleGeminiModel(ep.hintedModel) && !seen.has(ep.hintedModel)) {
+      seen.add(ep.hintedModel);
+      out.push(ep.hintedModel);
+    }
+  }
+  return out;
 }
 
 export function getServerGeminiApiKey(): string {
@@ -165,6 +482,8 @@ export const BACKEND_GEMINI_FAILOVER_CHAIN: ReadonlyArray<{
   { upstreamModelId: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
   { upstreamModelId: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
   { upstreamModelId: 'gemini-3.1-flash-lite-preview', label: 'Gemini 3.1 Flash-Lite Preview' },
+  { upstreamModelId: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
+  { upstreamModelId: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash-Lite' },
 ];
 
 export const FREE_MESH_MODEL_LABELS: Record<string, string> = {
@@ -333,7 +652,7 @@ export function isDeprecatedGeminiModelId(modelId: string): boolean {
   if (!lower.startsWith('gemini')) return false;
   return (
     /^gemini-1\./.test(lower) ||
-    /^gemini-2\./.test(lower) ||
+    /^gemini-2\.0(?:\b|-)/.test(lower) ||
     /^gemini-3\.8\b/.test(lower) ||
     /^gemini-pro(?:-vision)?$/.test(lower)
   );
@@ -412,10 +731,14 @@ export function invalidateDiscoveredGeminiModelsCache(apiKey?: string): void {
 
 export async function discoverLiveGeminiModelsForKey(
   apiKey: string,
-  forceRefresh = false
+  forceRefresh = false,
+  baseUrlOverride?: string
 ): Promise<string[]> {
   if (!apiKey) return [];
-  const fp = computeApiKeyFingerprint(apiKey);
+  const origin =
+    (baseUrlOverride ? normalizeGeminiEndpointUrl(baseUrlOverride)?.baseUrl : '') ||
+    getGeminiEffectiveBaseUrl();
+  const fp = `${computeApiKeyFingerprint(apiKey)}:${origin}`;
   const cached = discoveredModelsCache.get(fp);
   if (!forceRefresh && cached && Date.now() - cached.fetchedAt < DISCOVERY_CACHE_TTL_MS) {
     return cached.models;
@@ -424,7 +747,6 @@ export async function discoverLiveGeminiModelsForKey(
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3800);
-    const origin = getGeminiEffectiveBaseUrl();
     const url = `${origin}/v1beta/models?key=${encodeURIComponent(
       apiKey
     )}&pageSize=100`;
@@ -433,6 +755,7 @@ export async function discoverLiveGeminiModelsForKey(
       signal: controller.signal,
       headers: {
         'User-Agent': 'aistudio-build',
+        'x-goog-api-key': apiKey,
       },
     }).finally(() => clearTimeout(timer));
 
@@ -440,21 +763,38 @@ export async function discoverLiveGeminiModelsForKey(
       return cached?.models || [];
     }
 
-    const data = (await resp.json().catch(() => null)) as {
-      models?: Array<{
-        name?: string;
-        supportedGenerationMethods?: string[];
-      }>;
-    } | null;
+    const data = (await resp.json().catch(() => null)) as
+      | {
+          models?: Array<{
+            name?: string;
+            id?: string;
+            supportedGenerationMethods?: string[];
+          }>;
+          data?: Array<{ id?: string; name?: string }>;
+        }
+      | Array<{ name?: string; id?: string; supportedGenerationMethods?: string[] }>
+      | null;
 
-    const rawModels = Array.isArray(data?.models) ? data.models : [];
+    const rawModels = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.models)
+        ? data.models
+        : Array.isArray(data?.data)
+          ? data.data
+          : [];
     const usable: string[] = [];
     for (const item of rawModels) {
-      const methods = Array.isArray(item?.supportedGenerationMethods)
-        ? item.supportedGenerationMethods
-        : [];
+      const methods =
+        'supportedGenerationMethods' in item &&
+        Array.isArray(item.supportedGenerationMethods)
+          ? item.supportedGenerationMethods
+          : [];
       if (methods.length > 0 && !methods.includes('generateContent')) continue;
-      const bare = String(item?.name || '').replace(/^models\//i, '').trim();
+      const rawName =
+        typeof item === 'string'
+          ? item
+          : String(item?.name || item?.id || '');
+      const bare = rawName.replace(/^models\//i, '').trim();
       if (!bare || !isBuilderCompatibleGeminiModel(bare)) continue;
       usable.push(bare);
     }
@@ -498,8 +838,23 @@ export async function resolveDynamicGeminiExecutionMatrix(options?: {
   const activeKeys = allKeys.filter((k) => !isApiKeyInvalidCoolingDown(k));
   const keysToUse = activeKeys.length > 0 ? activeKeys : allKeys;
 
+  const pairs = getGeminiEnvKeyEndpointPairs();
+  const pairByKey = new Map<string, ParsedEnvKeyEntry>();
+  for (const p of pairs) {
+    if (!pairByKey.has(p.apiKey) || p.baseUrl) {
+      pairByKey.set(p.apiKey, p);
+    }
+  }
+  const defaultEp = getGeminiEndpointOverrides().find((ep) => !ep.isOpenAiStyle);
+
   const discoveredPerKey = await Promise.all(
-    keysToUse.map((k) => discoverLiveGeminiModelsForKey(k, forceRefresh))
+    keysToUse.map((k) => {
+      const pair = pairByKey.get(k);
+      const baseOverride = !pair?.isOpenAiStyle
+        ? pair?.baseUrl || defaultEp?.baseUrl
+        : undefined;
+      return discoverLiveGeminiModelsForKey(k, forceRefresh, baseOverride);
+    })
   );
 
   const readyCandidates: DynamicGeminiCandidate[] = [];
@@ -508,6 +863,8 @@ export async function resolveDynamicGeminiExecutionMatrix(options?: {
 
   const perKeyOrderedModels: Array<{ apiKey: string; items: DynamicGeminiCandidate[] }> =
     keysToUse.map((apiKey, keyIdx) => {
+      const pair = pairByKey.get(apiKey);
+      const effectiveBaseUrl = pair?.baseUrl || defaultEp?.baseUrl;
       const fp = computeApiKeyFingerprint(apiKey);
       const mask = computeApiKeyMask(apiKey);
       const liveList = [...(discoveredPerKey[keyIdx] || [])].sort(
@@ -567,6 +924,8 @@ export async function resolveDynamicGeminiExecutionMatrix(options?: {
         confirmedLive,
         thinkingMode: inferGeminiThinkingMode(id),
         isGemini4Series: isGemini4SeriesModel(id),
+        ...(effectiveBaseUrl ? { baseUrl: effectiveBaseUrl } : {}),
+        ...(pair?.isOpenAiStyle ? { isOpenAiStyle: true } : {}),
       }));
 
       return { apiKey, items };

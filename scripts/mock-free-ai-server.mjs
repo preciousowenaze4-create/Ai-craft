@@ -242,6 +242,36 @@ const server = http.createServer((req, res) => {
     }
 
     if (isGeminiEndpoint) {
+      const apiKeyHdr = String(req.headers['x-goog-api-key'] || '');
+      const queryKey = new URL(`http://localhost${reqUrl}`).searchParams.get('key') || '';
+      const activeKey = apiKeyHdr || queryKey;
+      if (/badkey/i.test(activeKey)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: {
+              code: 401,
+              message: 'API key not valid.',
+              status: 'UNAUTHENTICATED',
+            },
+          })
+        );
+        return;
+      }
+      if (/\/models\/gemini-3\.[56]-flash\b/i.test(reqUrl)) {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: {
+              code: 429,
+              message: 'You exceeded your current quota, please check your plan.',
+              status: 'RESOURCE_EXHAUSTED',
+            },
+          })
+        );
+        return;
+      }
+
       const { text: lastUserText } = extractGeminiPromptText(parsed);
       const hasSearchTool = Array.isArray(parsed.tools) && parsed.tools.some((t) => Boolean(t?.googleSearch));
       if (hasSearchTool && /__REJECT_TOOLS_400__/.test(lastUserText)) {
@@ -252,6 +282,19 @@ const server = http.createServer((req, res) => {
               code: 400,
               message: 'Search grounding tool is unsupported for this candidate.',
               status: 'INVALID_ARGUMENT',
+            },
+          })
+        );
+        return;
+      }
+      if (hasSearchTool && /__REJECT_SEARCH_429__/.test(lastUserText)) {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: {
+              code: 429,
+              message: 'Search grounding quota exhausted.',
+              status: 'RESOURCE_EXHAUSTED',
             },
           })
         );

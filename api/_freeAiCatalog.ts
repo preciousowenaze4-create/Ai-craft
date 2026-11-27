@@ -12,6 +12,8 @@ export const FREE_MODEL_CATALOG: Record<string, string[]> = {
     'gemini-4-neon',
     'gemini-4-argon',
     'gemini-4-carbon',
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
   ],
 };
 

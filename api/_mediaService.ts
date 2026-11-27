@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { GenerateContentConfig, Part } from '@google/genai';
 import {
+  getGeminiEnvKeyEndpointPairs,
   getServerGeminiApiKeys,
   hasServerFreeAiKey,
   parseGatewayModelIdentifier,
@@ -109,6 +110,7 @@ async function generateGeminiImageAsset(params: {
   requestedModel?: string;
   attachmentDataUrl?: string | null;
 }): Promise<GeneratedMediaResult> {
+  const keyPairs = getGeminiEnvKeyEndpointPairs();
   const keys = getServerGeminiApiKeys();
   if (keys.length === 0) {
     throw new Error(
@@ -127,9 +129,9 @@ async function generateGeminiImageAsset(params: {
   let lastError: unknown = null;
 
   for (const modelId of modelChain) {
-    for (const apiKey of keys) {
+    for (const pair of keyPairs) {
       try {
-        const ai = createGeminiClient(apiKey);
+        const ai = createGeminiClient(pair.apiKey, pair.isOpenAiStyle ? undefined : pair.baseUrl);
         const isBanana = modelId === PRO_GEMINI_IMAGE_MODEL;
         const imageConfig: Record<string, string> = {};
         if (opts.aspectRatio) {
@@ -636,7 +638,10 @@ async function composeArrangementWithAi(
     const candidates = await resolveDynamicGeminiExecutionMatrix({ taskKind: 'media' });
     for (const candidate of candidates.slice(0, 5)) {
       try {
-        const ai = createGeminiClient(candidate.apiKey);
+        const ai = createGeminiClient(
+          candidate.apiKey,
+          candidate.isOpenAiStyle ? undefined : candidate.baseUrl
+        );
         const response = await ai.models.generateContent({
           model: candidate.upstreamModelId,
           contents: prompt,

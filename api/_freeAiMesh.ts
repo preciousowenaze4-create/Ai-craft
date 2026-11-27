@@ -19,8 +19,11 @@ import {
   buildCandidateCooldownKey,
   discoverLiveGeminiModelsForKey,
   gatewayCandidateCooldownRemainingMs,
+  getEnvGeminiModelsOverride,
   getGeminiBaseUrlOverride,
   getGeminiEffectiveBaseUrl,
+  getGeminiEndpointOverrides,
+  getGeminiEnvKeyEndpointPairs,
   getServerGeminiApiKeys,
   inferGeminiThinkingMode,
   isBuilderCompatibleGeminiModel,
@@ -92,13 +95,6 @@ export class FreeAiMeshAllFailedError extends Error {
 // Env & helper utilities
 // ---------------------------------------------------------------------------
 
-function readEnvCsv(name: string): string[] {
-  return (process.env[name] || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
 function readEnvNumber(name: string, defaultValue: number): number {
   const raw = (process.env[name] || '').trim();
   if (!raw) return defaultValue;
@@ -107,8 +103,8 @@ function readEnvNumber(name: string, defaultValue: number): number {
   return Math.floor(parsed);
 }
 
-function createSdkClient(apiKey: string): GoogleGenAI {
-  const baseUrlOverride = getGeminiBaseUrlOverride();
+function createSdkClient(apiKey: string, baseUrl?: string): GoogleGenAI {
+  const baseUrlOverride = baseUrl || getGeminiBaseUrlOverride();
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
@@ -179,8 +175,6 @@ function releaseProviderSlot(providerId: string): void {
 // Gemini credentials, model discovery & diagnostics
 // ---------------------------------------------------------------------------
 
-let geminiModelsCache: { models: string[]; at: number } | null = null;
-
 let lastGeminiDiag: {
   checkedAt: string;
   endpoint: string;
@@ -239,32 +233,84 @@ export function getGeminiApiOrigin(): string {
   return getGeminiEffectiveBaseUrl();
 }
 
+let geminiModelsCache: {
+  signature: string;
+  models: string[];
+  at: number;
+} | null = null;
+
+function currentDiscoverySignature(): string {
+  const keys = getServerGeminiApiKeys();
+  const origin = getGeminiEffectiveBaseUrl();
+  const keyHead = keys.map((k) => k.slice(-6)).join(',');
+  return `${origin}::${keyHead}`;
+}
+
 export async function refreshGeminiModelsIfConfigured(): Promise<string[]> {
   const keys = getServerGeminiApiKeys();
   if (keys.length === 0) return [];
-  const discovered = await discoverLiveGeminiModelsForKey(keys[0], true).catch(() => []);
+  const pairs = getGeminiEnvKeyEndpointPairs();
+  const endpoints = getGeminiEndpointOverrides();
+  const defaultOrigin = getGeminiEffectiveBaseUrl();
+  const sig = currentDiscoverySignature();
+
+  const discoveryTasks: Array<Promise<string[]>> = [];
+  const seenProbe = new Set<string>();
+
+  for (const pair of pairs) {
+    const targetOrigin = pair.isOpenAiStyle
+      ? ''
+      : pair.baseUrl || defaultOrigin;
+    if (!targetOrigin) continue;
+    const probeKey = `${pair.apiKey}::${targetOrigin}`;
+    if (!seenProbe.has(probeKey)) {
+      seenProbe.add(probeKey);
+      discoveryTasks.push(
+        discoverLiveGeminiModelsForKey(pair.apiKey, true, targetOrigin).catch(() => [])
+      );
+    }
+    if (discoveryTasks.length >= 6) break;
+  }
+
+  for (const ep of endpoints) {
+    if (ep.isOpenAiStyle) continue;
+    for (const k of keys.slice(0, 3)) {
+      const probeKey = `${k}::${ep.baseUrl}`;
+      if (!seenProbe.has(probeKey)) {
+        seenProbe.add(probeKey);
+        discoveryTasks.push(
+          discoverLiveGeminiModelsForKey(k, true, ep.baseUrl).catch(() => [])
+        );
+      }
+    }
+  }
+
+  const results = await Promise.all(discoveryTasks);
+  const discovered = Array.from(new Set(results.flat()));
   if (discovered.length > 0) {
-    geminiModelsCache = { models: discovered, at: Date.now() };
-    recordGeminiDiag(`${getGeminiEffectiveBaseUrl()}/v1beta/models`, 200, `ok (${discovered.length} models)`);
+    geminiModelsCache = { signature: sig, models: discovered, at: Date.now() };
+    recordGeminiDiag(
+      `${defaultOrigin}/v1beta/models`,
+      200,
+      `ok (${discovered.length} models)`
+    );
   }
   return resolveGeminiModels();
 }
 
 function resolveGeminiModels(taskKind: 'chat' | 'build' = 'build'): string[] {
-  const singleOverride = (process.env.GEMINI_MODEL || '').trim();
-  const csvOverride = readEnvCsv('GEMINI_MODELS');
-  const envModels = [
-    ...singleOverride.split(',').map((s) => s.trim()).filter(Boolean),
-    ...csvOverride,
-  ]
-    .filter((m) => isBuilderCompatibleGeminiModel(m))
-    .filter((m, idx, arr) => arr.indexOf(m) === idx);
-
+  const envModels = getEnvGeminiModelsOverride();
   if (envModels.length > 0) {
-    return envModels.slice(0, 12);
+    return envModels.slice(0, 14);
   }
 
-  const live = [...(geminiModelsCache?.models || [])].sort(
+  const sig = currentDiscoverySignature();
+  const cachedModels =
+    geminiModelsCache && geminiModelsCache.signature === sig
+      ? geminiModelsCache.models
+      : [];
+
+  const live = [...cachedModels].sort(
     (a, b) => scoreDiscoveredGeminiModel(b, taskKind) - scoreDiscoveredGeminiModel(a, taskKind)
   );
   const baseList =
@@ -272,10 +318,11 @@ function resolveGeminiModels(taskKind: 'chat' | 'build' = 'build'): string[] {
       ? [
           ...FREE_MODEL_CATALOG.gemini.filter((m) => live.includes(m)),
           ...live.filter((m) => !FREE_MODEL_CATALOG.gemini.includes(m)),
+          ...FREE_MODEL_CATALOG.gemini.filter((m) => !live.includes(m)),
         ]
       : FREE_MODEL_CATALOG.gemini;
 
-  return baseList.slice(0, 12);
+  return Array.from(new Set(baseList)).slice(0, 14);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,11 +335,13 @@ interface MeshCandidate {
   keyless: boolean;
   apiKey: string;
   model: string;
+  baseUrl?: string;
+  isOpenAiStyle?: boolean;
   cooldownKey: string;
 }
 
-const MAX_MODELS_PER_KEY = 8;
-const MAX_ATTEMPTS_PER_WALK = 8;
+const MAX_MODELS_PER_KEY = 14;
+const MAX_ATTEMPTS_PER_WALK = 24;
 
 const dailyUsage = new Map<string, number>();
 
@@ -334,32 +383,91 @@ interface MeshWalkBudget {
 }
 
 function budgetFor(taskKind: 'chat' | 'build'): MeshWalkBudget {
+  const keyCount = Math.max(1, getServerGeminiApiKeys().length);
+  const maxAttempts = Math.min(MAX_ATTEMPTS_PER_WALK, Math.max(10, keyCount * 8));
   if (taskKind === 'chat') {
-    return { firstByteMs: 35_000, idleMs: 40_000, walkMs: 90_000, maxAttempts: 6 };
+    return { firstByteMs: 35_000, idleMs: 40_000, walkMs: 90_000, maxAttempts };
   }
-  return { firstByteMs: 55_000, idleMs: 65_000, walkMs: 140_000, maxAttempts: 8 };
+  return { firstByteMs: 55_000, idleMs: 65_000, walkMs: 140_000, maxAttempts };
+}
+
+function resolveKeyEndpointBindings(): Array<{
+  apiKey: string;
+  baseUrl?: string;
+  isOpenAiStyle?: boolean;
+  hintedModel?: string;
+}> {
+  const pairs = getGeminiEnvKeyEndpointPairs();
+  if (pairs.length === 0) return [];
+  const endpoints = getGeminiEndpointOverrides();
+  const out: Array<{
+    apiKey: string;
+    baseUrl?: string;
+    isOpenAiStyle?: boolean;
+    hintedModel?: string;
+  }> = [];
+  const seen = new Set<string>();
+
+  for (const pair of pairs) {
+    if (pair.baseUrl) {
+      const k = `${pair.apiKey}::${pair.baseUrl}`;
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(pair);
+      }
+    } else if (endpoints.length > 0) {
+      for (const ep of endpoints) {
+        const k = `${pair.apiKey}::${ep.rawEndpointUrl}`;
+        if (!seen.has(k)) {
+          seen.add(k);
+          out.push({
+            apiKey: pair.apiKey,
+            baseUrl: ep.baseUrl,
+            isOpenAiStyle: ep.isOpenAiStyle,
+            hintedModel: ep.hintedModel,
+          });
+        }
+      }
+    } else {
+      const k = `${pair.apiKey}::default`;
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(pair);
+      }
+    }
+  }
+  return out;
 }
 
 function enumerateMeshCandidates(
   taskKind: 'chat' | 'build' = 'build'
 ): Array<{ candidate: MeshCandidate; coolingMs: number }> {
-  const keys = getServerGeminiApiKeys();
-  if (keys.length === 0) return [];
+  const bindings = resolveKeyEndpointBindings();
+  if (bindings.length === 0) return [];
   const models = resolveGeminiModels(taskKind).slice(0, MAX_MODELS_PER_KEY);
   const all: Array<{ candidate: MeshCandidate; coolingMs: number }> = [];
 
   for (const model of models) {
     if (isDailyQuotaExhausted('gemini', model)) continue;
-    for (const apiKey of keys) {
-      const cooldownKey = buildCandidateCooldownKey('gemini', apiKey, model);
+    for (const binding of bindings) {
+      const effectiveModel = binding.hintedModel && models.length === 0
+        ? binding.hintedModel
+        : model;
+      const cooldownKey = `${buildCandidateCooldownKey(
+        'gemini',
+        binding.apiKey,
+        effectiveModel
+      )}:${binding.baseUrl || 'default'}`;
       if (isGatewayCandidateHardBlocked(cooldownKey)) continue;
       all.push({
         candidate: {
           providerId: 'gemini',
           providerLabel: 'Google Gemini',
           keyless: false,
-          apiKey,
-          model,
+          apiKey: binding.apiKey,
+          model: effectiveModel,
+          ...(binding.baseUrl ? { baseUrl: binding.baseUrl } : {}),
+          ...(binding.isOpenAiStyle ? { isOpenAiStyle: true } : {}),
           cooldownKey,
         },
         coolingMs: gatewayCandidateCooldownRemainingMs(cooldownKey),
@@ -396,11 +504,30 @@ function prioritizeCandidatesForRequestedModel(
     return [...exact, ...others];
   }
 
+  const sig = currentDiscoverySignature();
+  const liveDiscovered =
+    geminiModelsCache && geminiModelsCache.signature === sig
+      ? geminiModelsCache.models
+      : [];
+  const envModels = getEnvGeminiModelsOverride();
+  const shouldInjectRequestedFallback =
+    (liveDiscovered.length === 0 || liveDiscovered.includes(targetModel)) &&
+    (envModels.length === 0 || envModels.includes(targetModel));
+
   const keys = getServerGeminiApiKeys();
-  if (keys.length > 0 && !isDailyQuotaExhausted('gemini', targetModel)) {
+  if (
+    shouldInjectRequestedFallback &&
+    keys.length > 0 &&
+    !isDailyQuotaExhausted('gemini', targetModel)
+  ) {
+    const bindings = resolveKeyEndpointBindings();
     const fallbackEntries: MeshCandidate[] = [];
-    for (const apiKey of keys) {
-      const cooldownKey = buildCandidateCooldownKey('gemini', apiKey, targetModel);
+    for (const binding of bindings) {
+      const cooldownKey = `${buildCandidateCooldownKey(
+        'gemini',
+        binding.apiKey,
+        targetModel
+      )}:${binding.baseUrl || 'default'}`;
       if (
         !isGatewayCandidateHardBlocked(cooldownKey) &&
         gatewayCandidateCooldownRemainingMs(cooldownKey) <= 0
@@ -409,8 +536,10 @@ function prioritizeCandidatesForRequestedModel(
           providerId: 'gemini',
           providerLabel: 'Google Gemini',
           keyless: false,
-          apiKey,
+          apiKey: binding.apiKey,
           model: targetModel,
+          ...(binding.baseUrl ? { baseUrl: binding.baseUrl } : {}),
+          ...(binding.isOpenAiStyle ? { isOpenAiStyle: true } : {}),
           cooldownKey,
         });
       }
@@ -498,7 +627,7 @@ export interface FreeMeshModelOption {
 }
 
 export function getFreeMeshModelOptions(): FreeMeshModelOption[] {
-  return GEMINI_BUILDER_MODELS.map((m) => ({
+  const base: FreeMeshModelOption[] = GEMINI_BUILDER_MODELS.map((m) => ({
     id: m.id,
     name: m.name,
     provider: m.provider,
@@ -509,11 +638,78 @@ export function getFreeMeshModelOptions(): FreeMeshModelOption[] {
     capabilities: m.capabilities,
     category: m.category,
   }));
+
+  const seen = new Set(base.map((m) => m.id));
+  const sig = currentDiscoverySignature();
+  const discovered =
+    geminiModelsCache && geminiModelsCache.signature === sig
+      ? geminiModelsCache.models
+      : [];
+  const extras = [...getEnvGeminiModelsOverride(), ...discovered];
+  for (const upstream of extras) {
+    const id = `gemini::${upstream}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    base.push({
+      id,
+      name: makeGeminiDisplayLabel(upstream),
+      provider: 'gemini',
+      contextLength: 1048576,
+      isFree: true,
+      gateway: 'gemini',
+      tierLabel: 'Live · Endpoint',
+      capabilities: ['Chat', 'Code', 'Vision'],
+      category: 'code',
+    });
+  }
+
+  return base;
 }
 
 interface MeshErrorInfo {
   status: number | null;
   message: string;
+}
+
+function unwrapJsonErrorPayload(
+  rawText: string,
+  depth = 0
+): { status: number | null; message: string } | null {
+  if (depth > 3 || typeof rawText !== 'string') return null;
+  const trimmed = rawText.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as
+      | {
+          error?: { message?: string; code?: string | number; status?: string };
+          message?: string;
+          code?: string | number;
+        }
+      | Array<{ error?: { message?: string; code?: string | number }; message?: string }>;
+    const obj = Array.isArray(parsed) ? parsed[0] : parsed;
+    if (!obj || typeof obj !== 'object') return null;
+    const rawCode = obj.error?.code ?? obj.code;
+    const numericCode =
+      typeof rawCode === 'number'
+        ? rawCode
+        : typeof rawCode === 'string' && /^\d{3}$/.test(rawCode)
+          ? Number(rawCode)
+          : null;
+    const innerMsg = obj.error?.message || obj.message || '';
+    if (innerMsg) {
+      const nested = unwrapJsonErrorPayload(innerMsg, depth + 1);
+      if (nested) {
+        return {
+          status: nested.status ?? numericCode,
+          message: nested.message,
+        };
+      }
+      return { status: numericCode, message: innerMsg };
+    }
+    return numericCode ? { status: numericCode, message: trimmed } : null;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeMeshError(err: unknown): MeshErrorInfo {
@@ -524,26 +720,36 @@ function normalizeMeshError(err: unknown): MeshErrorInfo {
       message?: string;
       body?: unknown;
     };
-    const status =
+    let status =
       typeof anyErr.status === 'number'
         ? anyErr.status
         : typeof anyErr.statusCode === 'number'
           ? anyErr.statusCode
           : null;
     let message = typeof anyErr.message === 'string' ? anyErr.message : String(err);
+
+    const unwrappedFromMessage = unwrapJsonErrorPayload(message);
+    if (unwrappedFromMessage) {
+      status = status ?? unwrappedFromMessage.status;
+      message = unwrappedFromMessage.message || message;
+    }
+
     if (anyErr.body != null) {
-      try {
-        const text =
-          typeof anyErr.body === 'string' ? anyErr.body : JSON.stringify(anyErr.body);
-        const parsed = JSON.parse(text) as {
-          error?: { message?: string; code?: string | number; status?: string };
-          message?: string;
-        };
-        message = parsed?.error?.message || parsed?.message || message;
-      } catch {
-        // ignore JSON parse issues
+      const text =
+        typeof anyErr.body === 'string' ? anyErr.body : JSON.stringify(anyErr.body);
+      const unwrappedBody = unwrapJsonErrorPayload(text);
+      if (unwrappedBody) {
+        status = status ?? unwrappedBody.status;
+        message = unwrappedBody.message || message;
       }
     }
+
+    if (status === null && /\b429\b|RESOURCE_EXHAUSTED/i.test(message)) {
+      status = 429;
+    } else if (status === null && /\b401\b|\b403\b|PERMISSION_DENIED|API_KEY_INVALID/i.test(message)) {
+      status = /401|UNAUTHENTICATED/i.test(message) ? 401 : 403;
+    }
+
     return { status, message: message.slice(0, 300) };
   }
   return { status: null, message: String(err).slice(0, 300) };
@@ -643,7 +849,8 @@ function buildGeminiGenerateConfig(
   modelId: string,
   systemPrompt: string,
   abortSignal?: AbortSignal,
-  enableWebSearch?: boolean
+  enableWebSearch?: boolean,
+  enableThinking = true
 ): GenerateContentConfig {
   const isG4 = isGemini4SeriesModel(modelId);
   const thinkingMode = inferGeminiThinkingMode(modelId);
@@ -659,14 +866,12 @@ function buildGeminiGenerateConfig(
 
   // Strictly obey Gemini 4 config rules:
   // NEVER pass temperature, topP, topK, candidateCount, or thinkingBudget on Gemini 4 models.
-  if (isG4) {
-    config.thinkingConfig = {
-      includeThoughts: true,
-    };
-  } else if (thinkingMode === 'level') {
-    config.thinkingConfig = {
-      includeThoughts: true,
-    };
+  if (enableThinking) {
+    if (isG4 || thinkingMode === 'level') {
+      config.thinkingConfig = {
+        includeThoughts: true,
+      };
+    }
   }
 
   if (enableWebSearch) {
@@ -709,6 +914,165 @@ class MeshHttpError extends Error {
   }
 }
 
+async function streamOpenAiCompatibleCandidate(
+  candidate: MeshCandidate,
+  params: MeshAttemptParams,
+  signal: AbortSignal,
+  onChunk: (text: string) => void
+): Promise<string> {
+  const messages: Array<{ role: string; content: string }> = [];
+  if (params.systemPrompt.trim()) {
+    messages.push({ role: 'system', content: params.systemPrompt.trim() });
+  }
+  for (const h of (params.historyMessages || []).slice(-16)) {
+    if (h.content?.trim()) {
+      messages.push({
+        role: h.role === 'assistant' ? 'assistant' : 'user',
+        content: h.content.trim().slice(0, 4500),
+      });
+    }
+  }
+  messages.push({ role: 'user', content: params.userPrompt.slice(0, 30000) });
+
+  const endpoint = candidate.baseUrl!;
+  const resp = await fetch(endpoint, {
+    method: 'POST',
+    signal,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${candidate.apiKey}`,
+      'User-Agent': 'aistudio-build',
+    },
+    body: JSON.stringify({
+      model: candidate.model,
+      messages,
+      stream: true,
+    }),
+  });
+
+  if (!resp.ok) {
+    const bodyText = await resp.text().catch(() => '');
+    throw new MeshHttpError(
+      bodyText || `HTTP ${resp.status} from endpoint`,
+      resp.status,
+      bodyText
+    );
+  }
+
+  const contentType = resp.headers.get('content-type') || '';
+  if (!contentType.includes('text/event-stream')) {
+    const jsonData = (await resp.json().catch(() => null)) as
+      | { choices?: Array<{ message?: { content?: string }; text?: string }> }
+      | Array<{ choices?: Array<{ message?: { content?: string }; text?: string }> }>
+      | null;
+    const items = Array.isArray(jsonData) ? jsonData : jsonData ? [jsonData] : [];
+    const text = items
+      .map((item) => item?.choices?.[0]?.message?.content || item?.choices?.[0]?.text || '')
+      .join('');
+    if (text) onChunk(text);
+    return text;
+  }
+
+  const reader = resp.body?.getReader();
+  if (!reader) return '';
+  const decoder = new TextDecoder();
+  let buf = '';
+  let raw = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+      try {
+        const parsed = JSON.parse(payload) as {
+          choices?: Array<{
+            delta?: { content?: string };
+            message?: { content?: string };
+          }>;
+        };
+        const delta =
+          parsed?.choices?.[0]?.delta?.content ??
+          parsed?.choices?.[0]?.message?.content ??
+          '';
+        if (delta) {
+          raw += delta;
+          onChunk(delta);
+        }
+      } catch {
+        // ignore partial line
+      }
+    }
+  }
+  return raw;
+}
+
+function extractTextAndGroundingFromCandidatesPayload(
+  payload: unknown,
+  onGrounding?: (meta: MeshGroundingMeta) => void,
+  onReasoning?: (text: string) => void
+): string {
+  const blocks = Array.isArray(payload) ? payload : payload ? [payload] : [];
+  let text = '';
+  const seenQueries = new Set<string>();
+  const seenUrls = new Set<string>();
+
+  for (const block of blocks) {
+    if (!block || typeof block !== 'object') continue;
+    const cand = (block as {
+      candidates?: Array<{
+        content?: { parts?: Array<{ text?: string; thought?: boolean }> };
+        groundingMetadata?: {
+          webSearchQueries?: unknown[];
+          groundingChunks?: Array<{ web?: { uri?: string; title?: string } }>;
+        };
+      }>;
+    }).candidates?.[0];
+    if (!cand) continue;
+
+    if (cand.groundingMetadata && onGrounding) {
+      const newQueries: string[] = [];
+      const newSources: Array<{ title: string; url: string }> = [];
+      for (const q of cand.groundingMetadata.webSearchQueries || []) {
+        const cleanQ = typeof q === 'string' ? q.trim() : '';
+        if (cleanQ && !seenQueries.has(cleanQ)) {
+          seenQueries.add(cleanQ);
+          newQueries.push(cleanQ);
+        }
+      }
+      for (const gc of cand.groundingMetadata.groundingChunks || []) {
+        const uri = typeof gc?.web?.uri === 'string' ? gc.web.uri.trim() : '';
+        const title =
+          typeof gc?.web?.title === 'string' && gc.web.title.trim()
+            ? gc.web.title.trim()
+            : uri;
+        if (uri && !seenUrls.has(uri)) {
+          seenUrls.add(uri);
+          newSources.push({ title, url: uri });
+        }
+      }
+      if (newQueries.length > 0 || newSources.length > 0) {
+        onGrounding({ queries: newQueries, sources: newSources });
+      }
+    }
+
+    for (const part of cand.content?.parts || []) {
+      if (!part?.text) continue;
+      if (part.thought) {
+        onReasoning?.(part.text);
+      } else {
+        text += part.text;
+      }
+    }
+  }
+  return text;
+}
+
 async function streamOneMeshCandidateRaw(
   candidate: MeshCandidate,
   params: MeshAttemptParams,
@@ -716,14 +1080,17 @@ async function streamOneMeshCandidateRaw(
   onReasoning?: (text: string) => void
 ): Promise<string> {
   const hasImage = Boolean(params.attachmentDataUrl?.startsWith('data:image/'));
-  const maxPasses = hasImage || params.enableWebSearch ? 2 : 1;
+  const maxPasses = hasImage || params.enableWebSearch ? 3 : 2;
   let useImagePass = hasImage;
   let useSearchPass = Boolean(params.enableWebSearch);
+  let useThinkingPass = true;
   let lastErr: unknown = null;
+  const endpointOrigin = candidate.baseUrl || getGeminiEffectiveBaseUrl();
 
   for (let pass = 0; pass < maxPasses; pass += 1) {
     const withImage = useImagePass;
     const withSearch = useSearchPass;
+    const withThinking = useThinkingPass;
     const controller = new AbortController();
     const outerSignal = params.signal?.signal;
     if (outerSignal?.aborted) throw new Error('Request cancelled.');
@@ -752,7 +1119,35 @@ async function streamOneMeshCandidateRaw(
     };
 
     try {
-      const ai = createSdkClient(candidate.apiKey);
+      if (candidate.isOpenAiStyle && candidate.baseUrl) {
+        resetIdle();
+        const text = await streamOpenAiCompatibleCandidate(
+          candidate,
+          params,
+          controller.signal,
+          (chunk) => {
+            if (!gotFirstEvent) {
+              gotFirstEvent = true;
+              clearTimeout(firstByteTimer);
+            }
+            resetIdle();
+            onChunk(chunk);
+          }
+        );
+        gotFirstEvent = true;
+        clearTimeout(firstByteTimer);
+        recordGeminiDiag(endpointOrigin, 200, 'connected');
+        if (text.trim()) {
+          void recordGeminiApiUsage({
+            modelId: candidate.model,
+            totalTokens: Math.max(40, Math.ceil((params.userPrompt.length + text.length) / 4)),
+            source: params.taskKind,
+          });
+        }
+        return text;
+      }
+
+      const ai = createSdkClient(candidate.apiKey, candidate.baseUrl);
       const contents = buildGeminiContents({
         historyMessages: params.historyMessages,
         userPrompt: params.userPrompt,
@@ -763,16 +1158,10 @@ async function streamOneMeshCandidateRaw(
         candidate.model,
         params.systemPrompt,
         controller.signal,
-        withSearch
+        withSearch,
+        withThinking
       );
 
-      const stream = await ai.models.generateContentStream({
-        model: candidate.model,
-        contents,
-        config,
-      });
-
-      resetIdle();
       let raw = '';
       let promptTokens = 0;
       let candidatesTokens = 0;
@@ -780,69 +1169,127 @@ async function streamOneMeshCandidateRaw(
       const seenQueries = new Set<string>();
       const seenSourceUrls = new Set<string>();
 
-      for await (const chunk of stream) {
-        if (!gotFirstEvent) {
-          gotFirstEvent = true;
-          clearTimeout(firstByteTimer);
-        }
+      try {
+        const stream = await ai.models.generateContentStream({
+          model: candidate.model,
+          contents,
+          config,
+        });
+
         resetIdle();
 
-        const groundingMeta = chunk.candidates?.[0]?.groundingMetadata;
-        if (groundingMeta && params.onGrounding) {
-          const newQueries: string[] = [];
-          const newSources: Array<{ title: string; url: string }> = [];
-          if (Array.isArray(groundingMeta.webSearchQueries)) {
-            for (const q of groundingMeta.webSearchQueries) {
-              const cleanQ = typeof q === 'string' ? q.trim() : '';
-              if (cleanQ && !seenQueries.has(cleanQ)) {
-                seenQueries.add(cleanQ);
-                newQueries.push(cleanQ);
+        for await (const chunk of stream) {
+          if (!gotFirstEvent) {
+            gotFirstEvent = true;
+            clearTimeout(firstByteTimer);
+          }
+          resetIdle();
+
+          const groundingMeta = chunk.candidates?.[0]?.groundingMetadata;
+          if (groundingMeta && params.onGrounding) {
+            const newQueries: string[] = [];
+            const newSources: Array<{ title: string; url: string }> = [];
+            if (Array.isArray(groundingMeta.webSearchQueries)) {
+              for (const q of groundingMeta.webSearchQueries) {
+                const cleanQ = typeof q === 'string' ? q.trim() : '';
+                if (cleanQ && !seenQueries.has(cleanQ)) {
+                  seenQueries.add(cleanQ);
+                  newQueries.push(cleanQ);
+                }
               }
             }
-          }
-          if (Array.isArray(groundingMeta.groundingChunks)) {
-            for (const gChunk of groundingMeta.groundingChunks) {
-              const uri = typeof gChunk?.web?.uri === 'string' ? gChunk.web.uri.trim() : '';
-              const title =
-                typeof gChunk?.web?.title === 'string' && gChunk.web.title.trim()
-                  ? gChunk.web.title.trim()
-                  : uri;
-              if (uri && !seenSourceUrls.has(uri)) {
-                seenSourceUrls.add(uri);
-                newSources.push({ title, url: uri });
+            if (Array.isArray(groundingMeta.groundingChunks)) {
+              for (const gChunk of groundingMeta.groundingChunks) {
+                const uri = typeof gChunk?.web?.uri === 'string' ? gChunk.web.uri.trim() : '';
+                const title =
+                  typeof gChunk?.web?.title === 'string' && gChunk.web.title.trim()
+                    ? gChunk.web.title.trim()
+                    : uri;
+                if (uri && !seenSourceUrls.has(uri)) {
+                  seenSourceUrls.add(uri);
+                  newSources.push({ title, url: uri });
+                }
               }
             }
-          }
-          if (newQueries.length > 0 || newSources.length > 0) {
-            params.onGrounding({ queries: newQueries, sources: newSources });
-          }
-        }
-
-        const parts = chunk.candidates?.[0]?.content?.parts ?? [];
-        if (parts.length > 0) {
-          for (const part of parts) {
-            if (!part?.text) continue;
-            if (part.thought) {
-              onReasoning?.(part.text);
-            } else {
-              raw += part.text;
-              onChunk(part.text);
+            if (newQueries.length > 0 || newSources.length > 0) {
+              params.onGrounding({ queries: newQueries, sources: newSources });
             }
           }
-        } else if (typeof chunk.text === 'string' && chunk.text) {
-          raw += chunk.text;
-          onChunk(chunk.text);
-        }
 
-        if (chunk.usageMetadata) {
-          promptTokens = chunk.usageMetadata.promptTokenCount ?? promptTokens;
-          candidatesTokens = chunk.usageMetadata.candidatesTokenCount ?? candidatesTokens;
-          totalTokens = chunk.usageMetadata.totalTokenCount ?? totalTokens;
+          const parts = chunk.candidates?.[0]?.content?.parts ?? [];
+          if (parts.length > 0) {
+            for (const part of parts) {
+              if (!part?.text) continue;
+              if (part.thought) {
+                onReasoning?.(part.text);
+              } else {
+                raw += part.text;
+                onChunk(part.text);
+              }
+            }
+          } else if (typeof chunk.text === 'string' && chunk.text) {
+            raw += chunk.text;
+            onChunk(chunk.text);
+          }
+
+          if (chunk.usageMetadata) {
+            promptTokens = chunk.usageMetadata.promptTokenCount ?? promptTokens;
+            candidatesTokens = chunk.usageMetadata.candidatesTokenCount ?? candidatesTokens;
+            totalTokens = chunk.usageMetadata.totalTokenCount ?? totalTokens;
+          }
+        }
+      } catch (streamErr) {
+        // Custom proxy endpoints sometimes return a JSON array/object instead of SSE
+        const streamErrMsg =
+          streamErr instanceof Error ? streamErr.message : String(streamErr);
+        const isLikelyStreamParseError =
+          !raw.trim() &&
+          !/401|403|404|429|resource_exhausted|quota|api.?key/i.test(streamErrMsg) &&
+          /json|sse|parse|syntaxerror|unexpected token|stream|body|empty/i.test(streamErrMsg);
+        if (!isLikelyStreamParseError) {
+          throw streamErr;
+        }
+        const fallbackResp = await fetch(
+          `${endpointOrigin}/v1beta/models/${encodeURIComponent(candidate.model)}:generateContent?key=${encodeURIComponent(candidate.apiKey)}`,
+          {
+            method: 'POST',
+            signal: controller.signal,
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': 'aistudio-build',
+              'x-goog-api-key': candidate.apiKey,
+            },
+            body: JSON.stringify({
+              contents,
+              ...(config.systemInstruction
+                ? { systemInstruction: { parts: [{ text: String(config.systemInstruction) }] } }
+                : {}),
+              ...(config.tools ? { tools: config.tools } : {}),
+            }),
+          }
+        );
+        if (!fallbackResp.ok) {
+          const errText = await fallbackResp.text().catch(() => '');
+          throw new MeshHttpError(errText || `HTTP ${fallbackResp.status}`, fallbackResp.status, errText);
+        }
+        const jsonPayload = await fallbackResp.json();
+        const extracted = extractTextAndGroundingFromCandidatesPayload(
+          jsonPayload,
+          params.onGrounding,
+          onReasoning
+        );
+        if (extracted) {
+          gotFirstEvent = true;
+          clearTimeout(firstByteTimer);
+          raw = extracted;
+          onChunk(extracted);
+        } else {
+          throw streamErr;
         }
       }
 
       recordGeminiDiag(
-        `${getGeminiEffectiveBaseUrl()}/v1beta/models/${candidate.model}`,
+        `${endpointOrigin}/v1beta/models/${candidate.model}`,
         200,
         'connected'
       );
@@ -868,21 +1315,34 @@ async function streamOneMeshCandidateRaw(
           ? new MeshHttpError('Gemini stream stalled before completing', null)
           : err;
       recordGeminiDiag(
-        `${getGeminiEffectiveBaseUrl()}/v1beta/models/${candidate.model}`,
+        `${endpointOrigin}/v1beta/models/${candidate.model}`,
         info.status,
         friendlyErr instanceof Error ? friendlyErr.message : info.message
       );
 
-      if (
-        pass + 1 < maxPasses &&
+      const retryableStatus =
         info.status !== null &&
-        [400, 413, 415, 422].includes(info.status)
-      ) {
-        if (withSearch && /tool|search|grounding|unsupported|invalid/i.test(info.message)) {
+        [400, 403, 404, 413, 415, 422, 429].includes(info.status);
+      if (pass + 1 < maxPasses && retryableStatus) {
+        if (
+          withSearch &&
+          ([400, 413, 415, 422].includes(info.status!) ||
+            /tool|search|grounding|unsupported|invalid|quota|resource_exhausted/i.test(
+              info.message
+            ))
+        ) {
           useSearchPass = false;
           continue;
         }
-        if (withImage) {
+        if (
+          withThinking &&
+          info.status === 400 &&
+          /thinking|thought|includethoughts|config|unsupported/i.test(info.message)
+        ) {
+          useThinkingPass = false;
+          continue;
+        }
+        if (withImage && [400, 413, 415, 422].includes(info.status!)) {
           useImagePass = false;
           continue;
         }
@@ -1015,11 +1475,6 @@ async function runMeshStreamAttempt(params: {
     if (isAuthError(info)) {
       markApiKeyInvalidCooldown(candidate.apiKey, 5 * 60_000);
     }
-    void recordGeminiApiError({
-      modelId: candidate.model,
-      error: err,
-      source: walk.taskKind,
-    });
     throw err;
   } finally {
     unlink();
@@ -1027,7 +1482,8 @@ async function runMeshStreamAttempt(params: {
 }
 
 export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStreamResult> {
-  if (!geminiModelsCache && isGeminiConfigured()) {
+  const sig = currentDiscoverySignature();
+  if ((!geminiModelsCache || geminiModelsCache.signature !== sig) && isGeminiConfigured()) {
     await Promise.race([
       refreshGeminiModelsIfConfigured().catch(() => undefined),
       sleepWithSignal(1_800, params.signal).catch(() => undefined),
@@ -1113,7 +1569,13 @@ export async function streamFreeAiMesh(params: MeshWalkParams): Promise<MeshStre
   }
 
   if (attempts === 0) throw new FreeAiMeshUnavailableError();
-  throw new FreeAiMeshAllFailedError(details);
+  const finalErr = new FreeAiMeshAllFailedError(details);
+  void recordGeminiApiError({
+    modelId: candidates[0]?.model || 'gemini-4-hydrogen',
+    error: finalErr,
+    source: params.taskKind,
+  });
+  throw finalErr;
 }
 
 export async function completeFreeAiMesh(params: {

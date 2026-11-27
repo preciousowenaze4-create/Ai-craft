@@ -604,5 +604,121 @@ assert(
   'repairIncompleteBuildHtml with isPatchFallback must produce valid replacement HTML when anchors miss'
 );
 
+// --- 12: JSON arrays, endpoint overrides, 429 quota failover & OpenAI-style endpoints ---
+const {
+  getEnvGeminiModelsOverride,
+  getGeminiBaseUrlOverride,
+  getGeminiEndpointOverrides,
+  getServerGeminiApiKeys,
+  normalizeGeminiEndpointUrl,
+} = await import('../api/_aiGateways.js');
+
+const prevApiKey = process.env.GEMINI_API_KEY;
+const prevApiKeys = process.env.GEMINI_API_KEYS;
+const prevEndpoint = process.env.GEMINI_ENDPOINT;
+const prevBaseUrl = process.env.GEMINI_API_BASE_URL;
+const prevModels = process.env.GEMINI_MODELS;
+
+try {
+  delete process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_BASE_URL;
+  process.env.GEMINI_ENDPOINT = 'http://127.0.0.1:4592/v1beta/models/gemini-2.5-flash:generateContent';
+  process.env.GEMINI_API_KEYS = JSON.stringify([
+    'AIzaSyBadKey00000000000000000',
+    'AIzaSyGoodKey1111111111111111',
+  ]);
+  process.env.GEMINI_MODELS = JSON.stringify([
+    'gemini-3.6-flash',
+    'gemini-3.5-flash',
+    'gemini-2.5-flash',
+  ]);
+
+  const parsedKeys = getServerGeminiApiKeys();
+  assert(
+    parsedKeys.length === 2 && parsedKeys[1] === 'AIzaSyGoodKey1111111111111111',
+    `GEMINI_API_KEYS JSON array failed to parse: ${JSON.stringify(parsedKeys)}`
+  );
+  assert(
+    getGeminiBaseUrlOverride() === 'http://127.0.0.1:4592',
+    `GEMINI_ENDPOINT should normalize to base origin, got ${getGeminiBaseUrlOverride()}`
+  );
+  const envModels = getEnvGeminiModelsOverride();
+  assert(
+    envModels.includes('gemini-3.6-flash') && envModels.includes('gemini-2.5-flash'),
+    `GEMINI_MODELS JSON array must include gemini-2.5-flash, got ${JSON.stringify(envModels)}`
+  );
+  assert(
+    getFreeMeshModelOptions().some((m) => m.id === 'gemini::gemini-2.5-flash'),
+    'getFreeMeshModelOptions must surface gemini-2.5-flash from GEMINI_MODELS array'
+  );
+
+  // Even when 3.6-flash & 3.5-flash 429 and key 1 fails 401, failover reaches key 2 + gemini-2.5-flash!
+  const quotaFailoverRes = await streamFreeAiMesh({
+    taskKind: 'chat',
+    systemPrompt: 'sys',
+    historyMessages: [],
+    userPrompt: 'Say hello across quota failover',
+    onContentChunk: () => {},
+  });
+  assert(
+    quotaFailoverRes.modelUsed === 'gemini::gemini-2.5-flash' &&
+      quotaFailoverRes.rawOutput.includes('Build success'),
+    `Expected failover to gemini::gemini-2.5-flash, got ${quotaFailoverRes.modelUsed}`
+  );
+
+  // Search tool 429 must retry cleanly without search tool on the same candidate
+  const searchQuotaFallback = await streamFreeAiMesh({
+    taskKind: 'chat',
+    requestedModel: 'gemini::gemini-2.5-flash',
+    systemPrompt: 'sys',
+    historyMessages: [],
+    userPrompt: 'Search retry __REJECT_SEARCH_429__',
+    enableWebSearch: true,
+    onContentChunk: () => {},
+  });
+  assert(
+    searchQuotaFallback.rawOutput.includes('Build success'),
+    'streamFreeAiMesh must retry cleanly without googleSearch when search quota returns 429'
+  );
+
+  // JSON array of { apiKey, endpoint } objects + OpenAI-style /v1/chat/completions endpoint
+  delete process.env.GEMINI_ENDPOINT;
+  process.env.GEMINI_API_KEYS = JSON.stringify([
+    {
+      apiKey: 'AIzaSyObjEndpointKey1234567890',
+      endpoint: 'http://127.0.0.1:4592/v1/chat/completions',
+      model: 'gemini-2.5-flash',
+    },
+  ]);
+  const epList = getGeminiEndpointOverrides();
+  assert(
+    epList.some((e) => e.isOpenAiStyle && e.baseUrl.endsWith('/v1/chat/completions')),
+    `Object-array OpenAI endpoint must be recognized, got ${JSON.stringify(epList)}`
+  );
+  const openAiRes = await streamFreeAiMesh({
+    taskKind: 'chat',
+    systemPrompt: 'sys',
+    historyMessages: [],
+    userPrompt: 'Say hello via openai endpoint',
+    onContentChunk: () => {},
+  });
+  assert(
+    openAiRes.rawOutput.includes('Build success'),
+    'OpenAI-compatible /chat/completions endpoint must stream cleanly'
+  );
+  assert(
+    normalizeGeminiEndpointUrl('https://proxy.example.com/custom/v1beta/models')?.baseUrl ===
+      'https://proxy.example.com/custom',
+    'normalizeGeminiEndpointUrl must preserve proxy path prefixes'
+  );
+} finally {
+  scrubAiEnv();
+  if (prevApiKey !== undefined) process.env.GEMINI_API_KEY = prevApiKey;
+  if (prevApiKeys !== undefined) process.env.GEMINI_API_KEYS = prevApiKeys;
+  if (prevEndpoint !== undefined) process.env.GEMINI_ENDPOINT = prevEndpoint;
+  if (prevBaseUrl !== undefined) process.env.GEMINI_API_BASE_URL = prevBaseUrl;
+  if (prevModels !== undefined) process.env.GEMINI_MODELS = prevModels;
+}
+
 console.log('ALL GEMINI ENGINE TESTS PASSED');
 process.exit(0);

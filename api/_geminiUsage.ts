@@ -456,6 +456,8 @@ export async function recordGeminiApiUsage(
       cycleTokensUsed: current.cycleTokensUsed + total,
       lifetimeRequestsUsed: current.lifetimeRequestsUsed + reqInc,
       lifetimeTokensUsed: current.lifetimeTokensUsed + total,
+      quotaExhausted: false,
+      exhaustedReason: undefined,
       lastUsageAt: now,
       lastModelId: input.modelId,
       lastSource: input.source,

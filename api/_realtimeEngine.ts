@@ -43,8 +43,8 @@ import {
   type MeshGroundingMeta,
 } from './_freeAiMesh.js';
 
-export function createGeminiClient(apiKey: string): GoogleGenAI {
-  const baseUrlOverride = getGeminiBaseUrlOverride();
+export function createGeminiClient(apiKey: string, baseUrl?: string): GoogleGenAI {
+  const baseUrlOverride = baseUrl || getGeminiBaseUrlOverride();
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
