@@ -502,8 +502,8 @@ export async function POST(request: Request): Promise<Response> {
               }
               if (
                 !codeStart.isPatch &&
-                htmlSoFar.length >= 220 &&
-                htmlSoFar.length - lastPreviewBytesSent >= 900
+                htmlSoFar.length >= 80 &&
+                htmlSoFar.length - lastPreviewBytesSent >= 250
               ) {
                 lastPreviewBytesSent = htmlSoFar.length;
                 const liveHtml = finalizePartialPreviewHtml(cleanSoFar);

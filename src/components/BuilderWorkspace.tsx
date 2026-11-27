@@ -3097,7 +3097,7 @@ export function BuilderWorkspace({
                                   isActive
                                     ? 'text-[#0B0B0F]'
                                     : isDone
-                                      ? 'text-[#16A34A]'
+                                      ? 'text-[#0D5BFF]'
                                       : 'text-[#A1A1AA]'
                                 }`}
                               >
@@ -3107,7 +3107,7 @@ export function BuilderWorkspace({
                                     style={{ color: theme.accentColor }}
                                   />
                                 ) : isDone ? (
-                                  <CheckCircle2 className="w-3.5 h-3.5 text-[#16A34A] shrink-0" />
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-[#0D5BFF] shrink-0" />
                                 ) : (
                                   <span className="w-2 h-2 rounded-full bg-black/15 shrink-0" />
                                 )}
@@ -3127,11 +3127,11 @@ export function BuilderWorkspace({
                         <span className="truncate flex items-center gap-1.5 font-medium">
                           {isCompletedBuild ? (
                             <>
-                              <CheckCircle2 className="w-3.5 h-3.5 text-[#16A34A] shrink-0" />
+                              <CheckCircle2 className="w-3.5 h-3.5 text-[#0D5BFF] shrink-0" />
                               <span>All files edited & live preview verified</span>
                             </>
                           ) : activeStageIndex === 1 && turn.activeFile ? (
-                            `Coding ${turn.activeFile}`
+                            `Editing file ${turn.activeFile}`
                           ) : (
                             turn.phaseLabel || `${stageSteps[activeStageIndex]}...`
                           )}
