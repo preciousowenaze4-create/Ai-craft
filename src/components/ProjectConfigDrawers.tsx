@@ -886,9 +886,9 @@ export function ProjectDatabaseModal({
   const [serverTablesMap, setServerTablesMap] = useState<
     Record<string, Record<string, unknown>[]>
   >({});
-  const [serverStorageMode, setServerStorageMode] = useState<'supabase' | 'disk' | 'tmp' | null>(
-    null
-  );
+  const [serverStorageMode, setServerStorageMode] = useState<
+    'file' | 'file+cloud' | 'tmp-file' | 'cloud+tmp-file' | 'supabase' | 'disk' | 'tmp' | null
+  >(null);
   const [syncingDb, setSyncingDb] = useState(false);
 
   const effectiveDbAppId = testMode ? `${projectId}__test` : projectId;
@@ -905,7 +905,14 @@ export function ProjectDatabaseModal({
       const data = (await res.json()) as {
         ok?: boolean;
         tables?: Record<string, Record<string, unknown>[]>;
-        storageMode?: 'supabase' | 'disk' | 'tmp';
+        storageMode?:
+          | 'file'
+          | 'file+cloud'
+          | 'tmp-file'
+          | 'cloud+tmp-file'
+          | 'supabase'
+          | 'disk'
+          | 'tmp';
       };
       if (data.ok && data.tables && typeof data.tables === 'object') {
         setServerTablesMap(data.tables);
@@ -1478,9 +1485,12 @@ export function ProjectDatabaseModal({
                     </span>
                   </div>
                   <span className="text-[11px] text-[#71717A] truncate pl-4">
-                    {serverStorageMode === 'supabase' || hasSupabaseConfigured
+                    {serverStorageMode === 'file+cloud' ||
+                    serverStorageMode === 'cloud+tmp-file' ||
+                    serverStorageMode === 'supabase' ||
+                    hasSupabaseConfigured
                       ? `Connected to Real Supabase + Server File DB${testMode ? ' (Test Sandbox)' : ''}`
-                      : serverStorageMode === 'disk'
+                      : serverStorageMode === 'file' || serverStorageMode === 'disk'
                         ? `Real Server File DB (.aicraft-data)${testMode ? ' · Isolated Test Store' : ' · Persistent'}`
                         : `Real Server Backend DB (/api/app-data)${testMode ? ' · Isolated Test Store' : ''}`}
                   </span>

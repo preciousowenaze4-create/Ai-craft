@@ -87,7 +87,11 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   const payload =
-    body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+    body.row && typeof body.row === 'object' && !Array.isArray(body.row)
+      ? (body.row as Record<string, unknown>)
+      : body && typeof body === 'object' && !Array.isArray(body)
+        ? body
+        : {};
   const row = await insertAppTableRow(appId, table, payload);
   return Response.json(
     { ok: true, row, storageMode: getAppDataStorageMode() },
@@ -105,7 +109,12 @@ export async function PATCH(request: Request): Promise<Response> {
   }
 
   const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-  const patch = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+  const patch =
+    body.patch && typeof body.patch === 'object' && !Array.isArray(body.patch)
+      ? (body.patch as Record<string, unknown>)
+      : body && typeof body === 'object' && !Array.isArray(body)
+        ? body
+        : {};
   const row = await updateAppTableRow(appId, table, rowId, patch);
   if (!row) {
     return Response.json(

@@ -1480,11 +1480,13 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
       try {
         while (true) {
           const { value, done } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
+          if (done) {
+            buffer += decoder.decode();
+          } else {
+            buffer += decoder.decode(value, { stream: true });
+          }
           const events = buffer.split(/\r?\n\r?\n/);
-          buffer = events.pop() ?? '';
+          buffer = done ? '' : (events.pop() ?? '');
 
           for (const rawEvent of events) {
             const line = rawEvent
@@ -1933,6 +1935,12 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                     title: evt.title,
                     logo: evt.logo,
                   });
+                  if (finalKind === 'build') {
+                    setProjectViews((prev) => ({
+                      ...prev,
+                      [projectId]: 'preview',
+                    }));
+                  }
                 }
                 if (Array.isArray(evt.dbTables) && evt.dbTables.length > 0) {
                   const doneTables = evt.dbTables;
@@ -2186,6 +2194,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
               // ignore malformed chunk
             }
           }
+          if (done) break;
         }
       } finally {
         stopCreditTicker();
@@ -2568,6 +2577,12 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
             title: snap.title,
             logo: snap.logo,
           });
+          if ((snap.kind ?? 'build') === 'build') {
+            setProjectViews((prev) => ({
+              ...prev,
+              [projId]: 'preview',
+            }));
+          }
         }
         notifyBackgroundJobCompletion(
           projId,
@@ -2606,10 +2621,21 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
       if (turn.phase === 'complete' || turn.phase === 'paused' || turn.phase === 'error') return;
 
       const rerunTurnFromSavedProgress = () => {
+        const latestProj = projectsRef.current.find((p) => p.id === projectId);
+        const latestTurn = latestProj?.turns.find((t) => t.id === turnId);
+        if (
+          !latestProj ||
+          !latestTurn ||
+          latestTurn.phase === 'complete' ||
+          latestTurn.phase === 'paused' ||
+          latestTurn.phase === 'error'
+        ) {
+          return;
+        }
         const prevCount = retriedTurnsRef.current.get(turnId) ?? 0;
         retriedTurnsRef.current.set(turnId, prevCount + 1);
-        const idx = project.turns.findIndex((t) => t.id === turnId);
-        const priorTurns = idx > 0 ? project.turns.slice(0, idx) : [];
+        const idx = latestProj.turns.findIndex((t) => t.id === turnId);
+        const priorTurns = idx > 0 ? latestProj.turns.slice(0, idx) : [];
         const history = priorTurns.flatMap((t) => [
           { role: 'user', text: t.userMessage },
           ...(t.aiText ? [{ role: 'model', text: t.aiText }] : []),
@@ -2762,16 +2788,34 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                 const snap = (await res.json()) as Parameters<
                   typeof applyJobSnapshotToTurn
                 >[2];
+                const latestProj = projectsRef.current.find((p) => p.id === proj.id);
+                const latestTurn = latestProj?.turns.find((t) => t.id === turn.id);
+                if (
+                  !latestTurn ||
+                  latestTurn.phase === 'complete' ||
+                  latestTurn.phase === 'paused' ||
+                  latestTurn.phase === 'error'
+                ) {
+                  return;
+                }
                 if (
                   snap.status === 'complete' ||
                   snap.status === 'paused' ||
                   snap.status === 'error'
                 ) {
-                  activeConnectionsRef.current.get(turn.id)?.abort();
-                  activeConnectionsRef.current.delete(turn.id);
-                  applyJobSnapshotToTurn(proj.id, turn.id, snap);
-                } else {
-                  applyJobSnapshotToTurn(proj.id, turn.id, snap);
+                  // Only step in if SSE connection didn't already finalize the terminal event
+                  window.setTimeout(() => {
+                    const postProj = projectsRef.current.find((p) => p.id === proj.id);
+                    const postTurn = postProj?.turns.find((t) => t.id === turn.id);
+                    if (
+                      postTurn &&
+                      (postTurn.phase === 'understanding' || postTurn.phase === 'building')
+                    ) {
+                      activeConnectionsRef.current.get(turn.id)?.abort();
+                      activeConnectionsRef.current.delete(turn.id);
+                      applyJobSnapshotToTurn(proj.id, turn.id, snap);
+                    }
+                  }, 700);
                 }
               } catch {
                 // ignore background check failure

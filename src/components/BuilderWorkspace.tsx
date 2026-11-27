@@ -428,10 +428,14 @@ export function BuilderWorkspace({
   const narratedTurnIdsRef = useRef<Set<string>>(new Set());
   const prevProjectIdRef = useRef<string | null>(null);
 
-  const latestBuiltTurn = useMemo(
-    () => [...turns].reverse().find((t) => Boolean(t.previewHtml)),
-    [turns]
-  );
+  const latestBuiltTurn = useMemo(() => {
+    const reversed = [...turns].reverse();
+    const latestCompleted = reversed.find(
+      (t) => Boolean(t.previewHtml) && t.phase !== 'understanding' && t.phase !== 'building'
+    );
+    if (latestCompleted) return latestCompleted;
+    return reversed.find((t) => Boolean(t.previewHtml));
+  }, [turns]);
   const latestBuiltTurnId = latestBuiltTurn?.id ?? null;
   const latestPreviewHtml = latestBuiltTurn?.previewHtml ?? '';
   const hasBuiltApp = latestPreviewHtml.length > 0;
@@ -525,6 +529,8 @@ export function BuilderWorkspace({
       try {
         const jsonish = objText
           .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')
+          .replace(/new\s+Date\s*\(\s*\)\s*\.toISOString\s*\(\s*\)/g, JSON.stringify(new Date().toISOString()))
+          .replace(/Date\.now\s*\(\s*\)/g, String(Date.now()))
           .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')
           .replace(/'((?:\\.|[^'\\])*)'/g, (_, inner: string) =>
             JSON.stringify(inner.replace(/\\'/g, "'"))
@@ -814,6 +820,12 @@ export function BuilderWorkspace({
   var dbPrefix = ${safeDbPrefix};
   var dbMeta = ${safeDbMeta};
   var isTestMode = ${safeTestModeJson};
+  var isStreamingBuild = false;
+  window.addEventListener('message', function(ev) {
+    if (ev && ev.data && ev.data.type === 'aicraft:streamState') {
+      isStreamingBuild = Boolean(ev.data.isStreaming);
+    }
+  });
 
   // Prevent DOMException: SecurityError when generated code accesses localStorage/sessionStorage inside sandboxed srcDoc iframe
   function installSafeStorage(propName, storeObj, syncToParent) {
@@ -1159,8 +1171,14 @@ export function BuilderWorkspace({
       rows.unshift(item);
       writeTable(t, rows);
       notifyDbSubscribers(t);
-      notifyParentDb('insert', { table: t, row: item });
-      return Promise.resolve(item);
+      return sendDbOp('insert', { table: t, row: item }, item).then(function(saved) {
+        var finalItem = (saved && typeof saved === 'object') ? saved : item;
+        var current = readTable(t).filter(function(r) { return r && r.id !== finalItem.id; });
+        current.unshift(finalItem);
+        writeTable(t, current);
+        notifyDbSubscribers(t);
+        return finalItem;
+      });
     },
     update: function(table, id, patch) {
       var t = cleanTable(table);
@@ -1171,23 +1189,28 @@ export function BuilderWorkspace({
       });
       writeTable(t, rows);
       notifyDbSubscribers(t);
-      notifyParentDb('update', { table: t, rowId: id, patch: patch || {} });
-      return Promise.resolve(updated);
+      return sendDbOp('update', { table: t, rowId: id, patch: patch || {} }, updated).then(function(saved) {
+        if (saved && typeof saved === 'object') {
+          var nextRows = readTable(t).map(function(r) { return (r && r.id === id) ? saved : r; });
+          writeTable(t, nextRows);
+          notifyDbSubscribers(t);
+          return saved;
+        }
+        return updated;
+      });
     },
     remove: function(table, id) {
       var t = cleanTable(table);
       var rows = readTable(t).filter(function(r) { return !r || r.id !== id; });
       writeTable(t, rows);
       notifyDbSubscribers(t);
-      notifyParentDb('remove', { table: t, rowId: id });
-      return Promise.resolve(true);
+      return sendDbOp('remove', { table: t, rowId: id }, true);
     },
     clear: function(table) {
       var t = cleanTable(table);
       writeTable(t, []);
       notifyDbSubscribers(t);
-      notifyParentDb('clear', { table: t });
-      return Promise.resolve(true);
+      return sendDbOp('clear', { table: t }, true);
     },
     subscribe: function(table, listener) {
       var t = cleanTable(table);
@@ -1202,11 +1225,11 @@ export function BuilderWorkspace({
   };
   var runtimeErrorShown = false;
   function showRuntimeFixBar(errMsg) {
-    if (runtimeErrorShown) return;
+    if (runtimeErrorShown || isStreamingBuild) return;
     var msgText = String(errMsg || '').trim();
     if (!msgText || /^Script error\.?$/i.test(msgText) || /ResizeObserver loop/i.test(msgText)) return;
     setTimeout(function() {
-      if (runtimeErrorShown || !document.body) return;
+      if (runtimeErrorShown || isStreamingBuild || !document.body) return;
       runtimeErrorShown = true;
       var bar = document.createElement('div');
       bar.style.cssText = 'position:fixed;bottom:16px;left:16px;right:16px;z-index:99999;background:#111827;color:#F9FAFB;border:1px solid rgba(255,255,255,0.16);border-radius:14px;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;gap:8px;font-family:system-ui,sans-serif;font-size:12px;box-shadow:0 12px 32px rgba(0,0,0,0.45);';
@@ -1401,7 +1424,7 @@ export function BuilderWorkspace({
       previewObjectUrlRef.current = null;
       lastPreviewBuildRef.current = 0;
       setPreviewObjectUrl(null);
-      if (prev) URL.revokeObjectURL(prev);
+      if (prev) window.setTimeout(() => URL.revokeObjectURL(prev), 1500);
       return;
     }
     const buildObjectUrl = () => {
@@ -1434,10 +1457,10 @@ export function BuilderWorkspace({
       previewObjectUrlRef.current = url;
       lastPreviewBuildRef.current = Date.now();
       setPreviewObjectUrl(url);
-      if (prev && prev !== url) URL.revokeObjectURL(prev);
+      if (prev && prev !== url) window.setTimeout(() => URL.revokeObjectURL(prev), 1500);
     };
     const sinceLastBuild = Date.now() - lastPreviewBuildRef.current;
-    const minGapMs = isStreaming ? 650 : 0;
+    const minGapMs = isStreaming ? 900 : 0;
     const delayMs = Math.max(0, minGapMs - sinceLastBuild);
     if (delayMs === 0) {
       buildObjectUrl();
@@ -1446,6 +1469,17 @@ export function BuilderWorkspace({
     const timer = window.setTimeout(buildObjectUrl, delayMs);
     return () => window.clearTimeout(timer);
   }, [connectedPreviewHtml, isStreaming]);
+
+  useEffect(() => {
+    try {
+      previewIframeRef.current?.contentWindow?.postMessage(
+        { type: 'aicraft:streamState', isStreaming },
+        '*'
+      );
+    } catch {
+      // ignore iframe postMessage error
+    }
+  }, [isStreaming]);
 
   // Revoke the last blob URL on unmount.
   useEffect(
@@ -2290,6 +2324,10 @@ export function BuilderWorkspace({
                     try {
                       previewIframeRef.current?.contentWindow?.postMessage(
                         { type: 'aicraft:setInspect', enabled: visualInspectMode },
+                        '*'
+                      );
+                      previewIframeRef.current?.contentWindow?.postMessage(
+                        { type: 'aicraft:streamState', isStreaming },
                         '*'
                       );
                     } catch {

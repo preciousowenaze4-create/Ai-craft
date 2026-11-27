@@ -259,7 +259,11 @@ export async function POST(request: Request): Promise<Response> {
 
         sendEvent({
           type: 'meta',
-          kind: prepared.naturalMediaIntent ? 'media' : 'chat',
+          kind: prepared.naturalMediaIntent
+            ? 'media'
+            : prepared.initialRoute === 'build'
+              ? 'build'
+              : 'chat',
           modelId: requestedModel || 'gemini::gemini-4-hydrogen',
           modelName: prepared.requestedModelLabel || 'Gemini 4 Hydrogen',
           provider: 'gemini',
@@ -362,7 +366,7 @@ export async function POST(request: Request): Promise<Response> {
             activeProvider = meta.provider;
             sendEvent({
               type: 'meta',
-              kind: 'chat',
+              kind: prepared.initialRoute === 'build' ? 'build' : 'chat',
               modelId: meta.modelId,
               modelName: meta.modelName,
               provider: meta.provider,

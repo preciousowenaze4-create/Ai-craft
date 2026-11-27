@@ -157,12 +157,64 @@ const buildEvents = buildText
   })
   .filter(Boolean) as Array<Record<string, unknown>>;
 
+const buildMeta = buildEvents.find((e) => e.type === 'meta');
+if (buildMeta?.kind !== 'build') {
+  console.error('FAIL: build SSE meta event should carry kind=build, got:', JSON.stringify(buildMeta));
+  process.exit(1);
+}
 const buildDone = buildEvents.find((e) => e.type === 'done');
 const previewHtml = String(buildDone?.previewHtml ?? '');
 if (!previewHtml.includes('<!DOCTYPE html>') || !previewHtml.includes('Mesh Todo')) {
   console.error('FAIL: previewHtml missing expected build HTML');
   process.exit(1);
 }
+
+// Local Vue 3 vendor runtime + CORS check for opaque sandboxed blob iframes
+const vueRes = await fetch(`http://127.0.0.1:${PORT}/vendor/vue.global.prod.js`);
+if (!vueRes.ok || vueRes.headers.get('access-control-allow-origin') !== '*') {
+  console.error('FAIL: /vendor/vue.global.prod.js missing 200 or CORS header');
+  process.exit(1);
+}
+const vueJsText = await vueRes.text();
+if (!vueJsText.includes('createApp')) {
+  console.error('FAIL: /vendor/vue.global.prod.js content unexpected');
+  process.exit(1);
+}
+
+// Real backend DB POST { row } + PATCH { patch } + GET unwrapping check
+const dbAppId = `e2e_db_${Date.now()}`;
+const postRowRes = await fetch(`http://127.0.0.1:${PORT}/api/app-data/${dbAppId}/messages`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    row: { id: 'msg_1', sender: 'Ada', body: 'Hello live DB', likes: 2 },
+  }),
+});
+const postRowJson = (await postRowRes.json()) as {
+  ok?: boolean;
+  row?: Record<string, unknown>;
+};
+if (!postRowJson.ok || postRowJson.row?.sender !== 'Ada' || 'row' in (postRowJson.row || {})) {
+  console.error('FAIL: POST /api/app-data did not unwrap { row } cleanly:', JSON.stringify(postRowJson));
+  process.exit(1);
+}
+const patchRowRes = await fetch(
+  `http://127.0.0.1:${PORT}/api/app-data/${dbAppId}/messages/msg_1`,
+  {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ patch: { likes: 9 } }),
+  }
+);
+const patchRowJson = (await patchRowRes.json()) as {
+  ok?: boolean;
+  row?: Record<string, unknown>;
+};
+if (!patchRowJson.ok || patchRowJson.row?.likes !== 9 || 'patch' in (patchRowJson.row || {})) {
+  console.error('FAIL: PATCH /api/app-data did not unwrap { patch } cleanly:', JSON.stringify(patchRowJson));
+  process.exit(1);
+}
+await fetch(`http://127.0.0.1:${PORT}/api/app-data/${dbAppId}/messages`, { method: 'DELETE' });
 
 // /api/media text-to-image & attachment editing
 const mediaRes = await fetch(`http://127.0.0.1:${PORT}/api/media`, {

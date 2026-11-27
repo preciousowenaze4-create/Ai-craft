@@ -3,6 +3,7 @@ import {
   buildCraftSystemPrompt,
   buildFocusedSearchQuery,
   buildProjectInfraContext,
+  classifyInitialRoute,
   deriveServerSessionTitle,
   extractDbSchemaFromHtml,
   extractDbSchemaFromRaw,
@@ -267,7 +268,7 @@ export async function prepareRealtimePrompt(
     ? 'chat'
     : /\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(message) || wantsRestructure
       ? 'build'
-      : 'auto';
+      : classifyInitialRoute(message, previousHtml, input.attachmentName, hasAttachment);
 
   const isGameBuild = initialRoute === 'build' && isGameBuildPrompt(message);
   const focusedSearchQuery = buildFocusedSearchQuery(message);
@@ -292,14 +293,18 @@ export async function prepareRealtimePrompt(
     isFreeAiMeshAvailable() &&
     Boolean(input.attachmentDataUrl);
 
-  if (wantsSearch || shouldRunDesignEngine) {
+  if (wantsSearch || shouldRunDesignEngine || initialRoute === 'build') {
     input.onStage?.({
       phase: 'understanding',
       kind: initialRoute === 'build' ? 'build' : 'chat',
-      action: initialRoute === 'build' ? 'Building' : 'Thinking',
+      action: wantsSearch ? 'Searching' : initialRoute === 'build' ? 'Building' : 'Thinking',
       label: wantsSearch
         ? 'Searching live web...'
-        : 'Analyzing layout & screenshot...',
+        : shouldRunDesignEngine
+          ? 'Analyzing layout & screenshot...'
+          : isPatchMode
+            ? 'Planning update...'
+            : 'Planning app layout & database...',
     });
   }
 

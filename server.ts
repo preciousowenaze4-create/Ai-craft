@@ -1812,10 +1812,14 @@ async function startServer() {
   });
 
   app.post('/api/app-data/:appId/:table', async (req, res) => {
-    const payload =
+    const rawBody =
       req.body && typeof req.body === 'object' && !Array.isArray(req.body)
         ? (req.body as Record<string, unknown>)
         : {};
+    const payload =
+      rawBody.row && typeof rawBody.row === 'object' && !Array.isArray(rawBody.row)
+        ? (rawBody.row as Record<string, unknown>)
+        : rawBody;
     const row = await insertAppTableRow(
       req.params.appId || '',
       req.params.table || 'items',
@@ -1826,10 +1830,14 @@ async function startServer() {
   });
 
   app.patch('/api/app-data/:appId/:table/:rowId', async (req, res) => {
-    const patch =
+    const rawBody =
       req.body && typeof req.body === 'object' && !Array.isArray(req.body)
         ? (req.body as Record<string, unknown>)
         : {};
+    const patch =
+      rawBody.patch && typeof rawBody.patch === 'object' && !Array.isArray(rawBody.patch)
+        ? (rawBody.patch as Record<string, unknown>)
+        : rawBody;
     const row = await updateAppTableRow(
       req.params.appId || '',
       req.params.table || 'items',
@@ -1841,7 +1849,7 @@ async function startServer() {
       return;
     }
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ ok: true, row });
+    res.json({ ok: true, row, storageMode: getAppDataStorageMode() });
   });
 
   app.delete('/api/app-data/:appId/:table/:rowId', async (req, res) => {
@@ -3324,7 +3332,11 @@ async function startServer() {
 
       sendEvent({
         type: 'meta',
-        kind: prepared.naturalMediaIntent ? 'media' : 'chat',
+        kind: prepared.naturalMediaIntent
+          ? 'media'
+          : prepared.initialRoute === 'build'
+            ? 'build'
+            : 'chat',
         modelId: requestedModel || 'gemini::gemini-4-hydrogen',
         modelName: prepared.requestedModelLabel || 'Gemini 4 Hydrogen',
         provider: 'gemini',
@@ -3430,7 +3442,7 @@ async function startServer() {
           activeProvider = meta.provider;
           sendEvent({
             type: 'meta',
-            kind: 'chat',
+            kind: prepared.initialRoute === 'build' ? 'build' : 'chat',
             modelId: meta.modelId,
             modelName: meta.modelName,
             provider: meta.provider,
@@ -3881,6 +3893,8 @@ async function startServer() {
     }
     res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
     res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.setHeader('Vary', 'Accept-Encoding');
     const acceptEnc = String(req.headers['accept-encoding'] || '');
     if (vueRuntimeGzip && acceptEnc.includes('gzip')) {

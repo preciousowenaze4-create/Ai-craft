@@ -1030,20 +1030,60 @@ export function finalizePartialPreviewHtml(raw: string): string {
     html = html.slice(0, lastOpenBracket).trimEnd();
   }
 
-  const lastScriptOpen = html.toLowerCase().lastIndexOf('<script');
-  const lastScriptClose = html.toLowerCase().lastIndexOf('</script>');
+  // Strip an unclosed trailing <script> rather than terminating half-written JS with a SyntaxError
+  const lowerHtml = html.toLowerCase();
+  const lastScriptOpen = lowerHtml.lastIndexOf('<script');
+  const lastScriptClose = lowerHtml.lastIndexOf('</script>');
   if (lastScriptOpen > lastScriptClose) {
-    const lastNewline = html.lastIndexOf('\n');
-    if (lastNewline > lastScriptOpen) {
-      html = html.slice(0, lastNewline);
-    }
-    html += '\n</script>';
+    html = html.slice(0, lastScriptOpen).trimEnd();
   }
 
-  const lastStyleOpen = html.toLowerCase().lastIndexOf('<style');
-  const lastStyleClose = html.toLowerCase().lastIndexOf('</style>');
+  // Strip an unclosed trailing <template> block so Vue templates stay structurally valid
+  const lowerAfterScript = html.toLowerCase();
+  const lastTplOpen = lowerAfterScript.lastIndexOf('<template');
+  const lastTplClose = lowerAfterScript.lastIndexOf('</template>');
+  if (lastTplOpen > lastTplClose) {
+    html = html.slice(0, lastTplOpen).trimEnd();
+  }
+
+  const lowerAfterTpl = html.toLowerCase();
+  const lastStyleOpen = lowerAfterTpl.lastIndexOf('<style');
+  const lastStyleClose = lowerAfterTpl.lastIndexOf('</style>');
   if (lastStyleOpen > lastStyleClose) {
     html += '\n</style>';
+  }
+
+  // If this is a Vue mount shell (<div id="app"></div>) whose createApp().mount('#app') script has not closed yet,
+  // avoid flashing a blank empty white viewport mid-stream.
+  const hasEmptyMountShell =
+    /<div\b[^>]*id=["']app["'][^>]*>\s*<\/div>/i.test(html) ||
+    /\/vendor\/vue\.global\.prod\.js/i.test(html) ||
+    /<template\b/i.test(html);
+  const hasMountedVueScript = /\bcreateApp\b[\s\S]*\.mount\s*\(/i.test(html);
+  if (hasEmptyMountShell && !hasMountedVueScript) {
+    return '';
+  }
+
+  // Validate any completed inline <script> blocks so mid-stream previews never raise runtime SyntaxErrors
+  const inlineScriptRegex = /<script(?![^>]*\bsrc\s*=)([^>]*)>([\s\S]*?)<\/script>/gi;
+  for (const match of html.matchAll(inlineScriptRegex)) {
+    const attrs = (match[1] || '').toLowerCase();
+    if (
+      attrs.includes('application/json') ||
+      attrs.includes('application/ld+json') ||
+      attrs.includes('importmap') ||
+      attrs.includes('text/babel') ||
+      attrs.includes('text/x-template')
+    ) {
+      continue;
+    }
+    const jsCode = (match[2] || '').trim();
+    if (!jsCode) continue;
+    try {
+      new vm.Script(jsCode);
+    } catch {
+      return '';
+    }
   }
 
   if (!/<\/body>/i.test(html)) html += '\n</body>';

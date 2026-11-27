@@ -340,12 +340,27 @@ const {
   validateBuiltAppHtml,
   sanitizeAndHardenPreviewHtml,
   extractLiveBuildArtifacts,
+  finalizePartialPreviewHtml,
 } = await import('../api/_builderCore.js');
 
+const mobileStages: Array<{ kind: string; action: string; label: string }> = [];
 const mobilePromptPrep = await prepareRealtimePrompt({
   message: 'Build a WhatsApp-style mobile chat app with Chats, Status, and Calls tabs',
   mode: 'mobile',
+  onStage: (s) => mobileStages.push({ kind: s.kind, action: s.action, label: s.label }),
 });
+assert(
+  mobilePromptPrep.initialRoute === 'build',
+  `mobile app build request must classify initialRoute='build', got '${mobilePromptPrep.initialRoute}'`
+);
+assert(
+  mobilePromptPrep.searchData.query.length > 0,
+  'mobile app build must execute live web search and populate searchData.query'
+);
+assert(
+  mobileStages.some((s) => s.kind === 'build' && /planning/i.test(s.label)),
+  'prepareRealtimePrompt must emit build planning stage event'
+);
 assert(
   /\/vendor\/vue\.global\.prod\.js/.test(mobilePromptPrep.systemPrompt),
   'mobile system prompt must enforce local /vendor/vue.global.prod.js runtime'
@@ -358,6 +373,19 @@ assert(
 assert(
   /\[\[PLAN:/.test(mobilePromptPrep.systemPrompt),
   'mobile system prompt must require architectural [[PLAN:...]] breakdown before code'
+);
+
+// Verify finalizePartialPreviewHtml never emits broken half-written <script> or unmounted Vue #app shell
+const partialUnmountedVue = `<<<AICRAFT_APP_HTML>>>\n<!DOCTYPE html><html><head><script src="/vendor/vue.global.prod.js"></script></head><body><div id="app"></div><script>const { createApp } = Vue; const broken = "unterminated`;
+assert(
+  finalizePartialPreviewHtml(partialUnmountedVue) === '',
+  'finalizePartialPreviewHtml must withhold unmounted Vue #app shells until mount script finishes'
+);
+const partialValidStatic = `<<<AICRAFT_APP_HTML>>>\n<!DOCTYPE html><html><head><style>body{margin:0;}</style></head><body><main><h1>Chat App</h1></main><script>const x = 1; // half written`;
+const safePartial = finalizePartialPreviewHtml(partialValidStatic);
+assert(
+  safePartial.includes('<h1>Chat App</h1>') && !safePartial.includes('const x = 1'),
+  'finalizePartialPreviewHtml must strip unclosed trailing <script> instead of running half-written JS'
 );
 
 const sampleVueMobileHtml = `<!DOCTYPE html>
