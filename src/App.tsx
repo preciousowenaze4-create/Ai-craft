@@ -2970,6 +2970,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
     };
 
     setProjects((prev) => [newProject, ...prev]);
+    setProjectViews((prev) => ({ ...prev, [projectId]: 'chat' }));
     setActiveProjectId(projectId);
     setPrompt('');
     setViewMode('builder');
@@ -3049,6 +3050,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
     };
 
     setProjects((prev) => [newProject, ...prev]);
+    setProjectViews((prev) => ({ ...prev, [projectId]: 'chat' }));
     setActiveProjectId(projectId);
     setPrompt('');
     setViewMode('builder');
@@ -3680,6 +3682,7 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
     setProPlanId(null);
     setCredits(150);
     setShowProUpgrade(false);
+    setActiveProjectId(null);
     setViewMode('home');
     setActiveTab('create');
     setAuthUser(null);
@@ -3997,9 +4000,17 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
                   [activeProject.id]: 'chat',
                 }));
               } else {
+                setActiveProjectId(null);
                 setViewMode('home');
                 setActiveTab('create');
               }
+            }}
+            onNewChat={() => {
+              setActiveProjectId(null);
+              setViewMode('home');
+              setActiveTab('create');
+              setPrompt('');
+              setInlineNotice(null);
             }}
             onSendFollowUp={handleFollowUp}
             onContinueTurn={handleContinueTurn}
@@ -4011,10 +4022,12 @@ const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
               setShowProUpgrade(true);
             }}
             onOpenApps={() => {
+              setActiveProjectId(null);
               setViewMode('home');
               setActiveTab('apps');
             }}
             onOpenSettings={() => {
+              setActiveProjectId(null);
               setViewMode('home');
               setActiveTab('setting');
             }}

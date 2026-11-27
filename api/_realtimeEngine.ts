@@ -248,11 +248,24 @@ export async function prepareRealtimePrompt(
       ? null
       : detectNaturalMediaRequest(message, hasPreviousHtml, hasAttachment));
 
-  // Let Gemini naturally decide between normal chat, image creation, or building an app,
-  // unless the caller explicitly forces chat or resumes an interrupted build.
+  const previewSummary = extractPreviewStructureSummary(previousHtml);
+  const existingIsVue = /\b(?:createApp|defineComponent)\b|vue\.global\.prod\.js/i.test(
+    previousHtml
+  );
+  const wantsRestructure =
+    /\b(redesign|restructure|reorganiz(?:e|ing)|refactor|overhaul|rearchitect|rework|convert\s+to|switch\s+(?:to|layout|nav)|change\s+(?:the\s+)?(?:entire\s+|whole\s+|full\s+|app\s+)?(?:layout|structure|architecture|navigation|nav\s*bar|tabs?)|make\s+it\s+(?:look\s+like\s+)?(?:a\s+)?(?:real|standard|proper)\s+mobile|restyle\s*(?:all|everything|the\s*whole|entire)|rebuild(?:\s+from\s*scratch)?|start\s*over|completely\s*new)\b/i.test(
+      message
+    ) ||
+    (input.mode === 'mobile' &&
+      hasPreviousHtml &&
+      !existingIsVue &&
+      /\b(vue|ionic|capacitor|mobile\s*(?:app|layout|ui|navigation|tabs)|standard\s*mobile|bottom\s*tabs?|stack\s*navigation)\b/i.test(
+        message
+      ));
+
   const initialRoute: 'chat' | 'build' | 'auto' = input.forceChat
     ? 'chat'
-    : /\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(message)
+    : /\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(message) || wantsRestructure
       ? 'build'
       : 'auto';
 
@@ -266,15 +279,10 @@ export async function prepareRealtimePrompt(
     !skipBuildSearch &&
     (initialRoute === 'build' || shouldRunChatSearch(message, hasPreviousHtml));
 
-  const previewSummary = extractPreviewStructureSummary(previousHtml);
-  const wantsFullRedesign =
-    /\b(redesign|restyle\s*(?:all|everything|the\s*whole|entire)|rebuild\s*from\s*scratch|start\s*over|completely\s*new)\b/i.test(
-      message
-    );
   const isPatchMode =
     hasPreviousHtml &&
     initialRoute !== 'chat' &&
-    !wantsFullRedesign &&
+    !wantsRestructure &&
     !/\[\[\s*CONTINUE_BUILD\s*\]\]/i.test(message);
 
   // Only invoke the extra visual architect pre-pass when an image screenshot is attached.
@@ -410,22 +418,29 @@ export async function prepareRealtimePrompt(
     const cleanedPreviousForPrompt = previousHtml
       .replace(/<style\b[^>]*data-aicraft-safety[^>]*>[\s\S]*?<\/style>\s*/gi, '')
       .replace(/<script\b[^>]*data-aicraft-safety-js[^>]*>[\s\S]*?<\/script>\s*/gi, '');
+    const fileManifest = extractLiveBuildArtifacts(cleanedPreviousForPrompt)
+      .map((a) => `- ${a.path}`)
+      .join('\n');
     const trimmedExisting =
       cleanedPreviousForPrompt.length > 120000
         ? `${cleanedPreviousForPrompt.slice(0, 62000)}\n<!-- ... middle truncated (${cleanedPreviousForPrompt.length} total chars) ... -->\n${cleanedPreviousForPrompt.slice(-55000)}`
         : cleanedPreviousForPrompt;
     const continuationDirective = isContinueResume
-      ? `RESUMING STOPPED/PAUSED BUILD WITH ${executionPlan.requestedModelLabel}: Continue building cleanly from the saved progress below! Preserve EVERY existing screen, style, handler, and database table already written, finish any unfinished screens/scripts, and output the complete finished app inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>.`
-      : wantsFullRedesign
-        ? `EXISTING APP CODEBASE (Active Builder: ${executionPlan.requestedModelLabel} — User explicitly requested a redesign/overhaul. Preserve existing domain features and \`window.AICraft.db\` data tables while applying the requested redesign cleanly inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>):`
-        : `EXISTING APP CODEBASE — VISUAL LOCK & SURGICAL EDIT MODE (Active Builder: ${executionPlan.requestedModelLabel}):
-CRITICAL PRESERVATION RULES:
-- DO NOT change existing \`:root\` CSS variables, colors, fonts, body layout, header bar, bottom nav bar, or untouched screens!
-- DO NOT rewrite the entire HTML unless restructuring everything is strictly unavoidable.
-- USE \`<<<AICRAFT_PATCH>>>...<<<END_PATCH>>>\` with exact \`<<<SEARCH>>>...<<<REPLACE>>>...\` anchors (copied character-for-character from the code below), \`<<<APPEND_CSS>>>\`, \`<<<APPEND_SCREEN>>>\`, and/or \`<<<APPEND_SCRIPT>>>\` so the existing app keeps 100% of its exact visual look & working features:`;
+      ? `RESUMING STOPPED/PAUSED BUILD WITH ${executionPlan.requestedModelLabel}: Continue building cleanly from CURRENT_PROJECT_FILES below! Preserve EVERY existing screen, Vue component, style, handler, and database table already written, finish any unfinished screens/scripts, and output the complete finished app inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>.`
+      : wantsRestructure
+        ? `CURRENT_PROJECT_FILES — STRUCTURAL UPDATE & ARCHITECTURE MODE (Active Builder: ${executionPlan.requestedModelLabel}):
+MANDATORY ARCHITECT RULES:
+1. Never just chat or repeat unchanged boilerplate when files already exist.
+2. Inspect CURRENT_PROJECT_FILES below carefully and apply REAL structural changes (mobile Vue components, layout architecture, navigation tabs/stack, logic, and state) directly to the actual code.
+3. Preserve domain data tables (\`window.AICraft.db\`) and working features that still fit the restructured design, and output the complete restructured application inside \`<<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>\`.`
+        : `CURRENT_PROJECT_FILES — TARGETED UPDATE MODE (Active Builder: ${executionPlan.requestedModelLabel}):
+MANDATORY EDIT RULES:
+1. Inspect CURRENT_PROJECT_FILES below carefully — NEVER just chat or repeat unchanged boilerplate.
+2. Apply real code modifications matching the user's request (modifying templates, components, layout, logic, or state directly).
+3. For localized updates, use \`<<<AICRAFT_PATCH>>>...<<<END_PATCH>>>\` with exact \`<<<SEARCH>>>...<<<REPLACE>>>...\` anchors copied verbatim from \`index.html\` below, \`<<<APPEND_CSS>>>\`, \`<<<APPEND_SCREEN>>>\`, and/or \`<<<APPEND_SCRIPT>>>\`. If the requested change restructures components or navigation across sections, output the full updated app inside \`<<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>\`.`;
 
     userBlocks.push(
-      `${continuationDirective}\n\`\`\`html\n${trimmedExisting}\n\`\`\``
+      `${continuationDirective}\n\nCURRENT_PROJECT_FILES:\n${fileManifest || '- index.html'}\n\n=== FILE: index.html ===\n\`\`\`html\n${trimmedExisting}\n\`\`\``
     );
   }
 
@@ -685,11 +700,11 @@ interface StreamServerFreeAiParams {
 
 const MESH_ROLE_DIRECTIVES: Record<RealtimeAgentStatus['role'], string> = {
   architect:
-    'MESH_ROLE=architect. You are the lead application architect on a 3-agent build team. Output ONLY the complete single-file HTML application (from <!DOCTYPE html> to </html>) with correct document structure, all screens, the domain data model, and fully wired JavaScript. Prioritize a complete working end-to-end flow over decorative polish.',
+    'MESH_ROLE=architect. You are the lead application architect on a 3-agent build team. First output concise [[PLAN: ...]] architectural steps, then output the complete single-file HTML application inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>> with clean modular Vue 3 / mobile-first architecture (when building a mobile app), all screens, domain data model, and fully wired interactive state.',
   designer:
-    'MESH_ROLE=designer. You are the UI/UX design specialist on a 3-agent build team. Output ONLY a complete single-file HTML document whose strength is exceptional visual design: refined CSS design tokens, typography, spacing, visual hierarchy, micro-animations, and responsive layout for every screen.',
+    'MESH_ROLE=designer. You are the UI/UX design specialist on a 3-agent build team. Output a complete single-file HTML document whose strength is refined CSS design tokens, mobile safe areas, touch-friendly spacing (>=44px), typography, visual hierarchy, and smooth transitions.',
   engineer:
-    'MESH_ROLE=engineer. You are the front-end reliability engineer on a 3-agent build team. Output ONLY a complete single-file HTML document whose strength is rock-solid interactivity: state management, CRUD handlers, form validation, edge cases, and error-free vanilla JavaScript.',
+    'MESH_ROLE=engineer. You are the front-end reliability engineer on a 3-agent build team. Output a complete single-file HTML document whose strength is rock-solid Vue 3 / JavaScript interactivity: state management, navigation stack, CRUD handlers synced with window.AICraft.db, form validation, and error-free execution.',
 };
 
 function withMeshRoleDirective(
@@ -748,11 +763,20 @@ function spliceMergedHtmlIntoRaw(raw: string, html: string): string {
   return html;
 }
 
+function collectTemplateIds(html: string): string[] {
+  const ids: string[] = [];
+  for (const m of html.matchAll(
+    /<(?:template|script\b[^>]*type=["']text\/x-template["'])\b[^>]*\bid=["']([^"']+)["']/gi
+  )) {
+    if (m[1]) ids.push(m[1]);
+  }
+  return ids;
+}
+
 /**
  * Deterministic 3-agent merge: architect HTML is the base; the designer's
- * <style> and the engineer's main <script> are adopted only when safe —
- * CSS is cosmetic, and the script is adopted only if every DOM id it
- * references exists in the architect's document (so no handler breaks).
+ * <style> and the engineer's main <script> are adopted only when structurally safe —
+ * never overwriting Vue component templates or mismatched class/DOM structures.
  */
 function mergeParallelAgentHtml(
   baseHtml: string,
@@ -761,9 +785,12 @@ function mergeParallelAgentHtml(
 ): { html: string; applied: string[] } {
   let html = baseHtml;
   const applied: string[] = [];
+  const baseIsVue = /\b(?:createApp|defineComponent)\b|vue\.global\.prod\.js/i.test(
+    baseHtml
+  );
 
   const designerStyle = designerHtml ? extractLongestInlineStyle(designerHtml) : '';
-  if (designerStyle.length >= 120) {
+  if (designerStyle.length >= 120 && !baseIsVue) {
     if (/<style\b[^>]*>[\s\S]*?<\/style>/i.test(html)) {
       const next = html.replace(
         /(<style\b[^>]*>)[\s\S]*?(<\/style>)/i,
@@ -781,9 +808,16 @@ function mergeParallelAgentHtml(
 
   const engineerScript = engineerHtml ? extractMainInlineScript(engineerHtml) : '';
   if (engineerScript.length >= 300) {
+    const engineerIsVue = /\b(?:createApp|defineComponent)\b/i.test(engineerScript);
+    const baseTemplateIds = collectTemplateIds(baseHtml);
+    const engineerUsesAllTemplates = baseTemplateIds.every((tplId) =>
+      engineerScript.includes(tplId)
+    );
     const baseIds = collectDomIds(baseHtml);
     const refs = collectScriptDomRefs(engineerScript);
-    const safe = refs.every((id) => baseIds.has(id));
+    const safe =
+      refs.every((id) => baseIds.has(id)) &&
+      (!baseIsVue || (engineerIsVue && engineerUsesAllTemplates));
     if (safe) {
       const scriptTag = `<script>\n${engineerScript}\n</script>`;
       let bestIdx = -1;
@@ -985,7 +1019,7 @@ export async function repairIncompleteBuildHtml(params: {
 
   const repairPrompt = [
     `The built ${params.mode} app HTML for "${params.userMessage.slice(0, 200)}" failed validation: ${params.validationReason}`,
-    'Fix ONLY the broken/truncated HTML, CSS, or <script> syntax and ensure the main screen content renders immediately with working buttons and zero empty blank viewports.',
+    'Fix ONLY the broken/truncated HTML, CSS, Vue <template>/defineComponent wiring, or <script> syntax and ensure the main screen content renders immediately with working buttons and zero empty blank viewports (use <script src="/vendor/vue.global.prod.js"></script> if Vue is used).',
     'Output ONLY the complete corrected <!DOCTYPE html>...</html> inside <<<AICRAFT_APP_HTML>>>...<<<END_AICRAFT_APP_HTML>>>.',
     '```html',
     params.brokenHtml.slice(0, 70000),

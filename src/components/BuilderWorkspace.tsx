@@ -219,6 +219,7 @@ interface BuilderWorkspaceProps {
   onUpdatePreviewHtml?: (nextHtml: string) => Promise<void> | void;
   onDeployProject: (opts: DeploySubmitOptions) => Promise<boolean> | void;
   onBack: () => void;
+  onNewChat?: () => void;
   onSendFollowUp: (message: string, options: ComposerOptions) => void;
   onContinueTurn: (turn: BuilderTurn) => void;
   onStopGeneration?: () => void;
@@ -263,6 +264,7 @@ export function BuilderWorkspace({
   onUpdatePreviewHtml,
   onDeployProject,
   onBack,
+  onNewChat,
   onSendFollowUp,
   onContinueTurn,
   onStopGeneration,
@@ -413,6 +415,8 @@ export function BuilderWorkspace({
     setIsEditingCode(false);
     setCodeEditError(null);
     setCodeSaveNotice(null);
+    setPreviewSurfaceBg('#FFFFFF');
+    lastPreviewBuildRef.current = 0;
   }, [projectId, stopVoice]);
 
   const {
@@ -1362,10 +1366,23 @@ export function BuilderWorkspace({
   };
 })();
 </script>`;
-    if (/<\/head>/i.test(latestPreviewHtml)) {
-      return latestPreviewHtml.replace(/<\/head>/i, `${bridgeScript}</head>`);
+    let preparedHtml = latestPreviewHtml.replace(
+      /<script\b([^>]*)\bsrc=["']https?:\/\/(?:unpkg\.com|cdn\.jsdelivr\.net\/npm|cdnjs\.cloudflare\.com\/ajax\/libs)\/vue(?:@3[^"'\s]*|\/3[^"'\s]*)[^"']*["']([^>]*)><\/script>/gi,
+      '<script src="/vendor/vue.global.prod.js"></script>'
+    );
+    const usesVueApi = /\b(?:Vue\.(?:createApp|defineComponent|ref|reactive|computed)|defineComponent\s*\(|createApp\s*\()\b/.test(
+      preparedHtml
+    );
+    const hasLocalVueScript = /\/vendor\/vue\.global(?:\.prod)?\.js/i.test(preparedHtml);
+    const vueScriptTag =
+      usesVueApi && !hasLocalVueScript
+        ? '<script src="/vendor/vue.global.prod.js"></script>\n'
+        : '';
+
+    if (/<\/head>/i.test(preparedHtml)) {
+      return preparedHtml.replace(/<\/head>/i, `${vueScriptTag}${bridgeScript}</head>`);
     }
-    return `${bridgeScript}${latestPreviewHtml}`;
+    return `${vueScriptTag}${bridgeScript}${preparedHtml}`;
   }, [latestPreviewHtml, secrets, projectId, effectiveDbAppId, testMode]);
 
   // Live preview rendering: blob-URL iframe instead of srcDoc.
@@ -2266,7 +2283,7 @@ export function BuilderWorkspace({
               {hasBuiltApp ? (
                 <iframe
                   ref={previewIframeRef}
-                  key={`${projectId}-${previewKey}-${secretsFingerprint}`}
+                  key={`${projectId}-${latestBuiltTurnId ?? 'empty'}-${previewKey}-${secretsFingerprint}`}
                   title={`${projectTitle} Preview`}
                   src={previewObjectUrl ?? undefined}
                   onLoad={() => {
@@ -2910,7 +2927,11 @@ export function BuilderWorkspace({
                 type="button"
                 onClick={() => {
                   setShowHeaderActions(false);
-                  onBack();
+                  if (onNewChat) {
+                    onNewChat();
+                  } else {
+                    onBack();
+                  }
                 }}
                 className="px-3 py-1.5 rounded-lg bg-[#0B0B0F] text-white font-medium whitespace-nowrap"
               >

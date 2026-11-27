@@ -335,5 +335,157 @@ assert(
   'buildCraftSystemPrompt must omit [[MODE:GENERATE]] inside existing app/Test Mode builds'
 );
 
+// --- 10: mobile Vue architecture, sanitization, validation & restructure ---
+const {
+  validateBuiltAppHtml,
+  sanitizeAndHardenPreviewHtml,
+  extractLiveBuildArtifacts,
+} = await import('../api/_builderCore.js');
+
+const mobilePromptPrep = await prepareRealtimePrompt({
+  message: 'Build a WhatsApp-style mobile chat app with Chats, Status, and Calls tabs',
+  mode: 'mobile',
+});
+assert(
+  /\/vendor\/vue\.global\.prod\.js/.test(mobilePromptPrep.systemPrompt),
+  'mobile system prompt must enforce local /vendor/vue.global.prod.js runtime'
+);
+assert(
+  /\.ion-page/.test(mobilePromptPrep.systemPrompt) &&
+    /\.ion-tab-bar/.test(mobilePromptPrep.systemPrompt),
+  'mobile system prompt must require Ionic/Capacitor safe-area page & tab bar structure'
+);
+assert(
+  /\[\[PLAN:/.test(mobilePromptPrep.systemPrompt),
+  'mobile system prompt must require architectural [[PLAN:...]] breakdown before code'
+);
+
+const sampleVueMobileHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>PulseChat Mobile</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <style>
+    :root { --bg: #ffffff; --ink: #0f172a; --accent: #0ea5e9; }
+    html, body { margin: 0; padding: 0; height: 100dvh; font-family: system-ui, sans-serif; }
+    .ion-page { display: flex; flex-direction: column; height: 100dvh; background: var(--bg); color: var(--ink); }
+    .ion-header { padding: 14px 16px; border-bottom: 1px solid #e2e8f0; font-weight: 700; }
+    .ion-content { flex: 1; overflow-y: auto; padding: 12px 16px; }
+    .ion-tab-bar { display: flex; justify-content: space-around; padding: 10px 8px; border-top: 1px solid #e2e8f0; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <template id="tpl-chats-screen">
+    <section class="ion-page">
+      <header class="ion-header">Chats</header>
+      <main class="ion-content">
+        <div v-for="c in chats" :key="c.id" class="chat-row">
+          <button type="button" @click="$emit('open', c.id)">{{ c.name }}</button>
+        </div>
+      </main>
+      <nav class="ion-tab-bar">
+        <button type="button" @click="$emit('tab', 'chats')">Chats</button>
+        <button type="button" @click="$emit('tab', 'calls')">Calls</button>
+      </nav>
+    </section>
+  </template>
+  <template id="tpl-chat-composer">
+    <form class="composer" @submit.prevent="send">
+      <input v-model="draft" placeholder="Message" />
+      <button type="submit">Send</button>
+    </form>
+  </template>
+  <script>
+    const { createApp, ref, computed } = Vue;
+    const ChatsScreen = Vue.defineComponent({
+      name: 'ChatsScreen',
+      template: '#tpl-chats-screen',
+      props: ['chats'],
+      emits: ['open', 'tab']
+    });
+    const ChatComposer = Vue.defineComponent({
+      name: 'ChatComposer',
+      template: '#tpl-chat-composer',
+      setup() {
+        const draft = ref('');
+        const send = () => { draft.value = ''; };
+        return { draft, send };
+      }
+    });
+    createApp({
+      components: { ChatsScreen, ChatComposer },
+      setup() {
+        const activeTab = ref('chats');
+        const chats = ref([{ id: '1', name: 'Ada' }, { id: '2', name: 'Tunde' }]);
+        const openChat = async (id) => {
+          if (window.AICraft && window.AICraft.db) {
+            await window.AICraft.db.list('messages');
+          }
+          return id;
+        };
+        return { activeTab, chats, openChat };
+      },
+      template: '<chats-screen :chats="chats" @open="openChat" @tab="activeTab = $event" />'
+    }).mount('#app');
+  </script>
+</body>
+</html>`;
+
+const vueValidation = validateBuiltAppHtml(sampleVueMobileHtml);
+assert(
+  vueValidation.valid === true,
+  `validateBuiltAppHtml must accept modular Vue 3 mobile app, got: ${vueValidation.reason}`
+);
+
+const fakeStubHtml = sampleVueMobileHtml.replace('Chats', 'App Not Ready — Your app is still building');
+assert(
+  validateBuiltAppHtml(fakeStubHtml).valid === false,
+  'validateBuiltAppHtml must reject App Not Ready stub text'
+);
+
+const hardenedVueHtml = sanitizeAndHardenPreviewHtml(sampleVueMobileHtml);
+assert(
+  hardenedVueHtml.includes('/vendor/vue.global.prod.js') &&
+    !/https?:\/\/unpkg\.com\/vue/i.test(hardenedVueHtml),
+  'sanitizeAndHardenPreviewHtml must rewrite external Vue 3 CDN links to local /vendor/vue.global.prod.js'
+);
+
+const vueAutoInjected = sanitizeAndHardenPreviewHtml(
+  sampleVueMobileHtml.replace(
+    '<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>',
+    ''
+  )
+);
+assert(
+  vueAutoInjected.includes('/vendor/vue.global.prod.js'),
+  'sanitizeAndHardenPreviewHtml must auto-inject /vendor/vue.global.prod.js when Vue runtime APIs are present'
+);
+
+const artifacts = extractLiveBuildArtifacts(sampleVueMobileHtml).map((a) => a.path);
+assert(
+  artifacts.includes('screens/chats-screen.vue') &&
+    artifacts.includes('components/chat-composer.vue'),
+  `extractLiveBuildArtifacts must surface modular .vue files, got: ${artifacts.join(', ')}`
+);
+
+const restructurePrep = await prepareRealtimePrompt({
+  message: 'Restructure the layout into clean Vue screens with bottom navigation tabs and a full-screen thread detail view',
+  mode: 'mobile',
+  previousHtml: sampleVueMobileHtml,
+});
+assert(
+  restructurePrep.initialRoute === 'build' && !restructurePrep.isPatchMode,
+  'Restructure request on existing HTML must unlock full rebuild (initialRoute=build, isPatchMode=false)'
+);
+assert(
+  restructurePrep.userPrompt.includes('CURRENT_PROJECT_FILES:') &&
+    restructurePrep.userPrompt.includes('=== FILE: index.html ===') &&
+    restructurePrep.userPrompt.includes('screens/chats-screen.vue'),
+  'Restructure prompt must feed CURRENT_PROJECT_FILES manifest and actual existing code'
+);
+
 console.log('ALL GEMINI ENGINE TESTS PASSED');
 process.exit(0);

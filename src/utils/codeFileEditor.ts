@@ -58,6 +58,40 @@ function findScreenTagRange(
   return null;
 }
 
+function findVueTemplateRange(
+  html: string,
+  targetIdOrName: string
+): { start: number; end: number } | null {
+  const candidates = [targetIdOrName, `tpl-${targetIdOrName}`, `tpl_${targetIdOrName}`];
+  for (const cand of candidates) {
+    const escaped = cand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const openRe = new RegExp(
+      `<(template|script\\b[^>]*type=["']text\\/x-template["'])\\b[^>]*\\b(?:id|data-component)=["']${escaped}["'][^>]*>`,
+      'i'
+    );
+    const match = openRe.exec(html);
+    if (!match || match.index === undefined) continue;
+
+    const tag = match[1].toLowerCase().startsWith('script') ? 'script' : 'template';
+    const startIdx = match.index;
+    const tagPairRe = new RegExp(`<${tag}\\b[^>]*>|</${tag}>`, 'gi');
+    tagPairRe.lastIndex = startIdx;
+    let depth = 0;
+    let tm: RegExpExecArray | null;
+    while ((tm = tagPairRe.exec(html)) !== null) {
+      if (tm[0].startsWith('</')) {
+        depth -= 1;
+        if (depth <= 0) {
+          return { start: startIdx, end: tm.index + tm[0].length };
+        }
+      } else {
+        depth += 1;
+      }
+    }
+  }
+  return null;
+}
+
 export function extractEditableCodeFiles(html: string): EditableCodeFile[] {
   const cleanHtml = String(html || '');
   if (!cleanHtml.trim()) {
@@ -140,6 +174,39 @@ export function extractEditableCodeFiles(html: string): EditableCodeFile[] {
       });
     }
     if (seenScreens.size >= 8) break;
+  }
+
+  // Extract modular Vue templates (<template id="tpl-..."> / <template data-component="..."> / <script type="text/x-template">)
+  const seenVue = new Set<string>();
+  const vueOpenRe =
+    /<(?:template|script\b[^>]*type=["']text\/x-template["'])\b[^>]*\b(?:id|data-component)=["']([a-zA-Z0-9_-]{2,42})["'][^>]*>/gi;
+  let vm: RegExpExecArray | null;
+  while ((vm = vueOpenRe.exec(cleanHtml)) !== null) {
+    const rawId = (vm[1] || '').trim();
+    const normalized = rawId.replace(/^tpl[-_]/i, '').toLowerCase();
+    if (!normalized || /^(app|root|main)$/.test(normalized) || seenVue.has(normalized)) continue;
+    seenVue.add(normalized);
+    const range = findVueTemplateRange(cleanHtml, rawId);
+    if (range) {
+      const isComponentPart = /(?:composer|bubble|input|card|item|row|badge|modal|sheet|dialog|fab|button|toolbar|header|nav|footer|avatar|pill)$/i.test(
+        normalized
+      );
+      const isScreen =
+        !isComponentPart &&
+        (/(?:^|[-_])(?:screen|view|page|tab|feed|chats?|calls|status|updates|profile|home|explore|detail|settings)(?:$|[-_])/i.test(
+          normalized
+        ) ||
+          /(?:screen|view|page|tab)$/i.test(normalized));
+      const filePath = isScreen ? `screens/${normalized}.vue` : `components/${normalized}.vue`;
+      files.push({
+        id: filePath,
+        label: filePath,
+        content: cleanHtml.slice(range.start, range.end),
+        kind: 'screen',
+        editable: true,
+      });
+    }
+    if (seenVue.size >= 10) break;
   }
 
   return files;
@@ -233,6 +300,22 @@ export function applyFileEditToHtml(
         updated = `${updated}\n${newScriptTag}`;
       }
     }
+    return { ok: true, html: updated };
+  }
+
+  if (filePath.endsWith('.vue') && (filePath.startsWith('screens/') || filePath.startsWith('components/'))) {
+    const vueName = filePath.replace(/^(?:screens|components)\//, '').replace(/\.vue$/i, '');
+    const range = findVueTemplateRange(fullHtml, vueName);
+    if (!range) {
+      return {
+        ok: false,
+        error: `Could not locate Vue template "${vueName}" in index.html. Edit index.html directly instead.`,
+      };
+    }
+    if (!trimmedNext || !/<[a-z]/i.test(trimmedNext)) {
+      return { ok: false, error: 'Vue component template cannot be empty.' };
+    }
+    const updated = `${fullHtml.slice(0, range.start)}${trimmedNext}${fullHtml.slice(range.end)}`;
     return { ok: true, html: updated };
   }
 

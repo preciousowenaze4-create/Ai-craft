@@ -1114,12 +1114,34 @@ export function validateBuiltAppHtml(html: string): {
     }
   }
 
-  // Extract visible body markup (excluding style/script)
+  // Extract visible body markup (excluding style/script), while preserving Vue <template> / text/x-template / inline component templates
   const bodyMatch = /<body\b[^>]*>([\s\S]*?)<\/body>/i.exec(trimmed);
-  const bodyContent = (bodyMatch ? bodyMatch[1] : trimmed)
+  const rawBody = bodyMatch ? bodyMatch[1] : trimmed;
+
+  const xTemplateChunks: string[] = [];
+  for (const xMatch of trimmed.matchAll(
+    /<script\b[^>]*type=["']text\/x-template["'][^>]*>([\s\S]*?)<\/script>/gi
+  )) {
+    if (xMatch[1]?.trim()) xTemplateChunks.push(xMatch[1].trim());
+  }
+
+  const isVueApp =
+    /\b(?:Vue\s*\.\s*createApp|createApp|defineComponent)\b/i.test(trimmed) ||
+    /<template\b/i.test(rawBody) ||
+    xTemplateChunks.length > 0;
+
+  let inlineVueTemplateMarkup = '';
+  if (isVueApp) {
+    for (const tplMatch of trimmed.matchAll(
+      /\btemplate\s*:\s*`([\s\S]*?)`/gi
+    )) {
+      if (tplMatch[1]?.trim()) inlineVueTemplateMarkup += `\n${tplMatch[1]}`;
+    }
+  }
+
+  const bodyContent = `${rawBody
     .replace(/<script\b[\s\S]*?<\/script>/gi, '')
-    .replace(/<style\b[\s\S]*?<\/style>/gi, '')
-    .trim();
+    .replace(/<style\b[\s\S]*?<\/style>/gi, '')}\n${xTemplateChunks.join('\n')}\n${inlineVueTemplateMarkup}`.trim();
 
   if (bodyContent.length < 180) {
     return {
@@ -1131,10 +1153,10 @@ export function validateBuiltAppHtml(html: string): {
   // Reject bare shells whose main viewport container is empty and has near-zero JS to populate it
   const interactiveElements = (
     bodyContent.match(
-      /<(?:button|input|select|textarea|section|article|main|form|canvas|svg|a|li)\b/gi
+      /<(?:button|input|select|textarea|section|article|main|form|canvas|svg|a|li|ion-[a-z-]+|template)\b/gi
     ) || []
   ).length;
-  if (interactiveElements < 4) {
+  if (interactiveElements < 4 && !(isVueApp && totalInlineJsChars >= 450)) {
     return {
       valid: false,
       reason: 'Preview UI has fewer than 4 interactive or content elements.',
@@ -1150,7 +1172,7 @@ export function validateBuiltAppHtml(html: string): {
 
   // Catch classic empty placeholder stubs
   if (
-    /\b(todo:\s*implement|placeholder\s*content|coming\s+soon\s*\.{0,3}<\/|insert\s+code\s+here)\b/i.test(
+    /\b(todo:\s*implement|placeholder\s*content|coming\s+soon\s*\.{0,3}<\/|insert\s+code\s+here|app\s+not\s+ready|your\s+app\s+is\s+still\s+building)\b/i.test(
       bodyContent
     )
   ) {
@@ -1164,7 +1186,7 @@ export function validateBuiltAppHtml(html: string): {
 }
 
 /**
- * Ensures responsive viewport meta, mobile bottom-nav safe-area padding,
+ * Ensures responsive viewport meta, local Vue 3 runtime stability, mobile bottom-nav safe-area padding,
  * image onerror graceful fallback, and icon resilience without overriding design.
  */
 export function sanitizeAndHardenPreviewHtml(html: string): string {
@@ -1173,6 +1195,27 @@ export function sanitizeAndHardenPreviewHtml(html: string): string {
 
   // Normalize rigid 100vh in CSS declarations to 100dvh so mobile safe-areas never leave a white strip
   out = out.replace(/(:\s*)(100vh\b)/gi, '$1100dvh');
+
+  // Rewrite fragile external Vue 3 CDN links to local /vendor/vue.global.prod.js
+  out = out.replace(
+    /<script\b[^>]*\bsrc=["']https?:\/\/[^"']*\/vue(?:\.global(?:\.prod)?)?(?:@[^"'/]*)?(?:\/dist\/vue\.global(?:\.prod)?\.js)?["'][^>]*>\s*<\/script>/gi,
+    '<script src="/vendor/vue.global.prod.js"></script>'
+  );
+
+  // If the app uses Vue 3 runtime APIs without loading /vendor/vue.global.prod.js, inject it cleanly before app scripts
+  const usesVueRuntime =
+    /\bVue\s*\.\s*(?:createApp|defineComponent|ref|reactive|computed|watch|onMounted)\b/.test(out) ||
+    /\bconst\s*\{[^}]*\bcreateApp\b[^}]*\}\s*=\s*Vue\b/.test(out);
+  if (usesVueRuntime && !/\/vendor\/vue\.global\.prod\.js/i.test(out)) {
+    const vueTag = '<script src="/vendor/vue.global.prod.js"></script>';
+    if (/<\/head>/i.test(out)) {
+      out = out.replace(/<\/head>/i, `${vueTag}\n</head>`);
+    } else if (/<script\b/i.test(out)) {
+      out = out.replace(/<script\b/i, `${vueTag}\n<script`);
+    } else {
+      out = `${vueTag}\n${out}`;
+    }
+  }
 
   if (!/<meta\b[^>]*name=["']viewport["']/i.test(out)) {
     const vpTag =
@@ -1188,7 +1231,7 @@ export function sanitizeAndHardenPreviewHtml(html: string): string {
 :where(html) { width: 100%; height: 100%; min-height: 100%; margin: 0; padding: 0; max-width: 100%; overflow-x: hidden; -webkit-tap-highlight-color: transparent; }
 :where(body) { width: 100%; min-height: 100%; margin: 0; padding: 0; max-width: 100%; overflow-x: hidden; }
 :where(*, *::before, *::after) { box-sizing: border-box; }
-:where(nav[class*="bottom"], .bottom-nav, footer.app-nav, #bottom-nav) { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+:where(nav[class*="bottom"], .bottom-nav, .ion-tab-bar, footer.app-nav, #bottom-nav) { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
 </style>`;
     out = /<\/head>/i.test(out)
       ? out.replace(/<\/head>/i, `${safetyStyle}\n</head>`)
@@ -1395,22 +1438,42 @@ export function extractPreviewStructureSummary(previousHtml: string): string {
     .slice(0, 14)
     .map((m) => `${m[1]}()`);
 
-  const titleMatch = /<title\b[^>]*>([^<]{1,60})<\/title>/i.exec(previousHtml);
-  const themeMatch =
-    /<meta\b[^>]*name=["']theme-color["'][^>]*content=["']([^"']+)["']/i.exec(
-      previousHtml
-    );
-  const logoMatch = /<meta\b[^>]*name=["']aicraft-logo["'][^>]*>/i.exec(
+  const vueTemplateMatches = Array.from(
+    previousHtml.matchAll(
+      /<(?:template|script\b[^>]*type=["']text\/x-template["'])\b[^>]*\b(?:id|data-component)=["']([^"']{1,48})["'][^>]*>/gi
+    )
+  )
+    .slice(0, 14)
+    .map((m) => m[1]);
+
+  const vueComponentMatches = Array.from(
+    previousHtml.matchAll(/\b(?:const|let)\s+([A-Z][A-Za-z0-9_]{1,36})\s*=\s*(?:Vue\.)?defineComponent\s*\(/g)
+  )
+    .slice(0, 14)
+    .map((m) => m[1]);
+
+  const usesVue =
+    /\b(?:createApp|defineComponent)\b|vue\.global\.prod\.js/i.test(previousHtml) ||
+    vueTemplateMatches.length > 0;
+  const titleMatch = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(previousHtml);
+  const themeMatch = /<meta\b[^>]*name=["']theme-color["'][^>]*content=["']([^"']+)["']/i.exec(
     previousHtml
   );
+  const logoMatch = /<meta\b[^>]*name=["']aicraft-logo["'][^>]*>/i.exec(previousHtml);
 
   return [
-    `Live Preview already holds a rendered app (${previousHtml.length} chars).`,
-    titleMatch ? `Current app title: "${titleMatch[1].trim()}".` : '',
-    themeMatch ? `Current browser theme-color: ${themeMatch[1].trim()}.` : '',
+    `Live Preview already holds a rendered app (${previousHtml.length} chars${usesVue ? ', Vue 3 mobile architecture' : ''}).`,
+    titleMatch?.[1]?.trim() ? `Current app title: "${titleMatch[1].trim()}".` : '',
+    themeMatch?.[1]?.trim() ? `Current browser theme-color: ${themeMatch[1].trim()}.` : '',
     logoMatch ? `Current app logo meta: ${logoMatch[0]}.` : '',
+    vueComponentMatches.length > 0
+      ? `Existing Vue components: ${Array.from(new Set(vueComponentMatches)).join(', ')}.`
+      : '',
+    vueTemplateMatches.length > 0
+      ? `Existing Vue templates: ${Array.from(new Set(vueTemplateMatches)).join(', ')}.`
+      : '',
     screenMatches.length > 0 ? `Existing screens: ${screenMatches.join(', ')}.` : '',
-    cssVars.length > 0 ? `Locked CSS design tokens (DO NOT change unless requested): ${Array.from(new Set(cssVars)).join('; ')}.` : '',
+    cssVars.length > 0 ? `Existing CSS design tokens: ${Array.from(new Set(cssVars)).join('; ')}.` : '',
     dbTables.length > 0 ? `Existing window.AICraft.db tables: ${dbTables.join('; ')}.` : '',
     fnMatches.length > 0 ? `Existing JS functions: ${Array.from(new Set(fnMatches)).join(', ')}.` : '',
     items.length > 0 ? `Existing artifacts: ${items.join(', ')}.` : '',
@@ -1761,11 +1824,12 @@ export function extractLiveBuildArtifacts(htmlSoFar: string): LiveBuildArtifact[
   }
 
   const tagRegex =
-    /<(header|nav|canvas|form|footer)\b[^>]*>|<(?:section|template|article|main)\b[^>]*\bid=["']([a-zA-Z0-9_-]{2,36})["'][^>]*>|<\w+\b[^>]*\b(?:data-screen|data-view|data-tab|data-page|data-module)=["']([a-zA-Z0-9_-]{2,36})["'][^>]*>|<div\b[^>]*\bid=["']([a-zA-Z0-9_-]*(?:screen|view|page|tab|feed|post|upload|create|profile|account|home|explore|discover|inbox|chat|message|comment|search|cart|checkout|pricing|paywall|upgrade|pro|premium|billing|revenue|dashboard|settings|player|modal|notification|reel|story|wallet|analytics|monetize|auth|login)[a-zA-Z0-9_-]*)["'][^>]*>/gi;
+    /<(header|nav|canvas|form|footer)\b[^>]*>|<(?:section|article|main)\b[^>]*\bid=["']([a-zA-Z0-9_-]{2,36})["'][^>]*>|<(?:template|script\b[^>]*type=["']text\/x-template["'])\b[^>]*\b(?:id|data-component)=["']([a-zA-Z0-9_-]{2,42})["'][^>]*>|<\w+\b[^>]*\b(?:data-screen|data-view|data-tab|data-page|data-module)=["']([a-zA-Z0-9_-]{2,36})["'][^>]*>|<div\b[^>]*\bid=["']([a-zA-Z0-9_-]*(?:screen|view|page|tab|feed|post|upload|create|profile|account|home|explore|discover|inbox|chat|message|comment|search|cart|checkout|pricing|paywall|upgrade|pro|premium|billing|revenue|dashboard|settings|player|modal|notification|reel|story|wallet|analytics|monetize|auth|login)[a-zA-Z0-9_-]*)["'][^>]*>/gi;
   let match: RegExpExecArray | null;
   while ((match = tagRegex.exec(clean)) !== null) {
     const semanticTag = match[1]?.toLowerCase();
-    const namedView = (match[2] || match[3] || match[4])?.toLowerCase();
+    const vueTplId = match[3]?.trim();
+    const namedView = (match[2] || match[4] || match[5])?.toLowerCase();
     if (semanticTag) {
       if (semanticTag === 'canvas') {
         add('components/canvas.html', 'Rendering');
@@ -1778,6 +1842,23 @@ export function extractLiveBuildArtifacts(htmlSoFar: string): LiveBuildArtifact[
       } else if (semanticTag === 'form') {
         add('components/form.html', 'Building');
       }
+    } else if (vueTplId) {
+      const normalized = vueTplId.replace(/^tpl[-_]/i, '').toLowerCase();
+      if (normalized && !/^(app|root|main)$/.test(normalized)) {
+        const isComponentPart = /(?:composer|bubble|input|card|item|row|badge|modal|sheet|dialog|fab|button|toolbar|header|nav|footer|avatar|pill)$/i.test(
+          normalized
+        );
+        const isScreen =
+          !isComponentPart &&
+          (/(?:^|[-_])(?:screen|view|page|tab|feed|chats?|calls|status|updates|profile|home|explore|detail|settings)(?:$|[-_])/i.test(
+            normalized
+          ) ||
+            /(?:screen|view|page|tab)$/i.test(normalized));
+        add(
+          isScreen ? `screens/${normalized}.vue` : `components/${normalized}.vue`,
+          'Building'
+        );
+      }
     } else if (
       namedView &&
       !/^(app|root|container|wrapper|main|body|content|page|shell)$/i.test(namedView)
@@ -1785,6 +1866,16 @@ export function extractLiveBuildArtifacts(htmlSoFar: string): LiveBuildArtifact[
       add(`screens/${namedView}.html`, 'Building');
     }
     if (artifacts.length >= 12) break;
+  }
+
+  for (const compMatch of clean.matchAll(
+    /\b(?:const|let)\s+([A-Z][A-Za-z0-9_]{1,36})\s*=\s*(?:Vue\.)?defineComponent\s*\(/g
+  )) {
+    const rawComp = compMatch[1]?.replace(/(?:Component|View|Screen)$/i, '').toLowerCase();
+    if (rawComp && !/^(app|root|main)$/.test(rawComp)) {
+      add(`components/${rawComp}.vue`, 'Building');
+    }
+    if (artifacts.length >= 14) break;
   }
 
   if (/\bAICraft\.db\./i.test(clean)) {
@@ -1932,32 +2023,51 @@ export function buildCraftSystemPrompt(params: {
     ? 'First line: `[[TITLE: <Short 2-4 Word App Title>]]`.'
     : '';
 
+  const isMobileTarget = mode === 'mobile';
+
+  const mobileArchitectureRules = [
+    '- MOBILE-FIRST VUE 3 + IONIC/CAPACITOR-READY ARCHITECTURE (CRITICAL — NOT A STRETCHED DESKTOP WEBSITE):',
+    '  * Build a real, standard mobile application inside the HTTP/web preview environment using **Vue 3** (`<script src="/vendor/vue.global.prod.js"></script>` with `const { createApp, defineComponent, ref, reactive, computed, watch, onMounted, nextTick } = Vue;`) structured cleanly for **Ionic Vue / Capacitor** native packaging.',
+    '  * Mobile Viewport & Safe Areas: Use portrait mobile shell (`100dvh` height, `overflow: hidden`), `--ion-safe-area-top: env(safe-area-inset-top, 0px); --ion-safe-area-bottom: env(safe-area-inset-bottom, 0px);`, `.ion-page` flex-column layout (`height: 100dvh; display: flex; flex-direction: column;`), sticky `.ion-header` / toolbar (`padding-top: max(12px, var(--ion-safe-area-top))`), independently scrolling `.ion-content` (`flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;`), pinned `.ion-tab-bar` (`padding-bottom: max(10px, var(--ion-safe-area-bottom))`), `>= 44px` touch targets, smooth slide/fade screen transitions, stack navigation (`navStack` push/pop with back button & full-screen detail views), bottom sheets/modals, and Floating Action Button (FAB) where appropriate.',
+    '  * Clean Modular Vue Component Organization: Organize each view/widget as `<template id="tpl-<name>">...</template>` (or `<script type="text/x-template" id="tpl-<name>">`) + modular `Vue.defineComponent({ name, props, emits, template: "#tpl-<name>", setup() { ... } })` mounted via `createApp(RootApp).mount("#app")`, clean mobile CSS in `<style>...</style>`, and HTTP/database state flow via `await window.AICraft.db.list/insert/update/remove(...)` (and `fetch` when external APIs apply).',
+    '  * Every Screen & Control Real and Interactive: Account for every header action, search bar, tab switch, FAB, list row (e.g. avatar, timestamp, unread badge), full-screen detail view (e.g. back button, message bubbles, attachment/emoji triggers, composer input + send button), sheet/modal, and empty/filter state with realistic domain sample data persisted in `window.AICraft.db` — ZERO dead buttons or lazy placeholders.',
+  ].join('\n');
+
+  const webArchitectureRules = [
+    `- APP ARCHITECTURE (${targetLabel}): Build a complete, real interactive responsive full-stack web application tailored accurately to the user's description — clean modular views/components (using Vue 3 via \`<script src="/vendor/vue.global.prod.js"></script>\` or semantic \`<section data-screen="<id>" data-screen-title="<Name>">\` views) with \`flex: 1; min-height: 0;\` viewports and immediate active screen visibility.`,
+  ].join('\n');
+
   const buildRulesBlock = [
-    'OUTPUT FORMAT & STREAMING SPEED (CRITICAL):',
+    'OUTPUT FORMAT & STREAMING ARCHITECTURE (CRITICAL):',
     '- Never output `<think>` or XML thought tags in your text response.',
-    '- ZERO FAKE "APP NOT READY" OR PLACEHOLDER SCREENS: NEVER output placeholder screens (such as "App Not Ready", "Your app is still building", "Under construction", "Coming Soon") or stock photos pretending the app is building. Build the real, working, interactive application screens immediately on render 1 with real functional buttons, snap feed, and data bindings.',
-    '- SURGICAL EDITS & REMOVING SECTIONS ("remove this place"): When the user asks to remove a specific place, button, banner, or screen (e.g. "remove this place"), or modify an existing feature, do NOT reset the app or start from a blank slate. Use `<<<AICRAFT_PATCH>>>` with exact `<<<SEARCH>>>...<<<REPLACE>>>...` targeting the specific element/script, OR output the full updated HTML preserving all other existing tabs, styling, and database tables intact.',
-    '- NEVER generate standalone images inside Preview builds — focus 100% on building real, functional, interactive apps step-by-step in real time as the user requests.',
-    '- Build calmly and accurately to completion, wiring a genuine real-time backend database (`window.AICraft.db`) instead of fake static cards.',
+    '- NEVER JUST CHAT OR REPEAT UNCHANGED BOILERPLATE: Whenever `CURRENT_PROJECT_FILES` exists and the user asks to build, update, fix, remove, or restructure the app, inspect `CURRENT_PROJECT_FILES` and explicitly apply the real structural changes to the code/files. Never emit unchanged boilerplate or conversational-only text.',
+    '- ZERO FAKE "APP NOT READY" OR PLACEHOLDER SCREENS: NEVER output placeholder screens (such as "App Not Ready", "Your app is still building", "Under construction", "Coming Soon") or stock photos pretending the app is building. Build the real, working, interactive application immediately.',
+    '- CLEAN PARSEABLE OUTPUT (ZERO CLUTTER): Follow the exact tag protocol below so real-time streaming, file extraction, and live Preview rendering stay 100% clean.',
+    '- NEVER generate standalone images inside Preview builds — focus 100% on building real, functional, interactive apps in real time.',
     titleRuleForBuild,
-    '- Output 2–3 concise `[[PLAN: <step>]]` lines (e.g. `[[PLAN: Designing layout & real database tables]]`, `[[PLAN: Building interactive UI & live state]]`).',
+    '- ARCHITECTURAL & SCREEN LAYOUT BREAKDOWN BEFORE CODE (REQUIRED): Never jump straight into HTML/code. Before `<<<AICRAFT_APP_HTML>>>` (or `<<<AICRAFT_PATCH>>>`), emit 3–5 concise `[[PLAN: <step>]]` lines that map:',
+    isMobileTarget
+      ? '  (1) Mobile viewport behavior (portrait frame, safe areas, >=44px touch targets, transitions, HTTP/database flow), (2) Every screen & navigation pattern (tabs, stack push/back detail views, headers, FAB, modals/sheets), (3) Modular Vue components + interactive buttons, inputs, lists & state.'
+      : '  (1) Viewport layout & navigation architecture, (2) Interactive views/components, (3) Database tables & live state flow.',
     '- Output `[[DB_SCHEMA: table(col:type, ...)]]` lines for each domain table (types: `text`, `number`, `boolean`, `timestamp`, `json`).',
-    '- Write ONE short present-tense sentence saying what you are building right now (e.g. "Building your vertical short-video discovery app now..."). NEVER write past-tense "I have built..." before the code, and never include code fences/URLs in chat text.',
-    '- Immediately start the app code:',
-    '  * Full build / new app / redesign: `<<<AICRAFT_APP_HTML>>>` then complete `<!DOCTYPE html>...</html>` then `<<<END_AICRAFT_APP_HTML>>>`',
-    '  * Surgical edit on existing Preview app: `<<<AICRAFT_PATCH>>>` using exact `<<<SEARCH>>>...<<<REPLACE>>>...`, `<<<APPEND_CSS>>>`, `<<<APPEND_SCREEN>>>`, `<<<APPEND_SCRIPT>>>` ending with `<<<END_PATCH>>>`',
+    '- Write ONE short present-tense sentence saying what you are building or updating right now (e.g. "Structuring your Vue mobile messaging architecture and building the screens now..."). NEVER write past-tense "I have built..." before code, and never include code fences or conversational clutter outside the tags.',
+    '- Immediately emit the application code:',
+    '  * Full build / new app / structural layout or component overhaul: `<<<AICRAFT_APP_HTML>>>` then complete `<!DOCTYPE html>...</html>` then `<<<END_AICRAFT_APP_HTML>>>`',
+    '  * Localized surgical edit on existing Preview app: `<<<AICRAFT_PATCH>>>` using exact `<<<SEARCH>>>...<<<REPLACE>>>...`, `<<<APPEND_CSS>>>`, `<<<APPEND_SCREEN>>>`, `<<<APPEND_SCRIPT>>>` ending with `<<<END_PATCH>>>`',
     '- After `<<<END_AICRAFT_APP_HTML>>>` (or `<<<END_PATCH>>>`), optionally add 1–2 concise sentences confirming what is ready, plus:',
     '  `[[SUGGESTIONS]]` with 3 short tappable follow-up prompt lines ending with `[[/SUGGESTIONS]]`.',
     '',
     'ENGINEERING & LAYOUT QUALITY RULES:',
     isGameBuild
       ? `- GAME MODE (${targetLabel}): Build a smooth, immediately playable game with a crisp HUD (Score, Best, Lives/Timer, Pause, Mute SFX via Web Audio), 60fps \`requestAnimationFrame\` canvas or responsive board, mobile touch controls (>=48px buttons/swipe) + desktop keyboard (Arrows/WASD/Space), Play Again reset, and \`window.AICraft.db\` \`scores\` persistence.`
-      : `- APP ARCHITECTURE (${targetLabel}): Build a complete, real interactive app tailored accurately to the user's description — 4–5 focused interactive views/tabs using \`<section data-screen="<id>" data-screen-title="<Name>">\` (with \`[data-screen].active, [data-screen]:first-of-type { display: flex; }\` visible immediately in CSS).`,
-    '- ZERO HARDCODED STATIC MOCKUPS: Every feed, list, cart, counter, message thread, profile, search, filter, and modal must render dynamically from JavaScript state persisted in `window.AICraft.db` (`list`, `insert`, `update`, `remove`, seeded inside `DOMContentLoaded` ONLY when `await window.AICraft.db.list(table)` returns empty). Wire configured Secrets via `window.AICraft.findSecret(...)` / `window.AICraft.getSecret(...)` (including Supabase/Paystack/Stripe if configured).',
-    '- VERTICAL VIDEO / TIKTOK / SOCIAL FEED LAYOUTS: Whenever building a short-video or reels feed, engineer a clean full-bleed `100dvh` vertical snap feed (`scroll-snap-type: y mandatory`, `height: 100%; flex: 1; min-height: 0; overflow-y: auto`), real playable `<video playsinline muted loop poster="...">` from verified search results or `await window.AICraft.search(topic)` with rich poster/artwork gradient fallback (never blank black frames), crisp right-side action rail (like/comment/bookmark/share persisted in `window.AICraft.db`), bottom creator overlay, and bottom navigation (`padding-bottom: max(12px, env(safe-area-inset-bottom))`).',
-    '- ZERO FRAGILE EXTERNAL CDNs: Put ALL layout & styling cleanly in `<style>...</style>` and use pure inline `<svg width="20" height="20" viewBox="0 0 24 24">` icons so nothing depends on external Tailwind/Lucide CDNs. Ensure `html, body { margin:0; padding:0; width:100%; height:100%; min-height:100dvh; overflow:hidden; }` (or scrollable body for classic sites) with `flex: 1; min-height: 0;` on content areas so the middle viewport never collapses to 0px.',
+      : isMobileTarget
+        ? mobileArchitectureRules
+        : webArchitectureRules,
+    '- ZERO HARDCODED STATIC MOCKUPS: Every feed, list, chat thread, cart, counter, profile, search, filter, and modal must render dynamically from reactive state persisted in `window.AICraft.db` (`list`, `insert`, `update`, `remove`, seeded inside `onMounted` / `DOMContentLoaded` ONLY when `await window.AICraft.db.list(table)` returns empty). Wire configured Secrets via `window.AICraft.findSecret(...)` / `window.AICraft.getSecret(...)` (including Supabase/Paystack/Stripe if configured).',
+    '- VERTICAL VIDEO / TIKTOK / SOCIAL FEED LAYOUTS: Whenever building a short-video or reels feed, engineer a clean full-bleed `100dvh` vertical snap feed (`scroll-snap-type: y mandatory`, `height: 100%; flex: 1; min-height: 0; overflow-y: auto`), real playable `<video playsinline muted loop poster="...">` from verified search results or `await window.AICraft.search(topic)` with rich poster/artwork gradient fallback (never blank black frames), crisp right-side action rail (like/comment/bookmark/share persisted in `window.AICraft.db`), bottom creator overlay, and bottom navigation (`padding-bottom: max(12px, var(--ion-safe-area-bottom, env(safe-area-inset-bottom)))`).',
+    '- ZERO FRAGILE EXTERNAL CDNs: Put ALL layout & styling cleanly in `<style>...</style>`, use `/vendor/vue.global.prod.js` when using Vue 3 (never external unpkg/jsdelivr Vue links), and use crisp inline `<svg width="20" height="20" viewBox="0 0 24 24">` icons so nothing depends on external Tailwind/Lucide CDNs.',
     '- OPT-IN LOGO & PWA ONLY: Never invent brand logos (`[[LOGO:...]]`) or `<meta name="aicraft-pwa">` unless the user explicitly asks for a logo/icon or Home Screen installability.',
-    '- ERROR-FREE VANILLA JS: Wrap initialization in `DOMContentLoaded` + `try/catch`, null-check DOM nodes, escape user text safely, and verify every button/tab/form works on first tap.',
+    '- ERROR-FREE JAVASCRIPT / VUE: Guard initialization with `try/catch`, null-check refs/nodes, bind `Vue.createApp(...).mount("#app")` cleanly (or `DOMContentLoaded` for plain DOM), escape dynamic content safely, and ensure every button/tab/form works on first tap.',
   ]
     .filter(Boolean)
     .join('\n');
@@ -1997,15 +2107,15 @@ export function buildCraftSystemPrompt(params: {
     webSearchContext ? `\n${webSearchContext}` : '',
     previewSummary ? `\nEXISTING PREVIEW APP:\n${previewSummary}` : '',
     'INTENT ROUTING (DECIDE NATURALLY FROM CONTEXT — NEVER OUTPUT `<think>` TAGS):',
-    '1. NORMAL CONVERSATION / QUESTIONS -> Output `[[INTENT:CHAT]]` on line 1' +
+    '1. PURE CONVERSATION / QUESTIONS ONLY -> Output `[[INTENT:CHAT]]` on line 1' +
       (shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]`' : '') +
-      ', then reply naturally, warmly, and directly like ChatGPT (greetings, normal questions in any language, explanations, advice, feedback). Never emit HTML or fake build steps when chatting.',
+      ', then reply naturally, warmly, and directly like ChatGPT (greetings, normal questions in any language, explanations, advice). Never use CHAT if the user asked to build, update, change, fix, remove, or restructure ANY part of an app.',
     !hasPreviousHtml && !testMode
       ? '2. EXPLICIT STANDALONE IMAGE ART ONLY (NEVER FOR APPS OR PREVIEW) -> Only if the user explicitly asks to draw/generate a standalone artwork image (NOT an app, UI, screen, or preview), output `[[MODE:GENERATE]]` on line 1' +
         (shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]`' : '') +
         ', write ONE short confirming sentence, and end with `[[MEDIA_PROMPT: <vivid exact prompt matching the request>]]`.'
       : '',
-    `${!hasPreviousHtml && !testMode ? '3' : '2'}. BUILD / EDIT / UPGRADE AN APP OR WEBSITE -> Output \`[[INTENT:BUILD]]\` on line 1, then follow the build contract immediately:`,
+    `${!hasPreviousHtml && !testMode ? '3' : '2'}. BUILD / UPDATE / RESTRUCTURE AN APP OR WEBSITE -> Output \`[[INTENT:BUILD]]\` on line 1 (REQUIRED whenever \`CURRENT_PROJECT_FILES\` exists and the user asks to change, fix, expand, or restructure anything), then follow the build contract immediately:`,
     buildRulesBlock,
     activeFlags.length > 0 ? `Enabled capabilities: ${activeFlags.join(', ')}.` : '',
   ]

@@ -3399,6 +3399,7 @@ async function startServer() {
       await streamServerFreeAiRealTime({
         requestedModel,
         initialRoute: prepared.initialRoute,
+        isFastPatch: Boolean(prepared.isPatchMode),
         systemPrompt: prepared.systemPrompt,
         historyMessages: prepared.historyMessages,
         userPrompt: prepared.userPrompt,
@@ -3514,14 +3515,22 @@ async function startServer() {
           if (codeStart) {
             if (!enteredCodePhase) {
               enteredCodePhase = true;
+              const initialFile = codeStart.isPatch ? 'patch.diff' : 'index.html';
+              const initialAction = codeStart.isPatch ? 'Editing file' : 'Writing file';
+              const initialLabel = `${initialAction} ${initialFile}`;
               sendEvent({
                 type: 'phase',
                 phase: 'building',
                 kind: 'build',
-                action: 'Coding',
-                label: codeStart.isPatch
-                  ? 'Updating code...'
-                  : 'Writing real-time code...',
+                action: initialAction,
+                label: initialLabel,
+                toolStep: {
+                  id: 'step-code-init',
+                  label: initialLabel,
+                  file: initialFile,
+                  action: initialAction,
+                  status: 'running',
+                },
               });
             }
 
@@ -3535,18 +3544,35 @@ async function startServer() {
               lastFilesKey = filesKey;
               lastBytesSent = htmlSoFar.length;
               const active = artifacts[artifacts.length - 1];
+              const activeAction = active?.action
+                ? codeStart.isPatch
+                  ? 'Editing'
+                  : active.action
+                : codeStart.isPatch
+                  ? 'Editing'
+                  : 'Writing';
+              const activeFile = active?.path || 'index.html';
+              const stepAction = `${activeAction} file`;
+              const stepLabel = `${activeAction} ${activeFile}`;
               sendEvent({
                 type: 'file',
-                action: active?.action || 'Coding',
-                path: active?.path || 'index.html',
+                action: stepAction,
+                path: activeFile,
                 allFiles: paths,
                 bytesBuilt: htmlSoFar.length,
+                toolStep: {
+                  id: `step-${paths.length}`,
+                  label: stepLabel,
+                  file: activeFile,
+                  action: stepAction,
+                  status: 'running',
+                },
               });
             }
             if (
               !codeStart.isPatch &&
-              htmlSoFar.length >= 220 &&
-              htmlSoFar.length - lastPreviewBytesSent >= 900
+              htmlSoFar.length >= 80 &&
+              htmlSoFar.length - lastPreviewBytesSent >= 250
             ) {
               lastPreviewBytesSent = htmlSoFar.length;
               const liveHtml = finalizePartialPreviewHtml(cleanSoFar);
@@ -3576,7 +3602,13 @@ async function startServer() {
           phase: 'building',
           kind: 'build',
           action: 'Checking',
-          label: 'Checking code & live preview...',
+          label: 'Checking files & live preview...',
+          toolStep: {
+            id: 'step-check',
+            label: 'Checking files & live preview',
+            action: 'Checking',
+            status: 'running',
+          },
         });
       }
 
@@ -3739,6 +3771,37 @@ async function startServer() {
         }).catch(() => {});
       }
 
+      const buildToolSteps = [
+        {
+          id: 'step-thinking',
+          label: 'Thought through app architecture',
+          action: 'Thinking',
+          status: 'complete' as const,
+        },
+        ...finalized.files.map((file, idx) => {
+          const act = file.endsWith('.css')
+            ? 'Styling'
+            : file.includes('database')
+              ? 'Wiring database'
+              : file.endsWith('.js')
+                ? 'Scripting'
+                : 'Editing file';
+          return {
+            id: `step-file-${idx}`,
+            label: `${act} ${file}`,
+            file,
+            action: act,
+            status: 'complete' as const,
+          };
+        }),
+        {
+          id: 'step-preview-check',
+          label: 'Verified live preview & database',
+          action: 'Checking',
+          status: 'complete' as const,
+        },
+      ];
+
       sendEvent({
         type: 'done',
         kind: 'build',
@@ -3756,6 +3819,7 @@ async function startServer() {
         modelName: finalized.modelName,
         provider: finalized.provider,
         startedAt: job.startedAt,
+        toolSteps: buildToolSteps,
       });
     } catch (err) {
       clearInterval(keepAlive);
@@ -3798,6 +3862,35 @@ async function startServer() {
         message: errorMessage,
       });
     }
+  });
+
+  // Serve local Vue 3 runtime reliably across dev & prod previews
+  const vueRuntimeCandidates = [
+    path.join(__dirname, 'public', 'vendor', 'vue.global.prod.js'),
+    path.join(__dirname, 'dist', 'vendor', 'vue.global.prod.js'),
+    path.join(__dirname, 'node_modules', 'vue', 'dist', 'vue.global.prod.js'),
+  ];
+  const vueRuntimePath = vueRuntimeCandidates.find((p) => fs.existsSync(p));
+  const vueRuntimeRaw = vueRuntimePath ? fs.readFileSync(vueRuntimePath) : null;
+  const vueRuntimeGzip = vueRuntimeRaw ? zlib.gzipSync(vueRuntimeRaw, { level: 6 }) : null;
+
+  app.get('/vendor/vue.global.prod.js', (req, res) => {
+    if (!vueRuntimeRaw) {
+      res.status(404).end();
+      return;
+    }
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Vary', 'Accept-Encoding');
+    const acceptEnc = String(req.headers['accept-encoding'] || '');
+    if (vueRuntimeGzip && acceptEnc.includes('gzip')) {
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Content-Length', String(vueRuntimeGzip.length));
+      res.status(200).send(vueRuntimeGzip);
+      return;
+    }
+    res.setHeader('Content-Length', String(vueRuntimeRaw.length));
+    res.status(200).send(vueRuntimeRaw);
   });
 
   // Serve 3D head GLB pre-gzipped with immutable browser caching for instant load
